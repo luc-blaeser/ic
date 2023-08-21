@@ -185,7 +185,7 @@ impl Config {
             cost_to_compile_wasm_instruction: DEFAULT_COST_TO_COMPILE_WASM_INSTRUCTION,
             num_rayon_compilation_threads: DEFAULT_WASMTIME_RAYON_COMPILATION_THREADS,
             feature_flags: FeatureFlags::const_default(),
-            metering_type: MeteringType::Old,
+            metering_type: MeteringType::New,
             stable_memory_dirty_page_limit: NumPages::new(STABLE_MEMORY_DIRTY_PAGE_LIMIT),
             stable_memory_accessed_page_limit: NumPages::new(STABLE_MEMORY_ACCESSED_PAGE_LIMIT),
             min_sandbox_count: DEFAULT_MIN_SANDBOX_COUNT,
@@ -193,7 +193,7 @@ impl Config {
             max_sandbox_idle_time: DEFAULT_MAX_SANDBOX_IDLE_TIME,
             subnet_type: SubnetType::Application,
             dirty_page_overhead: NumInstructions::new(0),
-            trace_execution: FlagStatus::Disabled,
+            trace_execution: FlagStatus::Enabled,
         }
     }
 }
