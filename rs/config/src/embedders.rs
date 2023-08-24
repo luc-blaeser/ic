@@ -193,7 +193,7 @@ impl Config {
             max_sandbox_idle_time: DEFAULT_MAX_SANDBOX_IDLE_TIME,
             subnet_type: SubnetType::Application,
             dirty_page_overhead: NumInstructions::new(0),
-            trace_execution: FlagStatus::Enabled,
+            trace_execution: FlagStatus::Disabled,
         }
     }
 }
