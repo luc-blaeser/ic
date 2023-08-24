@@ -838,6 +838,7 @@ impl<S: SystemApi> WasmtimeInstance<S> {
                     .get()
                     .saturating_mul(access.dirty_pages.len() as u64),
             );
+            println!("DIRTY PAGE CHARGING {}", self.dirty_page_overhead.get().saturating_mul(access.dirty_pages.len() as u64));
             self.set_instruction_counter(x);
         }
 
