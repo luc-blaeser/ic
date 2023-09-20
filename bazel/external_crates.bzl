@@ -156,7 +156,7 @@ def external_crates_repository(name, static_openssl, cargo_lockfile, lockfile):
                 version = "^1.2.1",
             ),
             "bindgen": crate.spec(
-                version = "^0.59.0",
+                version = "^0.65.0",
                 default_features = False,
                 features = ["runtime"],
             ),
@@ -870,7 +870,7 @@ def external_crates_repository(name, static_openssl, cargo_lockfile, lockfile):
                 version = "^0.5.2",
             ),
             "rocksdb": crate.spec(
-                version = "^0.15.0",
+                version = "^0.21.0",
                 default_features = False,
             ),
             "rsa": crate.spec(
