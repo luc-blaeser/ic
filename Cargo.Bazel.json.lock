@@ -1,5 +1,5 @@
 {
-  "checksum": "b559e4590d57cd436416fa53501758130d6b277128e979da0d1ecbff93ca7ed9",
+  "checksum": "62df7c94ba5381e7e03473f66905a4e756addf753f8d6a4f43c6f1ec72ecad9b",
   "crates": {
     "abnf 0.12.0": {
       "name": "abnf",
@@ -21506,7 +21506,7 @@
         "Git": {
           "remote": "https://github.com/dfinity/bitcoin-canister",
           "commitish": {
-            "Rev": "0e996988693f2d55fc9533c44dc20ae5310a1894"
+            "Rev": "b1693619e3d4dbc00d8c79e9b6886e1db48b21f7"
           },
           "strip_prefix": "validation"
         }
@@ -26947,12 +26947,27 @@
         ],
         "crate_features": {
           "common": [
-            "errno",
             "general",
             "ioctl",
             "no_std"
           ],
-          "selects": {}
+          "selects": {
+            "aarch64-unknown-linux-gnu": [
+              "errno"
+            ],
+            "arm-unknown-linux-gnueabi": [
+              "errno"
+            ],
+            "armv7-unknown-linux-gnueabi": [
+              "errno"
+            ],
+            "i686-unknown-linux-gnu": [
+              "errno"
+            ],
+            "x86_64-unknown-linux-gnu": [
+              "errno"
+            ]
+          }
         },
         "edition": "2018",
         "version": "0.3.8"
@@ -26986,12 +27001,27 @@
         ],
         "crate_features": {
           "common": [
-            "errno",
             "general",
             "ioctl",
             "no_std"
           ],
-          "selects": {}
+          "selects": {
+            "aarch64-unknown-linux-gnu": [
+              "errno"
+            ],
+            "arm-unknown-linux-gnueabi": [
+              "errno"
+            ],
+            "armv7-unknown-linux-gnueabi": [
+              "errno"
+            ],
+            "i686-unknown-linux-gnu": [
+              "errno"
+            ],
+            "x86_64-unknown-linux-gnu": [
+              "errno"
+            ]
+          }
         },
         "edition": "2021",
         "version": "0.4.3"

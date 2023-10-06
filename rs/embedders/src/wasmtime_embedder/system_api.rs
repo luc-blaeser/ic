@@ -146,7 +146,7 @@ fn charge_for_cpu(
     charge_for_system_api_call(
         caller,
         overhead.system_api_overhead,
-        overhead.num_bytes.get() as u32,
+        overhead.num_bytes.get(),
         complexity,
         NumInstructions::from(0),
         // since we are not adding any stable dirty pages, process this as if there was no limit
@@ -1206,7 +1206,7 @@ pub(crate) fn syscalls(
 
     linker
         .func_wrap("ic0", "canister_cycle_balance128_64", {
-            move |mut caller: Caller<'_, StoreData>, dst: u32| {
+            move |mut caller: Caller<'_, StoreData>, dst: u64| {
                 charge_for_cpu(
                     &mut caller,
                     overhead!(CANISTER_CYCLE_BALANCE128, metering_type, 0),
@@ -1404,14 +1404,14 @@ pub(crate) fn syscalls(
 
     linker
         .func_wrap("__", "update_available_memory", {
-            move |mut caller: Caller<'_, StoreData<S>>,
-                  native_memory_grow_res: i64,
-                  additional_elements: i64,
+            move |mut caller: Caller<'_, StoreData>,
+                  native_memory_grow_res: i32,
+                  additional_elements: i32,
                   element_size: i32| {
                 with_system_api(&mut caller, |s| {
                     s.update_available_memory(
-                        native_memory_grow_res,
-                        additional_elements as u64,
+                        native_memory_grow_res as i64,
+                        additional_elements as u32 as u64,
                         element_size as u32 as u64,
                     )
                 })
