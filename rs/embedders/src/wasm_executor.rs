@@ -626,10 +626,15 @@ pub fn process(
     // Set the instruction limit for the first slice.
     instance.set_instruction_counter(first_slice_instruction_limit.get() as i64);
 
+    let instructions_before = instance.instruction_counter();
+
     // Execute Wasm code until it finishes or exceeds the message instruction
     // limit. With deterministic time slicing, this call may execute multiple
     // slices before it returns.
     let run_result = instance.run(func_ref);
+
+    let instruction_after = instance.instruction_counter();
+    println!("CONSUMED INSTRUCTIONS {}", instruction_after - instruction_before);
 
     // Get the executed/remaining instructions for the message and the slice.
     let instruction_counter = instance.instruction_counter();
