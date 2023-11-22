@@ -10,12 +10,13 @@ pub enum Exporter {
     Http(SocketAddr),
     /// Dump metrics to the given file on shutdown.
     File(PathBuf),
+    None,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            exporter: Exporter::Log,
+            exporter: Exporter::None,
             connection_read_timeout_seconds: 300, // 5 min
             max_concurrent_requests: 50,
             request_timeout_seconds: 30,

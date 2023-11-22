@@ -106,7 +106,8 @@ impl MetricsHttpEndpoint {
         match metrics.config.exporter {
             Exporter::Http(socket_addr) => metrics.start_http(socket_addr),
             Exporter::Log => metrics.start_log(),
-            Exporter::File(_) => {}
+            Exporter::File(_) => {},
+            Exporter::None => {},
         };
 
         metrics
@@ -134,7 +135,8 @@ impl MetricsHttpEndpoint {
         match metrics.config.exporter {
             Exporter::Http(socket_addr) => metrics.start_http(socket_addr),
             Exporter::Log => metrics.start_log(),
-            Exporter::File(_) => {}
+            Exporter::File(_) => {},
+            Exporter::None => {},
         };
 
         metrics

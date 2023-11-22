@@ -633,8 +633,8 @@ pub fn process(
     // slices before it returns.
     let run_result = instance.run(func_ref);
 
-    let instruction_after = instance.instruction_counter();
-    println!("CONSUMED INSTRUCTIONS {}", instruction_after - instruction_before);
+    let instructions_after = instance.instruction_counter();
+    println!("CONSUMED INSTRUCTIONS {}", instructions_before - instructions_after);
 
     // Get the executed/remaining instructions for the message and the slice.
     let instruction_counter = instance.instruction_counter();
