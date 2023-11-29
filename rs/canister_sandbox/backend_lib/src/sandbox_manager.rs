@@ -112,6 +112,7 @@ impl Execution {
 
         let message_instruction_limit =
             exec_input.execution_parameters.instruction_limits.message();
+        println!("INSTRUCTION LIMIT {message_instruction_limit}");
         let slice_instruction_limit = exec_input.execution_parameters.instruction_limits.slice();
         let sandbox_manager = Arc::clone(&self.sandbox_manager);
         let out_of_instructions_handler = DeterministicTimeSlicingHandler::new(

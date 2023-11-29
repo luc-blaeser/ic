@@ -883,6 +883,8 @@ impl WasmtimeInstance {
         self.instance_stats.copy_page_count += access.copy_page_count;
 
         if let MeteringType::New = self.metering_type {
+            let instructions_before = self.instruction_counter();
+
             // charge for dirty heap pages
             let x = self.instruction_counter().saturating_sub_unsigned(
                 self.dirty_page_overhead
@@ -890,6 +892,9 @@ impl WasmtimeInstance {
                     .saturating_mul(access.dirty_pages.len() as u64),
             );
             self.set_instruction_counter(x);
+
+            let instructions_after = self.instruction_counter();
+            println!("DIRTY PAGE CHARGING {}", instructions_before - instructions_after);
         }
 
         let stable_memory_dirty_pages: Vec<_> = match self.wasm_native_stable_memory {
