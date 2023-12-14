@@ -1592,7 +1592,7 @@ enum AccessKind {
 /// This implies that at most 2 pages are accessed by the operation.
 ///
 /// Bulk accesses with a longer length than an OS page size may access more than 2 pages
-/// and are thus separatedly handled, calling `main_bulk_accesss_guard()` in the system API.
+/// and are thus separately handled, calling `main_bulk_accesss_guard()` in the system API.
 fn memory64_barrier_instructions<'a>(
     kind: AccessKind,
     address_argument_index: u32,
