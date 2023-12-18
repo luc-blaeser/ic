@@ -3,7 +3,7 @@ use crate::wasmtime_embedder::{
 };
 
 use ic_config::{
-    embedders::{FeatureFlags, MeteringType},
+    embedders::{FeatureFlags, MeteringType, MAIN_MEMORY_PAGE_ACCESS_LIMIT},
     flag_status::FlagStatus,
 };
 use ic_interfaces::execution_environment::{
@@ -101,38 +101,6 @@ fn store_value<S: SystemApi>(
             caller,
             HypervisorError::InstructionLimitExceeded,
         ));
-    }
-    Ok(())
-}
-
-/// Updates heap bytemap marking which pages have been written to dst and size
-/// need to have valid values (need to pass checks performed by the function
-/// that actually writes to the heap)
-#[inline(never)]
-fn mark_writes_on_bytemap<S: SystemApi>(
-    caller: &mut Caller<'_, StoreData<S>>,
-    dst: usize,
-    size: usize,
-) -> Result<(), anyhow::Error> {
-    if size < 1 {
-        return Ok(());
-    }
-    let bitmap_mem = match caller.get_export(WASM_HEAP_BYTEMAP_MEMORY_NAME) {
-        Some(wasmtime::Extern::Memory(mem)) => mem,
-        _ => {
-            return Err(process_err(
-                caller,
-                HypervisorError::ContractViolation("Failed to access heap bitmap".to_string()),
-            ))
-        }
-    };
-
-    let bitmap = bitmap_mem.data_mut(caller);
-    let mut i = dst / PAGE_SIZE;
-    let end = (dst + size - 1) / PAGE_SIZE + 1;
-    while i < end {
-        bitmap[i] = 1;
-        i += 1;
     }
     Ok(())
 }
@@ -427,14 +395,15 @@ pub(crate) fn syscalls<S: SystemApi>(
             NumInstructions::from(0),
             stable_memory_dirty_page_limit,
         )?;
+        system_api_main_memory_access(
+            &mut caller,
+            AccessKind::Write,
+            dst as u64 as usize,
+            size as u64 as usize,
+        )?;
         with_memory_and_system_api(&mut caller, |system_api, memory| {
             system_api.ic0_msg_caller_copy_64(dst as u64, offset as u64, size as u64, memory)
-        })?;
-        if feature_flags.write_barrier == FlagStatus::Enabled {
-            mark_writes_on_bytemap(&mut caller, dst as u64 as usize, size as u64 as usize)
-        } else {
-            Ok(())
-        }
+        })
     };
 
     linker
@@ -535,14 +504,15 @@ pub(crate) fn syscalls<S: SystemApi>(
             NumInstructions::from(0),
             stable_memory_dirty_page_limit,
         )?;
+        system_api_main_memory_access(
+            &mut caller,
+            AccessKind::Write,
+            dst as u64 as usize,
+            size as u64 as usize,
+        )?;
         with_memory_and_system_api(&mut caller, |system_api, mem| {
             system_api.ic0_msg_arg_data_copy_64(dst as u64, offset as u64, size as u64, mem)
-        })?;
-        if feature_flags.write_barrier == FlagStatus::Enabled {
-            mark_writes_on_bytemap(&mut caller, dst as u64 as usize, size as u64 as usize)
-        } else {
-            Ok(())
-        }
+        })
     };
 
     linker
@@ -615,14 +585,15 @@ pub(crate) fn syscalls<S: SystemApi>(
             NumInstructions::from(0),
             stable_memory_dirty_page_limit,
         )?;
+        system_api_main_memory_access(
+            &mut caller,
+            AccessKind::Write,
+            dst as u64 as usize,
+            size as u64 as usize,
+        )?;
         with_memory_and_system_api(&mut caller, |system_api, memory| {
             system_api.ic0_msg_method_name_copy_64(dst as u64, offset as u64, size as u64, memory)
-        })?;
-        if feature_flags.write_barrier == FlagStatus::Enabled {
-            mark_writes_on_bytemap(&mut caller, dst as u64 as usize, size as u64 as usize)
-        } else {
-            Ok(())
-        }
+        })
     };
 
     linker
@@ -686,6 +657,12 @@ pub(crate) fn syscalls<S: SystemApi>(
                 },
                 NumInstructions::from(0),
                 stable_memory_dirty_page_limit,
+            )?;
+            system_api_main_memory_access(
+                &mut caller,
+                AccessKind::Read,
+                src as u64 as usize,
+                size as u64 as usize,
             )?;
             with_memory_and_system_api(&mut caller, |system_api, memory| {
                 system_api.ic0_msg_reply_data_append_64(src as u64, size as u64, memory)
@@ -771,6 +748,12 @@ pub(crate) fn syscalls<S: SystemApi>(
                 NumInstructions::from(0),
                 stable_memory_dirty_page_limit,
             )?;
+            system_api_main_memory_access(
+                &mut caller,
+                AccessKind::Read,
+                src as u64 as usize,
+                size as u64 as usize,
+            )?;
             with_memory_and_system_api(&mut caller, |system_api, memory| {
                 system_api.ic0_msg_reject_64(src as u64, size as u64, memory)
             })
@@ -840,14 +823,15 @@ pub(crate) fn syscalls<S: SystemApi>(
             NumInstructions::from(0),
             stable_memory_dirty_page_limit,
         )?;
+        system_api_main_memory_access(
+            &mut caller,
+            AccessKind::Write,
+            dst as u64 as usize,
+            size as u64 as usize,
+        )?;
         with_memory_and_system_api(&mut caller, |system_api, memory| {
             system_api.ic0_msg_reject_msg_copy_64(dst as u64, offset as u64, size as u64, memory)
-        })?;
-        if feature_flags.write_barrier == FlagStatus::Enabled {
-            mark_writes_on_bytemap(&mut caller, dst as u64 as usize, size as u64 as usize)
-        } else {
-            Ok(())
-        }
+        })
     };
 
     linker
@@ -920,14 +904,15 @@ pub(crate) fn syscalls<S: SystemApi>(
             NumInstructions::from(0),
             stable_memory_dirty_page_limit,
         )?;
+        system_api_main_memory_access(
+            &mut caller,
+            AccessKind::Write,
+            dst as u64 as usize,
+            size as u64 as usize,
+        )?;
         with_memory_and_system_api(&mut caller, |system_api, memory| {
             system_api.ic0_canister_self_copy_64(dst as u64, offset as u64, size as u64, memory)
-        })?;
-        if feature_flags.write_barrier == FlagStatus::Enabled {
-            mark_writes_on_bytemap(&mut caller, dst as u64 as usize, size as u64 as usize)
-        } else {
-            Ok(())
-        }
+        })
     };
 
     linker
@@ -981,6 +966,12 @@ pub(crate) fn syscalls<S: SystemApi>(
             // If rate limiting is disabled or the subnet is a system subnet, then
             // debug print produces output.
             (_, FlagStatus::Disabled) | (SubnetType::System, FlagStatus::Enabled) => {
+                system_api_main_memory_access(
+                    &mut caller,
+                    AccessKind::Read,
+                    offset as u64 as usize,
+                    length as u64 as usize,
+                )?;
                 with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_debug_print_64(offset as u64, length as u64, memory)
                 })
@@ -1023,6 +1014,12 @@ pub(crate) fn syscalls<S: SystemApi>(
             },
             NumInstructions::from(0),
             stable_memory_dirty_page_limit,
+        )?;
+        system_api_main_memory_access(
+            &mut caller,
+            AccessKind::Read,
+            offset as u64 as usize,
+            length as u64 as usize,
         )?;
         with_memory_and_system_api(&mut caller, |system_api, memory| {
             system_api.ic0_trap_64(offset as u64, length as u64, memory)
@@ -1069,6 +1066,18 @@ pub(crate) fn syscalls<S: SystemApi>(
             },
             NumInstructions::from(0),
             stable_memory_dirty_page_limit,
+        )?;
+        system_api_main_memory_access(
+            &mut caller,
+            AccessKind::Read,
+            callee_src as u64 as usize,
+            callee_size as u64 as usize,
+        )?;
+        system_api_main_memory_access(
+            &mut caller,
+            AccessKind::Read,
+            name_src as u64 as usize,
+            name_len as u64 as usize,
         )?;
         with_memory_and_system_api(&mut caller, |system_api, memory| {
             system_api.ic0_call_new_64(
@@ -1155,6 +1164,12 @@ pub(crate) fn syscalls<S: SystemApi>(
                 },
                 NumInstructions::from(0),
                 stable_memory_dirty_page_limit,
+            )?;
+            system_api_main_memory_access(
+                &mut caller,
+                AccessKind::Read,
+                src as u64 as usize,
+                size as u64 as usize,
             )?;
             with_memory_and_system_api(&mut caller, |system_api, memory| {
                 system_api.ic0_call_data_append_64(src as u64, size as u64, memory)
@@ -1346,14 +1361,15 @@ pub(crate) fn syscalls<S: SystemApi>(
                     NumInstructions::from(0),
                     stable_memory_dirty_page_limit,
                 )?;
+                system_api_main_memory_access(
+                    &mut caller,
+                    AccessKind::Write,
+                    dst as u32 as usize,
+                    size as u32 as usize,
+                )?;
                 with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_stable_read(dst as u32, offset as u32, size as u32, memory)
-                })?;
-                if feature_flags.write_barrier == FlagStatus::Enabled {
-                    mark_writes_on_bytemap(&mut caller, dst as u32 as usize, size as u32 as usize)
-                } else {
-                    Ok(())
-                }
+                })
             }
         })
         .unwrap();
@@ -1379,6 +1395,12 @@ pub(crate) fn syscalls<S: SystemApi>(
                     },
                     dirty_page_cost,
                     stable_memory_dirty_page_limit,
+                )?;
+                system_api_main_memory_access(
+                    &mut caller,
+                    AccessKind::Read,
+                    src as usize,
+                    size as usize,
                 )?;
                 with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_stable_write(offset, src, size, memory)
@@ -1451,11 +1473,12 @@ pub(crate) fn syscalls<S: SystemApi>(
                         memory,
                     )
                 })?;
-                if feature_flags.write_barrier == FlagStatus::Enabled {
-                    mark_writes_on_bytemap(&mut caller, dst as u32 as usize, size as u32 as usize)
-                } else {
-                    Ok(())
-                }
+                system_api_main_memory_access(
+                    &mut caller,
+                    AccessKind::Write,
+                    dst as u32 as usize,
+                    size as u32 as usize,
+                )
             }
         })
         .unwrap();
@@ -1477,14 +1500,15 @@ pub(crate) fn syscalls<S: SystemApi>(
                     NumInstructions::from(0),
                     stable_memory_dirty_page_limit,
                 )?;
+                system_api_main_memory_access(
+                    &mut caller,
+                    AccessKind::Write,
+                    dst as u64 as usize,
+                    size as u64 as usize,
+                )?;
                 with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_stable64_read(dst as u64, offset as u64, size as u64, memory)
-                })?;
-                if feature_flags.write_barrier == FlagStatus::Enabled {
-                    mark_writes_on_bytemap(&mut caller, dst as u64 as usize, size as u64 as usize)
-                } else {
-                    Ok(())
-                }
+                })
             }
         })
         .unwrap();
@@ -1510,6 +1534,12 @@ pub(crate) fn syscalls<S: SystemApi>(
                     },
                     dirty_page_cost,
                     stable_memory_dirty_page_limit,
+                )?;
+                system_api_main_memory_access(
+                    &mut caller,
+                    AccessKind::Read,
+                    src as u64 as usize,
+                    size as u64 as usize,
                 )?;
                 with_memory_and_system_api(&mut caller, |system_api, memory| {
                     system_api.ic0_stable64_write(offset, src, size, memory)
@@ -1656,14 +1686,10 @@ pub(crate) fn syscalls<S: SystemApi>(
                 NumInstructions::from(0),
                 stable_memory_dirty_page_limit,
             )?;
+            system_api_main_memory_access(&mut caller, AccessKind::Write, dst as usize, 16)?;
             with_memory_and_system_api(&mut caller, |system_api, memory| {
                 system_api.ic0_canister_cycle_balance128_64(dst, memory)
-            })?;
-            if feature_flags.write_barrier == FlagStatus::Enabled {
-                mark_writes_on_bytemap(&mut caller, dst as usize, 16)
-            } else {
-                Ok(())
-            }
+            })
         };
 
     linker
@@ -1727,14 +1753,10 @@ pub(crate) fn syscalls<S: SystemApi>(
                 NumInstructions::from(0),
                 stable_memory_dirty_page_limit,
             )?;
+            system_api_main_memory_access(&mut caller, AccessKind::Write, dst as usize, 16)?;
             with_memory_and_system_api(&mut caller, |system_api, memory| {
                 system_api.ic0_msg_cycles_available128_64(dst, memory)
-            })?;
-            if feature_flags.write_barrier == FlagStatus::Enabled {
-                mark_writes_on_bytemap(&mut caller, dst as usize, 16)
-            } else {
-                Ok(())
-            }
+            })
         };
 
     linker
@@ -1798,14 +1820,10 @@ pub(crate) fn syscalls<S: SystemApi>(
                 NumInstructions::from(0),
                 stable_memory_dirty_page_limit,
             )?;
+            system_api_main_memory_access(&mut caller, AccessKind::Write, dst as usize, 16)?;
             with_memory_and_system_api(&mut caller, |system_api, memory| {
                 system_api.ic0_msg_cycles_refunded128_64(dst, memory)
-            })?;
-            if feature_flags.write_barrier == FlagStatus::Enabled {
-                mark_writes_on_bytemap(&mut caller, dst as usize, 16)
-            } else {
-                Ok(())
-            }
+            })
         };
 
     linker
@@ -1867,18 +1885,14 @@ pub(crate) fn syscalls<S: SystemApi>(
             NumInstructions::from(0),
             stable_memory_dirty_page_limit,
         )?;
+        system_api_main_memory_access(&mut caller, AccessKind::Write, dst as usize, 16)?;
         with_memory_and_system_api(&mut caller, |system_api, memory| {
             system_api.ic0_msg_cycles_accept128_64(
                 Cycles::from_parts(amount_high as u64, amount_low as u64),
                 dst,
                 memory,
             )
-        })?;
-        if feature_flags.write_barrier == FlagStatus::Enabled {
-            mark_writes_on_bytemap(&mut caller, dst as usize, 16)
-        } else {
-            Ok(())
-        }
+        })
     };
 
     linker
@@ -2021,25 +2035,28 @@ pub(crate) fn syscalls<S: SystemApi>(
         })
         .unwrap();
 
-    let certified_data_set_64 =
-        move |log: &ReplicaLogger, mut caller: Caller<'_, StoreData<S>>, src: u64, size: u64| {
-            charge_for_system_api_call(
-                log,
-                canister_id,
-                &mut caller,
-                system_api::complexity_overhead!(CERTIFIED_DATA_SET, metering_type),
-                size,
-                ExecutionComplexity {
-                    cpu: system_api_complexity::cpu::CERTIFIED_DATA_SET,
-                    ..Default::default()
-                },
-                NumInstructions::from(0),
-                stable_memory_dirty_page_limit,
-            )?;
-            with_memory_and_system_api(&mut caller, |system_api, memory| {
-                system_api.ic0_certified_data_set_64(src, size, memory)
-            })
-        };
+    let certified_data_set_64 = move |log: &ReplicaLogger,
+                                      mut caller: Caller<'_, StoreData<S>>,
+                                      src: u64,
+                                      size: u64| {
+        charge_for_system_api_call(
+            log,
+            canister_id,
+            &mut caller,
+            system_api::complexity_overhead!(CERTIFIED_DATA_SET, metering_type),
+            size,
+            ExecutionComplexity {
+                cpu: system_api_complexity::cpu::CERTIFIED_DATA_SET,
+                ..Default::default()
+            },
+            NumInstructions::from(0),
+            stable_memory_dirty_page_limit,
+        )?;
+        system_api_main_memory_access(&mut caller, AccessKind::Read, src as usize, size as usize)?;
+        with_memory_and_system_api(&mut caller, |system_api, memory| {
+            system_api.ic0_certified_data_set_64(src, size, memory)
+        })
+    };
 
     linker
         .func_wrap("ic0", "certified_data_set", {
@@ -2120,6 +2137,12 @@ pub(crate) fn syscalls<S: SystemApi>(
                 NumInstructions::from(0),
                 stable_memory_dirty_page_limit,
             )?;
+            system_api_main_memory_access(
+                &mut caller,
+                AccessKind::Read,
+                src as u64 as usize,
+                size as u64 as usize,
+            )?;
             with_memory_and_system_api(&mut caller, |system_api, memory| {
                 system_api.ic0_is_controller_64(src as u64, size as u64, memory)
             })
@@ -2161,14 +2184,10 @@ pub(crate) fn syscalls<S: SystemApi>(
             NumInstructions::from(0),
             stable_memory_dirty_page_limit,
         )?;
+        system_api_main_memory_access(&mut caller, AccessKind::Write, dst as usize, size as usize)?;
         with_memory_and_system_api(&mut caller, |system_api, memory| {
             system_api.ic0_data_certificate_copy_64(dst, offset, size, memory)
-        })?;
-        if feature_flags.write_barrier == FlagStatus::Enabled {
-            mark_writes_on_bytemap(&mut caller, dst as usize, size as usize)
-        } else {
-            Ok(())
-        }
+        })
     };
 
     linker
@@ -2243,4 +2262,165 @@ pub(crate) fn syscalls<S: SystemApi>(
         .unwrap();
 
     linker
+        .func_wrap("__", "main_read_page_guard", {
+            move |mut caller: Caller<'_, StoreData<S>>, page_index: i32| {
+                main_read_page_guard(&mut caller, page_index as u32 as usize)
+            }
+        })
+        .unwrap();
+
+    linker
+        .func_wrap("__", "main_write_page_guard", {
+            move |mut caller: Caller<'_, StoreData<S>>, page_index: i32| {
+                main_write_page_guard(&mut caller, page_index as u32 as usize)
+            }
+        })
+        .unwrap();
+
+    linker
+        .func_wrap("__", "main_bulk_access_guard", {
+            move |mut caller: Caller<'_, StoreData<S>>,
+                  start_address: i64,
+                  length: i64,
+                  write_access: i32| {
+                main_bulk_access_guard(
+                    &mut caller,
+                    start_address as u64 as usize,
+                    length as u64 as usize,
+                    write_access,
+                )
+            }
+        })
+        .unwrap();
+
+    linker
+}
+
+const NO_ACCESS: u8 = 0;
+const WRITE_ACCESS: u8 = 1;
+const READ_ONLY_ACCESS: u8 = 2;
+
+/// Used during 64-bit main memory to guard the working set limit.
+/// The page is accessed for the potentially first time and this access is a read access.
+#[inline(never)]
+fn main_read_page_guard<S: SystemApi>(
+    mut caller: &mut Caller<'_, StoreData<S>>,
+    page_index: usize,
+) -> Result<(), anyhow::Error> {
+    let bytemap_mem = match caller.get_export(WASM_HEAP_BYTEMAP_MEMORY_NAME) {
+        Some(wasmtime::Extern::Memory(mem)) => mem,
+        _ => {
+            return Err(process_err(
+                caller,
+                HypervisorError::ContractViolation("Failed to access heap bitmap".to_string()),
+            ))
+        }
+    };
+
+    let bytemap = bytemap_mem.data_mut(&mut caller);
+    if bytemap[page_index] == NO_ACCESS {
+        bytemap[page_index] = READ_ONLY_ACCESS;
+        first_access_on_main_memory_page(&mut caller)?;
+    }
+    Ok(())
+}
+
+/// Used during 64-bit main memory to guard the working set limit.
+/// The page is written for the potentially first time and there may have been preceding reads to this page.
+#[inline(never)]
+fn main_write_page_guard<S: SystemApi>(
+    mut caller: &mut Caller<'_, StoreData<S>>,
+    page_index: usize,
+) -> Result<(), anyhow::Error> {
+    let bytemap_mem = match caller.get_export(WASM_HEAP_BYTEMAP_MEMORY_NAME) {
+        Some(wasmtime::Extern::Memory(mem)) => mem,
+        _ => {
+            return Err(process_err(
+                caller,
+                HypervisorError::ContractViolation("Failed to access heap bitmap".to_string()),
+            ))
+        }
+    };
+
+    let bytemap = bytemap_mem.data_mut(&mut caller);
+    let first_access = bytemap[page_index] == NO_ACCESS;
+    bytemap[page_index] = WRITE_ACCESS;
+    if first_access {
+        first_access_on_main_memory_page(&mut caller)?;
+    }
+    Ok(())
+}
+
+// Used during 64-bit main memory to guard the working set limit for bulk memory operations,
+// that potentially access multiple consecutive pages.
+// * `memory.copy` (reading and writing)
+// * `memory.fill` (write)
+#[inline(never)]
+fn main_bulk_access_guard<S: SystemApi>(
+    mut caller: &mut Caller<'_, StoreData<S>>,
+    start_address: usize,
+    length: usize,
+    write_access: i32,
+) -> Result<(), anyhow::Error> {
+    let write_access = write_access != 0;
+    let start_page = start_address / PAGE_SIZE;
+    let end_page = (start_address + length - 1) / PAGE_SIZE;
+    for page_index in start_page..end_page + 1 {
+        if write_access {
+            main_write_page_guard(&mut caller, page_index)?;
+        } else {
+            main_read_page_guard(&mut caller, page_index)?;
+        }
+    }
+    Ok(())
+}
+
+fn first_access_on_main_memory_page<S: SystemApi>(
+    mut caller: &mut Caller<'_, StoreData<S>>,
+) -> Result<(), anyhow::Error> {
+    let access_pages_global = caller.data().accessed_main_memory_pages.unwrap();
+    let mut total_accessed_pages = match access_pages_global.get(&mut caller) {
+        Val::I64(counter) => counter as u64,
+        _ => {
+            return Err(process_err(
+                caller,
+                HypervisorError::ContractViolation(
+                    "Invalid main memory page access counter".to_string(),
+                ),
+            ))
+        }
+    };
+    total_accessed_pages += 1;
+    access_pages_global.set(&mut caller, Val::I64(total_accessed_pages as i64))?;
+    if total_accessed_pages > MAIN_MEMORY_PAGE_ACCESS_LIMIT {
+        Err(process_err(&mut caller, HypervisorError::MemoryAccessLimitExceeded(
+            format!("Exceeded the limit for the number of accessed pages in the main memory in a single message execution: limit: {} KB.",
+                MAIN_MEMORY_PAGE_ACCESS_LIMIT * (PAGE_SIZE as u64 / 1024),
+            )
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+enum AccessKind {
+    Read,
+    Write,
+}
+
+fn system_api_main_memory_access<S: SystemApi>(
+    caller: &mut Caller<'_, StoreData<S>>,
+    kind: AccessKind,
+    address: usize,
+    length: usize,
+) -> Result<(), anyhow::Error> {
+    if caller.get_export(WASM_HEAP_BYTEMAP_MEMORY_NAME).is_some() {
+        let write_access = match kind {
+            AccessKind::Read => 0,
+            AccessKind::Write => 1,
+        };
+        main_bulk_access_guard(caller, address, length, write_access)
+    } else {
+        Ok(())
+    }
 }
