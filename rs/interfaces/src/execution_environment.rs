@@ -82,6 +82,7 @@ pub enum PerformanceCounterType {
     // The number of WebAssembly instructions the canister has executed since
     // the creation of the current call context.
     CallContextInstructions(i64),
+    DirtyPages(i64),
 }
 
 /// System API call ids to track their execution (in alphabetical order).

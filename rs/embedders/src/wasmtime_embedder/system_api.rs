@@ -58,6 +58,15 @@ fn get_num_instructions_global(caller: &Caller<'_, StoreData>) -> HypervisorResu
         .ok_or_else(|| unexpected_err("DataStore instructions counter is None".into()))
 }
 
+/// Gets the global variable that stores the dirty page counter from `caller`.
+#[inline(always)]
+fn get_num_dirty_pages_global(caller: &Caller<'_, StoreData>) -> HypervisorResult<Global> {
+    caller
+        .data()
+        .num_dirty_pages_global
+        .ok_or_else(|| unexpected_err("DataStore dirty page counter is None".into()))
+}
+
 #[inline(always)]
 fn load_value(global: &Global, caller: &mut Caller<'_, StoreData>) -> HypervisorResult<i64> {
     match global.get(caller) {
@@ -287,6 +296,8 @@ fn ic0_performance_counter_helper(
 ) -> HypervisorResult<u64> {
     let num_instructions_global = get_num_instructions_global(caller)?;
     let instruction_counter = load_value(&num_instructions_global, caller)?;
+    let num_dirty_page_global = get_num_dirty_pages_global(caller)?;
+    let dirty_page_counter = load_value(&num_dirty_page_global, caller)?;
     match counter_type {
         0 => caller
             .data()
@@ -295,6 +306,10 @@ fn ic0_performance_counter_helper(
         1 => caller.data().system_api()?.ic0_performance_counter(
             PerformanceCounterType::CallContextInstructions(instruction_counter),
         ),
+        2 => caller
+            .data()
+            .system_api()?
+            .ic0_performance_counter(PerformanceCounterType::DirtyPages(dirty_page_counter)),
         _ => Err(HypervisorError::ContractViolation(format!(
             "Error getting performance counter type {}",
             counter_type

@@ -1,7 +1,10 @@
 //! This module is responsible for validating the wasm binaries that are
 //! installed on the Internet Computer.
 
-use super::{Complexity, WasmImportsDetails, WasmValidationDetails};
+use super::{
+    instrumentation::MAIN_MEMORY_DIRTY_PAGE_COUNTER_GLOBAL_NAME, Complexity, WasmImportsDetails,
+    WasmValidationDetails,
+};
 
 use ic_config::embedders::Config as EmbeddersConfig;
 use ic_replicated_state::canister_state::execution_state::{
@@ -25,9 +28,10 @@ use wasmparser::{ExternalKind, FuncType, Operator, StructuralType, TypeRef, ValT
 
 /// Symbols that are reserved and cannot be exported by canisters.
 #[doc(hidden)] // pub for usage in tests
-pub const RESERVED_SYMBOLS: [&str; 6] = [
+pub const RESERVED_SYMBOLS: [&str; 7] = [
     "canister counter_instructions",
     "canister_start",
+    MAIN_MEMORY_DIRTY_PAGE_COUNTER_GLOBAL_NAME,
     DIRTY_PAGES_COUNTER_GLOBAL_NAME,
     ACCESSED_PAGES_COUNTER_GLOBAL_NAME,
     STABLE_MEMORY_NAME,

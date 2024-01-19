@@ -2349,6 +2349,7 @@ impl SystemApi for SystemApiImpl {
                     self.message_instructions_executed(instruction_counter)
                         .get(),
                 )),
+            PerformanceCounterType::DirtyPages(dirty_page_counter) => Ok(dirty_page_counter as u64),
         };
         trace_syscall!(self, PerformanceCounter, result);
         result

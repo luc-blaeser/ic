@@ -38,7 +38,7 @@ use signal_stack::WasmtimeSignalStack;
 
 use crate::wasm_utils::instrumentation::{
     ACCESSED_PAGES_COUNTER_GLOBAL_NAME, DIRTY_PAGES_COUNTER_GLOBAL_NAME,
-    INSTRUCTIONS_COUNTER_GLOBAL_NAME,
+    INSTRUCTIONS_COUNTER_GLOBAL_NAME, MAIN_MEMORY_DIRTY_PAGE_COUNTER_GLOBAL_NAME,
 };
 use crate::{
     serialized_module::SerializedModuleBytes, wasm_utils::validation::wasmtime_validation_config,
@@ -340,6 +340,7 @@ impl WasmtimeEmbedder {
             StoreData {
                 system_api,
                 num_instructions_global: None,
+                num_dirty_pages_global: None,
                 log: self.log.clone(),
                 num_stable_dirty_pages_from_non_native_writes: NumPages::from(0),
             },
@@ -363,6 +364,8 @@ impl WasmtimeEmbedder {
 
         store.data_mut().num_instructions_global =
             instance.get_global(&mut store, INSTRUCTIONS_COUNTER_GLOBAL_NAME);
+        store.data_mut().num_dirty_pages_global =
+            instance.get_global(&mut store, MAIN_MEMORY_DIRTY_PAGE_COUNTER_GLOBAL_NAME);
 
         if let Some(exported_globals) = exported_globals {
             let instance_globals = get_exported_globals(
@@ -643,6 +646,7 @@ fn sigsegv_memory_tracker<S>(
 pub struct StoreData {
     pub system_api: Option<SystemApiImpl>,
     pub num_instructions_global: Option<wasmtime::Global>,
+    pub num_dirty_pages_global: Option<wasmtime::Global>,
     pub log: ReplicaLogger,
     /// Tracks the number of dirty pages in stable memory in non-native stable mode
     pub num_stable_dirty_pages_from_non_native_writes: NumPages,
@@ -887,6 +891,8 @@ impl WasmtimeInstance {
         );
         self.set_instruction_counter(x);
 
+        self.set_dirty_page_counter(access.dirty_pages.len() as i64);
+
         let stable_memory_dirty_pages: Vec<_> = match self.wasm_native_stable_memory {
             FlagStatus::Enabled => {
                 #[cfg(debug_assertions)]
@@ -1070,6 +1076,30 @@ impl WasmtimeInstance {
                 _ => panic!("invalid instruction counter type"),
             },
             None => panic!("couldn't find the instruction counter in the canister globals"),
+        }
+    }
+
+    /// Sets the dirty page counter to the given value.
+    pub fn set_dirty_page_counter(&mut self, dirty_page_counter: i64) {
+        match self.store.data().num_dirty_pages_global {
+            Some(num_dirty_pages_global) => {
+                match num_dirty_pages_global.set(&mut self.store, Val::I64(dirty_page_counter)) {
+                    Ok(_) => (),
+                    Err(e) => panic!("couldn't set the dirty page counter: {:?}", e),
+                }
+            }
+            None => panic!("couldn't find the dirty page counter in the canister globals"),
+        }
+    }
+
+    /// Returns the current instruction counter.
+    pub fn dirty_page_counter(&mut self) -> i64 {
+        match self.store.data().num_dirty_pages_global {
+            Some(num_dirty_pages) => match num_dirty_pages.get(&mut self.store) {
+                Val::I64(dirty_page_counter) => dirty_page_counter,
+                _ => panic!("invalid dirty page counter type"),
+            },
+            None => panic!("couldn't find the dirty page counter in the canister globals"),
         }
     }
 

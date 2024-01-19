@@ -465,6 +465,8 @@ const TABLE_STR: &str = "table";
 pub(crate) const INSTRUCTIONS_COUNTER_GLOBAL_NAME: &str = "canister counter_instructions";
 pub(crate) const DIRTY_PAGES_COUNTER_GLOBAL_NAME: &str = "canister counter_dirty_pages";
 pub(crate) const ACCESSED_PAGES_COUNTER_GLOBAL_NAME: &str = "canister counter_accessed_pages";
+pub(crate) const MAIN_MEMORY_DIRTY_PAGE_COUNTER_GLOBAL_NAME: &str =
+    "canister counter_main_memory_dirty_pages";
 const CANISTER_START_STR: &str = "canister_start";
 
 /// There is one byte for each OS page in the wasm heap.
@@ -651,6 +653,7 @@ fn inject_helper_functions(mut module: Module, wasm_native_stable_memory: FlagSt
 #[derive(Default)]
 pub(super) struct SpecialIndices {
     pub instructions_counter_ix: u32,
+    pub main_memory_dirty_page_counter_ix: u32,
     pub dirty_pages_counter_ix: Option<u32>,
     pub accessed_pages_counter_ix: Option<u32>,
     pub decr_instruction_counter_fn: u32,
@@ -699,13 +702,15 @@ pub(super) fn instrument(
     let num_functions = (module.functions.len() + num_imported_functions) as u32;
     let num_globals = (module.globals.len() + num_imported_globals) as u32;
 
+    let instructions_counter_ix = num_globals;
+    let main_memory_dirty_page_counter_ix = num_globals + 1;
     let dirty_pages_counter_ix;
     let accessed_pages_counter_ix;
     let count_clean_pages_fn;
     match wasm_native_stable_memory {
         FlagStatus::Enabled => {
-            dirty_pages_counter_ix = Some(num_globals + 1);
-            accessed_pages_counter_ix = Some(num_globals + 2);
+            dirty_pages_counter_ix = Some(num_globals + 2);
+            accessed_pages_counter_ix = Some(num_globals + 3);
             count_clean_pages_fn = Some(num_functions + 1);
         }
         FlagStatus::Disabled => {
@@ -716,7 +721,8 @@ pub(super) fn instrument(
     };
 
     let special_indices = SpecialIndices {
-        instructions_counter_ix: num_globals,
+        instructions_counter_ix,
+        main_memory_dirty_page_counter_ix,
         dirty_pages_counter_ix,
         accessed_pages_counter_ix,
         decr_instruction_counter_fn: num_functions,
@@ -1048,6 +1054,14 @@ fn export_additional_symbols<'a>(
     debug_assert!(super::validation::RESERVED_SYMBOLS.contains(&counter_export.name));
     module.exports.push(counter_export);
 
+    let counter_export = Export {
+        name: MAIN_MEMORY_DIRTY_PAGE_COUNTER_GLOBAL_NAME,
+        kind: ExternalKind::Global,
+        index: special_indices.main_memory_dirty_page_counter_ix,
+    };
+    debug_assert!(super::validation::RESERVED_SYMBOLS.contains(&counter_export.name));
+    module.exports.push(counter_export);
+
     if let Some(index) = special_indices.dirty_pages_counter_ix {
         let export = Export {
             name: DIRTY_PAGES_COUNTER_GLOBAL_NAME,
@@ -1080,6 +1094,15 @@ fn export_additional_symbols<'a>(
     }
 
     // push the instructions counter
+    module.globals.push(Global {
+        ty: GlobalType {
+            content_type: ValType::I64,
+            mutable: true,
+        },
+        init_expr: vec![Operator::I64Const { value: 0 }, Operator::End],
+    });
+
+    // push the main memory dirty page counter
     module.globals.push(Global {
         ty: GlobalType {
             content_type: ValType::I64,
