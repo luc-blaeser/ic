@@ -135,6 +135,7 @@ service ic : {
       reinstall;
       upgrade : opt record {
         skip_pre_upgrade: opt bool;
+        keep_main_memory: opt bool;
       }
     };
     canister_id : canister_id;
@@ -148,6 +149,7 @@ service ic : {
       reinstall;
       upgrade : opt record {
         skip_pre_upgrade: opt bool;
+        keep_main_memory: opt bool;
       };
     };
     target_canister: canister_id;

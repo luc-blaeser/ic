@@ -1,7 +1,8 @@
 use super::CanisterId;
 
 use hex::decode;
-use ic_management_canister_types::{self as ic00, CanisterInstallMode, Payload};
+use ic_execution_environment::execution::install_code::ENHANCED_ORTHOGONAL_PERSISTENCE_SECTION;
+use ic_management_canister_types::{self as ic00, CanisterInstallModeV2, Payload, UpgradeOptions};
 use ic_types::{
     messages::{SignedIngress, UserQuery},
     time::expiry_time_from_now,
@@ -9,7 +10,6 @@ use ic_types::{
 };
 
 use std::{
-    convert::TryFrom,
     fmt,
     fs::File,
     io::{self, Read},
@@ -216,6 +216,24 @@ fn parse_create(nonce: u64) -> Result<Message, String> {
     Ok(Message::Create(signed_ingress))
 }
 
+fn contains_icp_private_custom_section(wasm_binary: &[u8], name: &str) -> Result<bool, String> {
+    use wasmparser::{Parser, Payload::CustomSection};
+
+    let icp_section_name = format!("icp:private {name}");
+    let parser = Parser::new(0);
+    for payload in parser.parse_all(wasm_binary) {
+        match payload.map_err(|e| format!("Wasm parsing error: {}", e))? {
+            CustomSection(reader) => {
+                if reader.name() == icp_section_name {
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
 fn parse_install(
     nonce: u64,
     canister_id: &str,
@@ -235,14 +253,36 @@ fn parse_install(
     let canister_id = parse_canister_id(canister_id)?;
     let payload = parse_octet_string(payload)?;
 
+    let install_mode = match mode {
+        "install" => CanisterInstallModeV2::Install,
+        "reinstall" => CanisterInstallModeV2::Reinstall,
+        "upgrade" => {
+            let keep_main_memory = if contains_icp_private_custom_section(
+                wasm_data.as_ref(),
+                ENHANCED_ORTHOGONAL_PERSISTENCE_SECTION,
+            )? {
+                Some(true)
+            } else {
+                None
+            };
+            CanisterInstallModeV2::Upgrade(Some(UpgradeOptions {
+                skip_pre_upgrade: None,
+                keep_main_memory,
+            }))
+        }
+        _ => {
+            return Err(String::from("Unsupported install mode: {mode}"));
+        }
+    };
+
     let signed_ingress = SignedIngressBuilder::new()
         // `source` should become a self-authenticating id according
         // to https://sdk.dfinity.org/docs/interface-spec/index.html#id-classes
         .canister_id(ic00::IC_00)
         .method_name(ic00::Method::InstallCode)
         .method_payload(
-            ic00::InstallCodeArgs::new(
-                CanisterInstallMode::try_from(mode.to_string()).unwrap(),
+            ic00::InstallCodeArgsV2::new(
+                install_mode,
                 canister_id,
                 wasm_data,
                 payload,

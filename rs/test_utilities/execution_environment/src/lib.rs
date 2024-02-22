@@ -24,7 +24,7 @@ use ic_management_canister_types::{
     CanisterIdRecord, CanisterInstallMode, CanisterInstallModeV2, CanisterSettingsArgs,
     CanisterSettingsArgsBuilder, CanisterStatusType, EcdsaKeyId, EmptyBlob, InstallCodeArgs,
     InstallCodeArgsV2, LogVisibility, Method, Payload, ProvisionalCreateCanisterWithCyclesArgs,
-    SkipPreUpgrade, UpdateSettingsArgs,
+    UpdateSettingsArgs, UpgradeOptions,
 };
 use ic_metrics::MetricsRegistry;
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
@@ -795,16 +795,16 @@ impl ExecutionTest {
         Ok(())
     }
 
-    /// Upgrades the given canister with the given Wasm binary,
-    /// in the mode specified by value of 'skip_pre_upgrade' field.
+    /// Upgrades the given canister with the given Wasm binary and
+    /// upgrade options.
     pub fn upgrade_canister_v2(
         &mut self,
         canister_id: CanisterId,
         wasm_binary: Vec<u8>,
-        skip_pre_upgrade: Option<SkipPreUpgrade>,
+        upgrade_options: UpgradeOptions,
     ) -> Result<(), UserError> {
         let args = InstallCodeArgsV2::new(
-            CanisterInstallModeV2::Upgrade(skip_pre_upgrade),
+            CanisterInstallModeV2::Upgrade(Some(upgrade_options)),
             canister_id,
             wasm_binary,
             vec![],

@@ -897,14 +897,14 @@ impl CanisterManager {
     ///
     /// There are three modes of installation that are supported:
     ///
-    /// 1. `CanisterInstallMode::Install`
+    /// 1. `CanisterInstallModeV2::Install`
     ///    Used for installing code on an empty canister.
     ///
-    /// 2. `CanisterInstallMode::Reinstall`
+    /// 2. `CanisterInstallModeV2::Reinstall`
     ///    Used for installing code on a _non-empty_ canister. All existing
     ///    state in the canister is cleared.
     ///
-    /// 3. `CanisterInstallMode::Upgrade`
+    /// 3. `CanisterInstallModeV2::Upgrade`
     ///    Used for upgrading a canister while providing a mechanism to
     ///    preserve its state.
     ///
@@ -1885,6 +1885,9 @@ pub(crate) enum CanisterManagerError {
     WasmChunkStoreError {
         message: String,
     },
+    MissingUpgradeOptionError {
+        message: String,
+    },
 }
 
 impl From<CanisterManagerError> for UserError {
@@ -2118,6 +2121,14 @@ impl From<CanisterManagerError> for UserError {
                     ErrorCode::CanisterContractViolation,
                     format!(
                         "Error from Wasm chunk store: {}", message
+                    )
+                )
+            }
+            MissingUpgradeOptionError { message } => {
+                Self::new(
+                    ErrorCode::CanisterContractViolation,
+                    format!(
+                        "Missing upgrade option: {}", message
                     )
                 )
             }
