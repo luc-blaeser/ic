@@ -16,6 +16,7 @@ use std::os::raw::c_int;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::mem::size_of;
 
 const MIN_PAGES_TO_FREE: usize = 10000;
 // The start address of a page.
@@ -76,6 +77,9 @@ impl PageInner {
                 // initialized immediately after allocation.
                 assert!(self.is_valid());
             }
+            println!("debug: copy_nonoverlapping {} {} {}", slice.as_ptr() as usize, self.ptr.0.add(offset) as usize, slice.len());
+            assert_eq!(slice.as_ptr() as usize % size_of::<usize>(), 0);
+            assert_eq!(self.ptr.0.add(offset) as usize % size_of::<usize>(), 0);
             std::ptr::copy_nonoverlapping(slice.as_ptr(), self.ptr.0.add(offset), slice.len());
             // Update the validation information if it wasn't initialized yet or
             // became invalid.
