@@ -380,6 +380,21 @@ impl AllocationArea {
         self.start == self.end
     }
 
+    fn check(&mut self) {
+        println!("ALLOCATION AREA CHECK START {} {}", self.start as usize, self.end as usize);
+        assert_eq!(self.start as usize % PAGE_SIZE, 0);
+        assert_eq!(self.end as usize % PAGE_SIZE, 0);
+        unsafe {
+            let mut current = self.start;
+            while (current as usize) < self.end as usize {
+                let _ = current.read_volatile();
+                println!(" READ CHECKED {}", current as usize);
+                current = current.add(PAGE_SIZE);
+            }
+        }
+        println!("ALLOCATION AREA CHECK DONE");
+    }
+
     // SAFETY: The caller must ensure that `self.start` and `self.end`
     // are backed a valid mutable memory.
     unsafe fn allocate_page(
@@ -605,11 +620,13 @@ impl MmapBasedPageAllocatorCore {
         // SAFETY: We memory-mapped exactly `mmap_size` bytes, so `end` points one byte
         // after the last byte of the chunk.
         let end = unsafe { mmap_ptr.add(mmap_size) };
-        AllocationArea {
+        let mut area = AllocationArea {
             start,
             end,
             offset: mmap_file_offset,
-        }
+        };
+        area.check();
+        area
     }
 
     // Ensures that that last chunk of the file up to the given length is
