@@ -38,6 +38,7 @@ type InstallMode =
   [candidType|
     variant {install : null; reinstall : null; upgrade : opt record {
         skip_pre_upgrade : opt bool;
+        keep_main_memory : opt bool;
       }}
   |]
 
