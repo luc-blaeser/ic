@@ -56,15 +56,18 @@ impl Drop for PageInner {
     }
 }
 
-fn check_memory<T>(start: *const T, length: usize) {
-    println!("CHECK START {} {} {}", start as usize, length, size_of::<T>());
-    for index in 0..length {
+fn check_memory<T>(name: &str, start: *const T, length: usize) {
+    println!("CHECK {name} START {} {} {}", start as usize, length, size_of::<T>());
+    for offset in 0..length {
         unsafe {
-            let pointer = start.add(index);
+            let pointer = start.add(offset);
             let _ = pointer.read_volatile();
+            if offset % 1024 == 0 {
+                println!("OFFSET {offset} READ");
+            }
         }
     }
-    println!("CHECK DONE {} {} {}", start as usize, length, size_of::<T>());
+    println!("CHECK {name} DONE");
 }
 
 fn overlapping<T>(first: *const T, second: *const T, length: usize) -> bool {
@@ -103,8 +106,8 @@ impl PageInner {
             assert_eq!(slice.as_ptr() as usize % size_of::<usize>(), 0);
             assert_eq!(self.ptr.0.add(offset) as usize % size_of::<usize>(), 0);
 
-            check_memory(slice.as_ptr(), slice.len());
-            check_memory(self.ptr.0.add(offset), slice.len());
+            check_memory("source", slice.as_ptr(), slice.len());
+            check_memory("target", self.ptr.0.add(offset), slice.len());
 
             assert!(!overlapping(slice.as_ptr(), self.ptr.0.add(offset), slice.len()));
 
