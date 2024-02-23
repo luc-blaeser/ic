@@ -222,13 +222,10 @@ fn contains_icp_private_custom_section(wasm_binary: &[u8], name: &str) -> Result
     let icp_section_name = format!("icp:private {name}");
     let parser = Parser::new(0);
     for payload in parser.parse_all(wasm_binary) {
-        match payload.map_err(|e| format!("Wasm parsing error: {}", e))? {
-            CustomSection(reader) => {
-                if reader.name() == icp_section_name {
-                    return Ok(true);
-                }
+        if let CustomSection(reader) = payload.map_err(|e| format!("Wasm parsing error: {}", e))? {
+            if reader.name() == icp_section_name {
+                return Ok(true);
             }
-            _ => {}
         }
     }
     Ok(false)
