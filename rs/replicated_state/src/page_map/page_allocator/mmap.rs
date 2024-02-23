@@ -386,11 +386,14 @@ impl AllocationArea {
         &mut self,
         page_allocator: Option<&Arc<PageAllocatorInner>>,
     ) -> PageInner {
+
         assert!(!self.is_empty());
         let ptr = PagePtr(self.start);
         let offset = self.offset;
         self.start = self.start.add(PAGE_SIZE);
         self.offset += PAGE_SIZE as FileOffset;
+        println!("ALLOCATE {} {} {}", self.start as usize, self.offset as usize, self.end as usize);
+
         PageInner {
             ptr,
             offset,
