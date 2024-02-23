@@ -1644,10 +1644,7 @@ fn get_data(
 ) -> Result<Segments, WasmInstrumentationError> {
     let res = data_section
         .iter()
-        .filter(|segment| match &segment.kind {
-            ic_wasm_transform::DataSegmentKind::Passive => false,
-            _ => true
-        })
+        .filter(|segment| !matches!(&segment.kind, ic_wasm_transform::DataSegmentKind::Passive))
         .map(|segment| {
             let offset = match &segment.kind {
                 ic_wasm_transform::DataSegmentKind::Active {
