@@ -56,6 +56,28 @@ impl Drop for PageInner {
     }
 }
 
+fn check_memory<T>(start: *const T, length: usize) {
+    println!("CHECK START {} {} {}", start as usize, length, size_of::<T>());
+    for index in 0..length {
+        unsafe {
+            let pointer = start.add(index);
+            let _ = pointer.read_volatile();
+        }
+    }
+    println!("CHECK DONE {} {} {}", start as usize, length, size_of::<T>());
+}
+
+fn overlapping<T>(first: *const T, second: *const T, length: usize) -> bool {
+    let first_start = first as usize;
+    let first_end = unsafe { first.add(length) } as usize;
+
+    let second_start = second as usize;
+    let second_end = unsafe { second.add(length) } as usize;
+
+    first_start >= second_start && first_start < second_end ||
+    second_start >= first_start && second_start < first_end
+}
+
 impl PageInner {
     pub fn contents(&self) -> &PageBytes {
         // SAFETY: The provided reference to the page allocator is a witness that the
@@ -77,9 +99,15 @@ impl PageInner {
                 // initialized immediately after allocation.
                 assert!(self.is_valid());
             }
-            println!("debug: copy_nonoverlapping {} {} {}", slice.as_ptr() as usize, self.ptr.0.add(offset) as usize, slice.len());
+
             assert_eq!(slice.as_ptr() as usize % size_of::<usize>(), 0);
             assert_eq!(self.ptr.0.add(offset) as usize % size_of::<usize>(), 0);
+
+            check_memory(slice.as_ptr(), slice.len());
+            check_memory(self.ptr.0.add(offset), slice.len());
+
+            assert!(!overlapping(slice.as_ptr(), self.ptr.0.add(offset), slice.len()));
+
             std::ptr::copy_nonoverlapping(slice.as_ptr(), self.ptr.0.add(offset), slice.len());
             // Update the validation information if it wasn't initialized yet or
             // became invalid.
