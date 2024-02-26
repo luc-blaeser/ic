@@ -98,7 +98,18 @@ impl PageInner {
                 slice.len()
             ));
 
+            println!("mlock {:?} {:?}", slice.as_ptr(), slice.len());
+            mlock(slice.as_ptr() as *const c_void, slice.len()).unwrap();
+            println!("mlock {:?} {:?}", self.ptr.0.add(offset), slice.len());
+            mlock(self.ptr.0.add(offset) as *const c_void, slice.len()).unwrap();
+
             std::ptr::copy_nonoverlapping(slice.as_ptr(), self.ptr.0.add(offset), slice.len());
+
+            println!("munlock {:?} {:?}", slice.as_ptr(), slice.len());
+            munlock(slice.as_ptr() as *const c_void, slice.len()).unwrap();
+            println!("munlock {:?} {:?}", self.ptr.0.add(offset), slice.len());
+            munlock(self.ptr.0.add(offset) as *const c_void, slice.len()).unwrap();
+
             // Update the validation information if it wasn't initialized yet or
             // became invalid.
             if self.validation.non_zero_word_value == 0 || !self.is_valid() {
@@ -455,16 +466,16 @@ impl Drop for MmapBasedPageAllocatorCore {
         for chunk in self.chunks.iter() {
             let ptr = chunk.ptr as *mut c_void;
 
-            println!("munlock drop {:?} {}", ptr, chunk.size);
-            unsafe { 
-                munlock(ptr, chunk.size).unwrap_or_else(|err| {
-                    panic!(
-                        "Failed to munlock a page range {:?}..{:?}:
-                    {}",
-                        ptr, chunk.size, err
-                    )
-                });
-            }   
+            // println!("munlock drop {:?} {}", ptr, chunk.size);
+            // unsafe {
+            //     munlock(ptr, chunk.size).unwrap_or_else(|err| {
+            //         panic!(
+            //             "Failed to munlock a page range {:?}..{:?}:
+            //         {}",
+            //             ptr, chunk.size, err
+            //         )
+            //     });
+            // }
             // SAFETY: The chunk was created using `mmap`, so `munmap` should work.
             unsafe { munmap(ptr, chunk.size) }.unwrap_or_else(|err| {
                 panic!(
@@ -597,17 +608,17 @@ impl MmapBasedPageAllocatorCore {
             offset: mmap_file_offset,
         });
 
-        println!("mlock new_allocation_area {:?} {:?}", mmap_ptr, mmap_size);
-        unsafe {
-            mlock(mmap_ptr as *const c_void, mmap_size).unwrap_or_else(|err| {
-                panic!(
-                    "Failed to mlock a page range {:?}..{:?}:
-                    {}",
-                    mmap_ptr, mmap_size, err
-                )
-            });
-        }
-        check_allocated_memory(mmap_ptr, mmap_size);
+        // println!("mlock new_allocation_area {:?} {:?}", mmap_ptr, mmap_size);
+        // unsafe {
+        //     mlock(mmap_ptr as *const c_void, mmap_size).unwrap_or_else(|err| {
+        //         panic!(
+        //             "Failed to mlock a page range {:?}..{:?}:
+        //             {}",
+        //             mmap_ptr, mmap_size, err
+        //         )
+        //     });
+        // }
+        // check_allocated_memory(mmap_ptr, mmap_size);
 
         let start = mmap_ptr;
         // SAFETY: We memory-mapped exactly `mmap_size` bytes, so `end` points one byte
@@ -665,17 +676,17 @@ impl MmapBasedPageAllocatorCore {
             )
         }) as *mut u8;
 
-        println!("mlock grow_for_deserialization {:?} {:?}", mmap_ptr, mmap_size);
-        unsafe {
-            mlock(mmap_ptr as *const c_void, mmap_size).unwrap_or_else(|err| {
-                panic!(
-                    "Failed to mlock a page range {:?}..{:?}:
-                    {}",
-                    mmap_ptr, mmap_size, err
-                )
-            });
-        }
-        check_allocated_memory(mmap_ptr, mmap_size);
+        // println!("mlock grow_for_deserialization {:?} {:?}", mmap_ptr, mmap_size);
+        // unsafe {
+        //     mlock(mmap_ptr as *const c_void, mmap_size).unwrap_or_else(|err| {
+        //         panic!(
+        //             "Failed to mlock a page range {:?}..{:?}:
+        //             {}",
+        //             mmap_ptr, mmap_size, err
+        //         )
+        //     });
+        // }
+        // check_allocated_memory(mmap_ptr, mmap_size);
 
         self.chunks.push(Chunk {
             ptr: mmap_ptr,
@@ -746,15 +757,15 @@ unsafe fn madvise_remove(start_ptr: *mut u8, end_ptr: *mut u8) {
     #[cfg(not(target_os = "linux"))]
     let advise = MmapAdvise::MADV_DONTNEED;
 
-    println!("munlock madvise_remove {:?} {}", ptr, size);
-    // SAFETY: the range is mapped as shared and writable by precondition.
-    munlock(ptr, size as usize).unwrap_or_else(|err| {
-        panic!(
-            "Failed to munlock a page range {:?}..{:?}:
-        {}",
-            start_ptr, end_ptr, err
-        )
-    });
+    // println!("munlock madvise_remove {:?} {}", ptr, size);
+    // // SAFETY: the range is mapped as shared and writable by precondition.
+    // munlock(ptr, size as usize).unwrap_or_else(|err| {
+    //     panic!(
+    //         "Failed to munlock a page range {:?}..{:?}:
+    //     {}",
+    //         start_ptr, end_ptr, err
+    //     )
+    // });
 
     madvise(ptr, size as usize, advise).unwrap_or_else(|err| {
         panic!(
@@ -842,21 +853,21 @@ unsafe fn get_file_length(fd: RawFd) -> FileOffset {
 #[cfg(test)]
 mod tests;
 
-fn check_allocated_memory<T>(start: *mut T, length: usize) {
-    println!(
-        "ALLOCATED MEMORY CHECK: START {} {}",
-        start as usize, length
-    );
-    assert_eq!(start as usize % PAGE_SIZE, 0);
-    assert_eq!(length % PAGE_SIZE, 0);
-    unsafe {
-        let end = start.add(length);
-        let mut current = start;
-        while (current as usize) < end as usize {
-            let _ = current.read_volatile();
-            println!(" READ CHECKED {}", current as usize);
-            current = current.add(PAGE_SIZE);
-        }
-    }
-    println!("ALLOCATED MEMORY CHECK: DONE");
-}
+// fn check_allocated_memory<T>(start: *mut T, length: usize) {
+//     println!(
+//         "ALLOCATED MEMORY CHECK: START {} {}",
+//         start as usize, length
+//     );
+//     assert_eq!(start as usize % PAGE_SIZE, 0);
+//     assert_eq!(length % PAGE_SIZE, 0);
+//     unsafe {
+//         let end = start.add(length);
+//         let mut current = start;
+//         while (current as usize) < end as usize {
+//             let _ = current.read_volatile();
+//             println!(" READ CHECKED {}", current as usize);
+//             current = current.add(PAGE_SIZE);
+//         }
+//     }
+//     println!("ALLOCATED MEMORY CHECK: DONE");
+// }
