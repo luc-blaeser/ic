@@ -12,11 +12,11 @@ use ic_sys::{page_bytes_from_ptr, PageBytes, PageIndex, PAGE_SIZE};
 use libc::{c_void, close};
 use nix::sys::mman::{madvise, mlock, mmap, munlock, munmap, MapFlags, MmapAdvise, ProtFlags};
 use serde::{Deserialize, Serialize};
+use std::mem::size_of;
 use std::os::raw::c_int;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::mem::size_of;
 
 const MIN_PAGES_TO_FREE: usize = 10000;
 // The start address of a page.
@@ -56,20 +56,6 @@ impl Drop for PageInner {
     }
 }
 
-fn check_memory<T>(name: &str, start: *const T, length: usize) {
-    println!("CHECK {name} START {} {} {}", start as usize, length, size_of::<T>());
-    for offset in 0..length {
-        unsafe {
-            let pointer = start.add(offset);
-            let _ = pointer.read_volatile();
-            if offset % 1024 == 0 {
-                println!("OFFSET {offset} READ");
-            }
-        }
-    }
-    println!("CHECK {name} DONE");
-}
-
 fn overlapping<T>(first: *const T, second: *const T, length: usize) -> bool {
     let first_start = first as usize;
     let first_end = unsafe { first.add(length) } as usize;
@@ -77,8 +63,8 @@ fn overlapping<T>(first: *const T, second: *const T, length: usize) -> bool {
     let second_start = second as usize;
     let second_end = unsafe { second.add(length) } as usize;
 
-    first_start >= second_start && first_start < second_end ||
-    second_start >= first_start && second_start < first_end
+    first_start >= second_start && first_start < second_end
+        || second_start >= first_start && second_start < first_end
 }
 
 impl PageInner {
@@ -106,10 +92,11 @@ impl PageInner {
             assert_eq!(slice.as_ptr() as usize % size_of::<usize>(), 0);
             assert_eq!(self.ptr.0.add(offset) as usize % size_of::<usize>(), 0);
 
-            check_memory("source", slice.as_ptr(), slice.len());
-            check_memory("target", self.ptr.0.add(offset), slice.len());
-
-            assert!(!overlapping(slice.as_ptr(), self.ptr.0.add(offset), slice.len()));
+            assert!(!overlapping(
+                slice.as_ptr(),
+                self.ptr.0.add(offset),
+                slice.len()
+            ));
 
             std::ptr::copy_nonoverlapping(slice.as_ptr(), self.ptr.0.add(offset), slice.len());
             // Update the validation information if it wasn't initialized yet or
@@ -386,14 +373,11 @@ impl AllocationArea {
         &mut self,
         page_allocator: Option<&Arc<PageAllocatorInner>>,
     ) -> PageInner {
-
         assert!(!self.is_empty());
         let ptr = PagePtr(self.start);
         let offset = self.offset;
         self.start = self.start.add(PAGE_SIZE);
         self.offset += PAGE_SIZE as FileOffset;
-        println!("ALLOCATE {} {} {}", self.start as usize, self.offset as usize, self.end as usize);
-
         PageInner {
             ptr,
             offset,
@@ -596,17 +580,24 @@ impl MmapBasedPageAllocatorCore {
             )
         }) as *mut u8;
 
-        let new_file_length = unsafe { get_file_length(self.file_descriptor) };
-        println!("FILE OFFSET {} OLD LENGTH {} NEW LENGTH {} AVAILABLE {}", mmap_file_offset, file_len, new_file_length, new_file_length - mmap_file_offset);
-
-        println!("MMAP {} {}", mmap_ptr as usize, mmap_size);
         self.chunks.push(Chunk {
             ptr: mmap_ptr,
             size: mmap_size,
             offset: mmap_file_offset,
         });
+
+        println!("MMAP new_allocation_area {:?} {:?}", mmap_ptr, mmap_size);
+        unsafe {
+            mlock(mmap_ptr as *const c_void, mmap_size).unwrap_or_else(|err| {
+                panic!(
+                    "Failed to mlock a page range {:?}..{:?}:
+                    {}",
+                    mmap_ptr, mmap_size, err
+                )
+            });
+        }
         check_allocated_memory(mmap_ptr, mmap_size);
-        
+
         let start = mmap_ptr;
         // SAFETY: We memory-mapped exactly `mmap_size` bytes, so `end` points one byte
         // after the last byte of the chunk.
@@ -663,8 +654,18 @@ impl MmapBasedPageAllocatorCore {
             )
         }) as *mut u8;
 
+        println!("MMAP grow_for_deserialization {:?} {:?}", mmap_ptr, mmap_size);
+        unsafe {
+            mlock(mmap_ptr as *const c_void, mmap_size).unwrap_or_else(|err| {
+                panic!(
+                    "Failed to mlock a page range {:?}..{:?}:
+                    {}",
+                    mmap_ptr, mmap_size, err
+                )
+            });
+        }
         check_allocated_memory(mmap_ptr, mmap_size);
-        
+
         self.chunks.push(Chunk {
             ptr: mmap_ptr,
             size: mmap_size,
@@ -829,15 +830,13 @@ unsafe fn get_file_length(fd: RawFd) -> FileOffset {
 mod tests;
 
 fn check_allocated_memory<T>(start: *mut T, length: usize) {
-    println!("ALLOCATED MEMORY CHECK: START {} {}", start as usize, length);
+    println!(
+        "ALLOCATED MEMORY CHECK: START {} {}",
+        start as usize, length
+    );
     assert_eq!(start as usize % PAGE_SIZE, 0);
     assert_eq!(length % PAGE_SIZE, 0);
     unsafe {
-        mlock(start as usize as *const c_void, length).unwrap_or_else(|err| {
-            panic!(
-                "mlock failed: {}", err
-            )
-        });
         let end = start.add(length);
         let mut current = start;
         while (current as usize) < end as usize {
