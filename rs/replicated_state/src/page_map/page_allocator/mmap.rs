@@ -454,6 +454,17 @@ impl Drop for MmapBasedPageAllocatorCore {
     fn drop(&mut self) {
         for chunk in self.chunks.iter() {
             let ptr = chunk.ptr as *mut c_void;
+
+            println!("munlock drop {:?} {}", ptr, chunk.size);
+            unsafe { 
+                munlock(ptr, chunk.size).unwrap_or_else(|err| {
+                    panic!(
+                        "Failed to munlock a page range {:?}..{:?}:
+                    {}",
+                        ptr, chunk.size, err
+                    )
+                });
+            }   
             // SAFETY: The chunk was created using `mmap`, so `munmap` should work.
             unsafe { munmap(ptr, chunk.size) }.unwrap_or_else(|err| {
                 panic!(
@@ -586,7 +597,7 @@ impl MmapBasedPageAllocatorCore {
             offset: mmap_file_offset,
         });
 
-        println!("MMAP new_allocation_area {:?} {:?}", mmap_ptr, mmap_size);
+        println!("mlock new_allocation_area {:?} {:?}", mmap_ptr, mmap_size);
         unsafe {
             mlock(mmap_ptr as *const c_void, mmap_size).unwrap_or_else(|err| {
                 panic!(
@@ -654,7 +665,7 @@ impl MmapBasedPageAllocatorCore {
             )
         }) as *mut u8;
 
-        println!("MMAP grow_for_deserialization {:?} {:?}", mmap_ptr, mmap_size);
+        println!("mlock grow_for_deserialization {:?} {:?}", mmap_ptr, mmap_size);
         unsafe {
             mlock(mmap_ptr as *const c_void, mmap_size).unwrap_or_else(|err| {
                 panic!(
@@ -734,6 +745,8 @@ unsafe fn madvise_remove(start_ptr: *mut u8, end_ptr: *mut u8) {
     let advise = MmapAdvise::MADV_REMOVE;
     #[cfg(not(target_os = "linux"))]
     let advise = MmapAdvise::MADV_DONTNEED;
+
+    println!("munlock madvise_remove {:?} {}", ptr, size);
     // SAFETY: the range is mapped as shared and writable by precondition.
     munlock(ptr, size as usize).unwrap_or_else(|err| {
         panic!(
