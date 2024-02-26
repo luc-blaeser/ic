@@ -10,7 +10,7 @@ use super::{
 use cvt::{cvt, cvt_r};
 use ic_sys::{page_bytes_from_ptr, PageBytes, PageIndex, PAGE_SIZE};
 use libc::{c_void, close};
-use nix::sys::mman::{madvise, mlock, mmap, munmap, MapFlags, MmapAdvise, ProtFlags};
+use nix::sys::mman::{madvise, mlock, mmap, munlock, munmap, MapFlags, MmapAdvise, ProtFlags};
 use serde::{Deserialize, Serialize};
 use std::os::raw::c_int;
 use std::os::unix::io::RawFd;
@@ -734,6 +734,14 @@ unsafe fn madvise_remove(start_ptr: *mut u8, end_ptr: *mut u8) {
     #[cfg(not(target_os = "linux"))]
     let advise = MmapAdvise::MADV_DONTNEED;
     // SAFETY: the range is mapped as shared and writable by precondition.
+    munlock(ptr, size as usize).unwrap_or_else(|err| {
+        panic!(
+            "Failed to munlock a page range {:?}..{:?}:
+        {}",
+            start_ptr, end_ptr, err
+        )
+    });
+
     madvise(ptr, size as usize, advise).unwrap_or_else(|err| {
         panic!(
             "Failed to madvise a page range {:?}..{:?}:
