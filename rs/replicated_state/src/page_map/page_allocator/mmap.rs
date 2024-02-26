@@ -10,7 +10,7 @@ use super::{
 use cvt::{cvt, cvt_r};
 use ic_sys::{page_bytes_from_ptr, PageBytes, PageIndex, PAGE_SIZE};
 use libc::{c_void, close};
-use nix::sys::mman::{madvise, mmap, munmap, MapFlags, MmapAdvise, ProtFlags};
+use nix::sys::mman::{madvise, mlock, mmap, munmap, MapFlags, MmapAdvise, ProtFlags};
 use serde::{Deserialize, Serialize};
 use std::os::raw::c_int;
 use std::os::unix::io::RawFd;
@@ -380,21 +380,6 @@ impl AllocationArea {
         self.start == self.end
     }
 
-    fn check(&mut self) {
-        println!("ALLOCATION AREA CHECK START {} {}", self.start as usize, self.end as usize);
-        assert_eq!(self.start as usize % PAGE_SIZE, 0);
-        assert_eq!(self.end as usize % PAGE_SIZE, 0);
-        unsafe {
-            let mut current = self.start;
-            while (current as usize) < self.end as usize {
-                let _ = current.read_volatile();
-                println!(" READ CHECKED {}", current as usize);
-                current = current.add(PAGE_SIZE);
-            }
-        }
-        println!("ALLOCATION AREA CHECK DONE");
-    }
-
     // SAFETY: The caller must ensure that `self.start` and `self.end`
     // are backed a valid mutable memory.
     unsafe fn allocate_page(
@@ -620,18 +605,17 @@ impl MmapBasedPageAllocatorCore {
             size: mmap_size,
             offset: mmap_file_offset,
         });
-
+        check_allocated_memory(mmap_ptr, mmap_size);
+        
         let start = mmap_ptr;
         // SAFETY: We memory-mapped exactly `mmap_size` bytes, so `end` points one byte
         // after the last byte of the chunk.
         let end = unsafe { mmap_ptr.add(mmap_size) };
-        let mut area = AllocationArea {
+        AllocationArea {
             start,
             end,
             offset: mmap_file_offset,
-        };
-        area.check();
-        area
+        }
     }
 
     // Ensures that that last chunk of the file up to the given length is
@@ -679,6 +663,8 @@ impl MmapBasedPageAllocatorCore {
             )
         }) as *mut u8;
 
+        check_allocated_memory(mmap_ptr, mmap_size);
+        
         self.chunks.push(Chunk {
             ptr: mmap_ptr,
             size: mmap_size,
@@ -833,3 +819,24 @@ unsafe fn get_file_length(fd: RawFd) -> FileOffset {
 
 #[cfg(test)]
 mod tests;
+
+fn check_allocated_memory<T>(start: *mut T, length: usize) {
+    println!("ALLOCATED MEMORY CHECK: START {} {}", start as usize, length);
+    assert_eq!(start as usize % PAGE_SIZE, 0);
+    assert_eq!(length % PAGE_SIZE, 0);
+    unsafe {
+        mlock(start as usize as *const c_void, length).unwrap_or_else(|err| {
+            panic!(
+                "mlock failed: {}", err
+            )
+        });
+        let end = start.add(length);
+        let mut current = start;
+        while (current as usize) < end as usize {
+            let _ = current.read_volatile();
+            println!(" READ CHECKED {}", current as usize);
+            current = current.add(PAGE_SIZE);
+        }
+    }
+    println!("ALLOCATED MEMORY CHECK: DONE");
+}
