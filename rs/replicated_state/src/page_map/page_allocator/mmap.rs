@@ -611,7 +611,8 @@ impl MmapBasedPageAllocatorCore {
             )
         }) as *mut u8;
 
-        println!("FILE OFFSET {} LENGTH {} AVAILABLE {}", mmap_file_offset, unsafe { get_file_length(self.file_descriptor) }, unsafe { get_file_length(self.file_descriptor) } - mmap_file_offset);
+        let new_file_length = unsafe { get_file_length(self.file_descriptor) };
+        println!("FILE OFFSET {} OLD LENGTH {} NEW LENGTH {} AVAILABLE {}", mmap_file_offset, file_len, new_file_length, new_file_length - mmap_file_offset);
 
         println!("MMAP {} {}", mmap_ptr as usize, mmap_size);
         self.chunks.push(Chunk {
