@@ -1050,8 +1050,7 @@ pub struct CanisterUpgradeOptions {
 
 /// The mode with which a canister is installed.
 ///
-/// This second version of the mode allows someone to specify the
-/// optional `SkipPreUpgrade` parameter in case of an upgrade
+/// This second version of the mode allows someone to specify upgrade options.
 #[derive(
     Clone, Debug, Deserialize, PartialEq, Serialize, Eq, EnumString, Hash, CandidType, Copy, Default,
 )]
