@@ -517,8 +517,8 @@ impl InstallCodeHelper {
     }
 
     /// Replaces the execution state of the current canister with the freshly
-    /// created execution state. The stable memory is conditionally replaced
-    /// based on the given `stable_memory_handling`.
+    /// created execution state. The stable memory and the main memory are
+    /// conditionally replaced based on the given `memory_handling`.
     ///
     /// It also updates the compute and memory allocations with the requested
     /// values in `original` context.
