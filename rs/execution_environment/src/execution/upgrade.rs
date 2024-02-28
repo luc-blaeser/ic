@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use crate::as_round_instructions;
 use crate::canister_manager::{
-    DtsInstallCodeResult, InstallCodeContext, PausedInstallCodeExecution,
+    CanisterManagerError, DtsInstallCodeResult, InstallCodeContext, PausedInstallCodeExecution,
 };
 use crate::execution::common::{ingress_status_with_processing_state, update_round_limits};
 use crate::execution::install_code::{
-    canister_layout, finish_err, InstallCodeHelper, MainMemoryHandling, MemoryHandling,
-    OriginalContext, PausedInstallCodeHelper, StableMemoryHandling,
+    canister_layout, finish_err, CanisterMemoryHandling, InstallCodeHelper, OriginalContext,
+    PausedInstallCodeHelper,
 };
 use crate::execution_environment::{RoundContext, RoundLimits};
 use ic_base_types::PrincipalId;
@@ -30,6 +30,8 @@ use ic_types::{
     funds::Cycles,
     messages::{CanisterCall, RequestMetadata},
 };
+
+use super::install_code::MemoryHandling;
 
 #[cfg(test)]
 mod tests;
@@ -285,20 +287,35 @@ fn upgrade_stage_2_and_3a_create_execution_state_and_call_start(
         original.compilation_cost_handling,
     );
 
-    let main_memory_handling = match context.mode {
+    let main_memory_retention = match context.mode {
         CanisterInstallModeV2::Upgrade(Some(upgrade_options)) => {
             match upgrade_options.keep_main_memory {
-                Some(true) => MainMemoryHandling::Keep,
-                Some(false) => MainMemoryHandling::Replace { explicit: true },
-                None => MainMemoryHandling::Replace { explicit: false },
+                Some(true) => MemoryHandling::Keep,
+                Some(false) => MemoryHandling::Replace,
+                None => {
+                    // Safety guard checking that the `keep_main_memory` upgrade option has not been omitted in error.
+                    if helper.expects_orthogonal_persistence() {
+                        let instructions_left = helper.instructions_left();
+                        let error = CanisterManagerError::MissingUpgradeOptionError { message: "Enhanced orthogonal persistence requires the `keep_main_memory` upgrade option.".to_string() };
+                        return finish_err(
+                            clean_canister,
+                            instructions_left,
+                            original,
+                            round,
+                            error,
+                        );
+                    } else {
+                        MemoryHandling::Replace
+                    }
+                }
             }
         }
-        _ => MainMemoryHandling::Replace { explicit: false },
+        _ => MemoryHandling::Replace,
     };
 
-    let memory_handling = MemoryHandling {
-        stable_memory_handling: StableMemoryHandling::Keep,
-        main_memory_handling,
+    let memory_handling = CanisterMemoryHandling {
+        stable_memory_handling: MemoryHandling::Keep,
+        main_memory_handling: main_memory_retention,
     };
 
     if let Err(err) = helper.replace_execution_state_and_allocations(
