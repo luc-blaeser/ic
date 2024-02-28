@@ -406,9 +406,9 @@ checksum = "34fde25430d87a9388dadbe6e34d7f72a462c8b43ac8d309b42b0a8505d7e2a5"
 
 [[package]]
 name = "anyhow"
-version = "1.0.79"
+version = "1.0.80"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "080e9890a082662b09c1ad45f567faeeb47f22b5fb23895fbe1e651e718e25ca"
+checksum = "5ad32ce52e4161730f7098c077cd2ed6229b5804ccf99e5366be1ab72a98b4e1"
 
 [[package]]
 name = "arbitrary"
@@ -5699,9 +5699,9 @@ dependencies = [
 
 [[package]]
 name = "ic-cdk"
-version = "0.12.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4ec8231f413b8a4d74b99d7df26d6e917d6528a6245abde27f251210dcf9b72"
+checksum = "9f3d204af0b11c45715169c997858edb58fa8407d08f4fae78a6b415dd39a362"
 dependencies = [
  "candid",
  "ic-cdk-macros",
@@ -5712,9 +5712,9 @@ dependencies = [
 
 [[package]]
 name = "ic-cdk-macros"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff30a6ddb3b50f1b7df689d203d2135b037706678368b1d73a9a98e17f87a9b4"
+checksum = "a5a618e4020cea88e933d8d2f8c7f86d570ec06213506a80d4f2c520a9bba512"
 dependencies = [
  "candid",
  "proc-macro2 1.0.75",
@@ -5937,6 +5937,7 @@ dependencies = [
  "ic-crypto-sha3",
  "ic-crypto-test-utils-reproducible-rng",
  "ic-ethereum-types",
+ "ic-ledger-suite-orchestrator-test-utils",
  "ic-management-canister-types",
  "ic-metrics-encoder",
  "ic-stable-structures",
@@ -5977,6 +5978,8 @@ dependencies = [
  "ic-cketh-minter",
  "ic-ethereum-types",
  "ic-icrc1-ledger",
+ "ic-ledger-suite-orchestrator",
+ "ic-ledger-suite-orchestrator-test-utils",
  "ic-state-machine-tests",
  "ic-test-utilities-load-wasm",
  "icrc-ledger-types",
@@ -6076,6 +6079,7 @@ dependencies = [
 name = "ic-consensus-manager"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum 0.7.4",
  "backoff",
  "bytes",
@@ -8711,6 +8715,7 @@ dependencies = [
 name = "ic-memory-transport"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "axum 0.7.4",
  "bytes",
@@ -9595,6 +9600,7 @@ dependencies = [
 name = "ic-p2p-test-utils"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "axum 0.7.4",
  "bytes",
@@ -9761,6 +9767,7 @@ dependencies = [
 name = "ic-quic-transport"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "axum 0.7.4",
  "bincode",
@@ -9787,7 +9794,6 @@ dependencies = [
  "serde_bytes",
  "slog",
  "socket2 0.5.5",
- "thiserror",
  "tokio",
  "tokio-metrics",
  "tokio-rustls",

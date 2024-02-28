@@ -291,6 +291,19 @@
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
     - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
+".rules-master-pipeline-no-merge-train-rust-bazel-changed":
+  rules:
+    - changes:
+        - ".bazelrc"
+        - ".bazelversion"
+        - "**/*.bazel"
+        - "**/*.bzl"
+        - "**/*.lock"
+        - "**/*.rs"
+        - "**/*.toml"
+      if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
 ".rules-post-master":
   rules:
     - allow_failure: true
@@ -520,7 +533,6 @@ bazel-build-fuzzers-archives:
   needs: []
   rules:
     - changes:
-        - gitlab-ci/config/main.yml
         - bin/build-all-fuzzers.sh
         - bazel/fuzz_testing.bzl
       if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -647,16 +659,18 @@ bazel-config-check-all-rebuild:
     - ".bazel-test-all"
   needs: []
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"
-      variables:
-        BAZEL_EXTRA_ARGS_RULES: "--test_timeout_filters=short,moderate --flaky_test_attempts=3"
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\bhotfix\b/i
-      variables:
-        BAZEL_EXTRA_ARGS_RULES: "--test_timeout_filters=short,moderate"
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "tnet-test"
-    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"
+    - - changes:
+          - ".bazelrc"
+          - ".bazelversion"
+          - "**/*.bazel"
+          - "**/*.bzl"
+          - "**/*.lock"
+          - "**/*.rs"
+          - "**/*.toml"
+        if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+      - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
+      - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
   script:
     - "./gitlab-ci/src/bazel-ci/main.sh"
   tags:
@@ -1363,7 +1377,15 @@ bazel-test-macos:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train" && $CI_MERGE_REQUEST_TITLE =~ /\bhotfix\b/i
       variables:
         BAZEL_EXTRA_ARGS_RULES: "--test_timeout_filters=short,moderate"
-    - - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+    - - changes:
+          - ".bazelrc"
+          - ".bazelversion"
+          - "**/*.bazel"
+          - "**/*.bzl"
+          - "**/*.lock"
+          - "**/*.rs"
+          - "**/*.toml"
+        if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
       - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
       - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
   script:
@@ -2537,9 +2559,21 @@ delegated-identity-bench:
     TESTNET: cdslo
 dependencies-check:
   allow_failure: false
+  extends:
+    - ".rules-master-pipeline-no-merge-train-rust-bazel-changed"
   needs: []
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+    - changes:
+        - ".bazelrc"
+        - ".bazelversion"
+        - "**/*.bazel"
+        - "**/*.bzl"
+        - "**/*.lock"
+        - "**/*.rs"
+        - "**/*.toml"
+      if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
   script:
     - |
       set -euo pipefail
@@ -2689,7 +2723,15 @@ large-response-downloading-nightly:
 lock-generate:
   needs: []
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - changes:
+        - ".bazelrc"
+        - ".bazelversion"
+        - "**/*.bazel"
+        - "**/*.bzl"
+        - "**/*.lock"
+        - "**/*.rs"
+        - "**/*.toml"
+      if: $CI_PIPELINE_SOURCE == "merge_request_event"
   script:
     - |
       set -euo pipefail
