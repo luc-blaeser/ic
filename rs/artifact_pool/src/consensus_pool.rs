@@ -1,4 +1,5 @@
 use crate::backup::Backup;
+use crate::height_index::HeightIndex;
 use crate::{
     consensus_pool_cache::{
         get_highest_finalized_block, update_summary_block, ConsensusBlockChainImpl,
@@ -9,6 +10,7 @@ use crate::{
 };
 use ic_config::artifact_pool::{ArtifactPoolConfig, PersistentPoolBackend};
 use ic_interfaces::consensus_pool::PurgeableArtifactType;
+use ic_interfaces::time_source::MonotonicTimeSource;
 use ic_interfaces::{
     consensus_pool::{
         ChangeAction, ChangeSet, ConsensusBlockCache, ConsensusBlockChain, ConsensusPool,
@@ -21,12 +23,15 @@ use ic_interfaces::{
 use ic_logger::{warn, ReplicaLogger};
 use ic_metrics::buckets::linear_buckets;
 use ic_protobuf::types::v1 as pb;
+use ic_types::crypto::CryptoHashOf;
 use ic_types::NodeId;
 use ic_types::{
     artifact::ArtifactKind, artifact::ConsensusMessageFilter, artifact::ConsensusMessageId,
     artifact_kind::ConsensusArtifact, consensus::*, Height, SubnetId, Time,
 };
 use prometheus::{histogram_opts, labels, opts, Histogram, IntCounter, IntGauge};
+use std::collections::BTreeMap;
+use std::time::Instant;
 use std::{marker::PhantomData, sync::Arc, time::Duration};
 
 #[derive(Debug, Clone)]
@@ -273,6 +278,13 @@ pub struct ConsensusPoolImpl {
     validated_metrics: PoolMetrics,
     unvalidated_metrics: PoolMetrics,
     invalidated_artifacts: IntCounter,
+    /// Instants below height h are purged whenever all validated and unvalidated
+    /// artifacts are also purged below that height.
+    block_instants: BTreeMap<CryptoHashOf<Block>, Instant>,
+    /// Instants below height h are purged whenever all validated and unvalidated
+    /// artifacts are also purged below that height.
+    block_instants_index: HeightIndex<CryptoHashOf<Block>>,
+    time_source: Arc<dyn MonotonicTimeSource>,
     cache: Arc<ConsensusCacheImpl>,
     backup: Option<Backup>,
     log: ReplicaLogger,
@@ -371,6 +383,17 @@ impl ConsensusPool for UncachedConsensusPoolImpl {
     fn as_block_cache(&self) -> &dyn ConsensusBlockCache {
         self
     }
+
+    fn build_block_chain(&self, start: &Block, end: &Block) -> Arc<dyn ConsensusBlockChain> {
+        Arc::new(ConsensusBlockChainImpl::new(self, start, end))
+    }
+
+    fn block_instant(&self, _hash: &CryptoHashOf<Block>) -> Option<Instant> {
+        // The uncached consensus pool is only used temporarily for genesis init.
+        // We are not inserting new artifacts in this pool, so we don't have any
+        // recorded instants at this point.
+        None
+    }
 }
 
 impl ConsensusPoolImpl {
@@ -385,10 +408,12 @@ impl ConsensusPoolImpl {
         config: ArtifactPoolConfig,
         registry: ic_metrics::MetricsRegistry,
         log: ReplicaLogger,
+        time_source: Arc<dyn MonotonicTimeSource>,
     ) -> ConsensusPoolImpl {
         let mut pool = UncachedConsensusPoolImpl::new(config.clone(), log.clone());
         Self::init_genesis(cup_proto, pool.validated.as_mut());
-        let mut pool = Self::from_uncached(node_id, pool, registry.clone(), log.clone());
+        let mut pool =
+            Self::from_uncached(node_id, pool, registry.clone(), log.clone(), time_source);
         // If the back up directory is set, instantiate the backup component
         // and create a subdirectory with the subnet id as directory name.
         pool.backup = config.backup_config.map(|config| {
@@ -442,6 +467,7 @@ impl ConsensusPoolImpl {
         uncached: UncachedConsensusPoolImpl,
         registry: ic_metrics::MetricsRegistry,
         log: ReplicaLogger,
+        time_source: Arc<dyn MonotonicTimeSource>,
     ) -> ConsensusPoolImpl {
         let cache = Arc::new(ConsensusCacheImpl::new(&uncached));
         ConsensusPoolImpl {
@@ -454,6 +480,9 @@ impl ConsensusPoolImpl {
             ),
             validated_metrics: PoolMetrics::new(registry.clone(), POOL_TYPE_VALIDATED),
             unvalidated_metrics: PoolMetrics::new(registry, POOL_TYPE_UNVALIDATED),
+            block_instants_index: HeightIndex::new(),
+            block_instants: BTreeMap::new(),
+            time_source,
             cache,
             backup: None,
             log,
@@ -579,6 +608,32 @@ impl ConsensusPoolImpl {
 
         backup.store(artifacts_for_backup);
     }
+
+    /// Clears all instants for artifacts below the given height.
+    fn clear_instants(&mut self, height: Height) {
+        let range = self.block_instants_index.range(Height::new(0)..height);
+        for (_, bucket) in range {
+            for hash in bucket {
+                self.block_instants.remove(hash);
+            }
+        }
+        self.block_instants_index.remove_all_below(height);
+    }
+    /// Add instant measurements for the given consensus message to the pool's
+    /// collection, for message types that we care about. If the message was already
+    /// recorded, this function does nothing.
+    fn record_instant(&mut self, msg: &ConsensusMessage) {
+        let now = self.time_source.get_monotonic_time();
+        if let ConsensusMessage::BlockProposal(bp) = msg {
+            let hash = bp.content.get_hash().clone();
+            if self
+                .block_instants_index
+                .insert(bp.content.get_value().height, &hash)
+            {
+                self.block_instants.entry(hash).or_insert(now);
+            }
+        }
+    }
 }
 
 impl ConsensusPool for ConsensusPoolImpl {
@@ -596,6 +651,14 @@ impl ConsensusPool for ConsensusPoolImpl {
 
     fn as_block_cache(&self) -> &dyn ConsensusBlockCache {
         self.cache.as_ref()
+    }
+
+    fn build_block_chain(&self, start: &Block, end: &Block) -> Arc<dyn ConsensusBlockChain> {
+        Arc::new(ConsensusBlockChainImpl::new(self, start, end))
+    }
+
+    fn block_instant(&self, hash: &CryptoHashOf<Block>) -> Option<Instant> {
+        self.block_instants.get(hash).copied()
     }
 }
 
@@ -626,6 +689,7 @@ impl MutablePool<ConsensusArtifact> for ConsensusPoolImpl {
         for change_action in change_set {
             match change_action {
                 ChangeAction::AddToValidated(to_add) => {
+                    self.record_instant(&to_add.msg);
                     adverts.push(ConsensusArtifact::message_to_advert(&to_add.msg));
                     validated_ops.insert(to_add);
                 }
@@ -640,6 +704,7 @@ impl MutablePool<ConsensusArtifact> for ConsensusPoolImpl {
                     let timestamp = self.unvalidated.get_timestamp(&msg_id).unwrap_or_else(|| {
                         panic!("Timestamp is not found for MoveToValidated: {:?}", to_move)
                     });
+                    self.record_instant(&to_move);
                     unvalidated_ops.remove(msg_id);
                     validated_ops.insert(ValidatedConsensusArtifact {
                         msg: to_move,
@@ -650,12 +715,14 @@ impl MutablePool<ConsensusArtifact> for ConsensusPoolImpl {
                     unvalidated_ops.remove(to_remove.get_id());
                 }
                 ChangeAction::PurgeValidatedBelow(height) => {
+                    self.clear_instants(height);
                     validated_ops.purge_below(height);
                 }
-                ChangeAction::PurgeValidatedOfGivenTypeBelow(artifact_type, height) => {
+                ChangeAction::PurgeValidatedOfTypeBelow(artifact_type, height) => {
                     validated_ops.purge_type_below(artifact_type, height);
                 }
                 ChangeAction::PurgeUnvalidatedBelow(height) => {
+                    self.clear_instants(height);
                     unvalidated_ops.purge_below(height);
                 }
                 ChangeAction::HandleInvalid(to_remove, s) => {
@@ -677,7 +744,8 @@ impl MutablePool<ConsensusArtifact> for ConsensusPoolImpl {
                     // When we prepare a list of artifacts for a backup, we first remove all
                     // block proposals and notarizations. We need to do this to avoid "polluting" the backup
                     // partition with non-finalized blocks, which are the largest artifacts.
-                    if !matches!(&artifact.msg, &ConsensusMessage::BlockProposal(_)) && !matches!(&artifact.msg, &ConsensusMessage::Notarization(_)) =>
+                    if !matches!(&artifact.msg, &ConsensusMessage::BlockProposal(_))
+                    && !matches!(&artifact.msg, &ConsensusMessage::Notarization(_)) =>
                 {
                     Some(artifact.msg.clone())
                 }
@@ -905,16 +973,6 @@ impl ValidatedPoolReader<ConsensusArtifact> for ConsensusPoolImpl {
     }
 }
 
-/// Returns the block chain cache between the given start/end
-/// blocks (inclusive)
-pub fn build_consensus_block_chain(
-    consensus_pool: &dyn ConsensusPool,
-    start: &Block,
-    end: &Block,
-) -> Arc<dyn ConsensusBlockChain> {
-    Arc::new(ConsensusBlockChainImpl::new(consensus_pool, start, end))
-}
-
 #[cfg(test)]
 mod tests {
     use crate::backup::{BackupAge, PurgingError};
@@ -951,6 +1009,7 @@ mod tests {
         config: ArtifactPoolConfig,
         registry: ic_metrics::MetricsRegistry,
         log: ReplicaLogger,
+        time_source: Arc<dyn MonotonicTimeSource>,
     ) -> ConsensusPoolImpl {
         ConsensusPoolImpl::new(
             node_id,
@@ -959,6 +1018,7 @@ mod tests {
             config,
             registry,
             log,
+            time_source,
         )
     }
 
@@ -974,6 +1034,7 @@ mod tests {
                 pool_config,
                 ic_metrics::MetricsRegistry::new(),
                 no_op_logger(),
+                time_source.clone(),
             );
 
             let mut random_beacon = RandomBeacon::fake(RandomBeaconContent::new(
@@ -1032,6 +1093,7 @@ mod tests {
                 pool_config,
                 ic_metrics::MetricsRegistry::new(),
                 no_op_logger(),
+                time_source.clone(),
             );
 
             let random_beacon_1 = RandomBeacon::fake(RandomBeaconContent::new(
@@ -1108,6 +1170,7 @@ mod tests {
                 pool_config,
                 ic_metrics::MetricsRegistry::new(),
                 no_op_logger(),
+                time_source.clone(),
             );
 
             let random_beacon = RandomBeacon::fake(RandomBeaconContent::new(
@@ -1174,6 +1237,7 @@ mod tests {
                 pool_config,
                 ic_metrics::MetricsRegistry::new(),
                 no_op_logger(),
+                time_source.clone(),
             );
 
             let random_beacon = RandomBeacon::fake(RandomBeaconContent::new(
@@ -1206,6 +1270,7 @@ mod tests {
                 pool_config,
                 ic_metrics::MetricsRegistry::new(),
                 no_op_logger(),
+                time_source.clone(),
             );
 
             let height_offset = 5_000_000_000;
@@ -1390,6 +1455,7 @@ mod tests {
                 pool_config,
                 ic_metrics::MetricsRegistry::global(),
                 no_op_logger(),
+                time_source.clone(),
             );
 
             // creates a block for the given height and rank
@@ -1534,6 +1600,7 @@ mod tests {
                 pool_config,
                 ic_metrics::MetricsRegistry::new(),
                 no_op_logger(),
+                time_source.clone(),
             );
 
             let purging_interval = Duration::from_millis(100);
@@ -1889,6 +1956,7 @@ mod tests {
                 pool_config,
                 ic_metrics::MetricsRegistry::new(),
                 no_op_logger(),
+                time_source.clone(),
             );
 
             let map: Arc<RwLock<HashMap<String, Duration>>> = Default::default();

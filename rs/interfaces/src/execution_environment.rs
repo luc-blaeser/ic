@@ -14,8 +14,8 @@ use ic_types::{
     crypto::canister_threshold_sig::MasterEcdsaPublicKey,
     ingress::{IngressStatus, WasmResult},
     messages::{
-        AnonymousQuery, AnonymousQueryResponse, CertificateDelegation, HttpQueryResponse,
-        MessageId, SignedIngressContent, UserQuery,
+        AnonymousQuery, AnonymousQueryResponse, CertificateDelegation, MessageId,
+        SignedIngressContent, UserQuery,
     },
     Cycles, ExecutionRound, Height, NumInstructions, NumPages, Randomness, Time,
 };
@@ -429,7 +429,8 @@ pub enum QueryExecutionError {
 
 /// The response type to a `call()` request in [`QueryExecutionService`].
 /// An Ok response contains the response from the canister and the batch time at the time of execution.
-pub type QueryExecutionResponse = Result<(HttpQueryResponse, Time), QueryExecutionError>;
+pub type QueryExecutionResponse =
+    Result<(Result<WasmResult, UserError>, Time), QueryExecutionError>;
 
 /// Interface for the component to execute queries.
 pub type QueryExecutionService =
@@ -1175,20 +1176,6 @@ pub trait Scheduler: Send {
         current_round_type: ExecutionRoundType,
         registry_settings: &RegistryExecutionSettings,
     ) -> Self::State;
-}
-
-/// Synchronous interface for use in testing
-/// to filter out ingress messages that
-/// the canister is not willing to accept.
-pub trait IngressFilter: Send + Sync {
-    type State;
-
-    fn should_accept_ingress_message(
-        &self,
-        state: Arc<Self::State>,
-        provisional_whitelist: &ProvisionalWhitelist,
-        ingress: &SignedIngressContent,
-    ) -> Result<(), UserError>;
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]

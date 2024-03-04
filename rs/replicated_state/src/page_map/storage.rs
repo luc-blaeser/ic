@@ -12,15 +12,16 @@ use std::{
 use crate::page_map::{
     checkpoint::{Checkpoint, Mapping, ZEROED_PAGE},
     CheckpointSerialization, MappingSerialization, MemoryInstruction, MemoryInstructions,
-    MemoryMapOrData, PageDelta, PersistDestination, PersistenceError, StorageMetrics,
-    LABEL_OP_FLUSH, LABEL_OP_MERGE, LABEL_TYPE_INDEX, LABEL_TYPE_PAGE_DATA,
+    MemoryMapOrData, PageDelta, PersistenceError, StorageMetrics, LABEL_OP_FLUSH, LABEL_OP_MERGE,
+    LABEL_TYPE_INDEX, LABEL_TYPE_PAGE_DATA,
 };
 
 use bit_vec::BitVec;
+use ic_config::state_manager::LsmtConfig;
 use ic_sys::{PageBytes, PageIndex, PAGE_SIZE};
 use ic_types::Height;
 use itertools::Itertools;
-use phantom_newtype::Id;
+use phantom_newtype::{AmountOf, Id};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use strum_macros::{EnumCount, EnumIter};
@@ -256,6 +257,7 @@ impl Storage {
         })
     }
 }
+
 /// A single overlay file describing a not necessarily exhaustive set of pages.
 #[derive(Clone)]
 pub(crate) struct OverlayFile {
@@ -296,26 +298,46 @@ impl OverlayFile {
         get_page_in_mapping(&self.mapping, position)
     }
 
-    /// Write a new overlay file to `path` containing all pages from `delta`.
+    /// Write a new overlay to the destination specified by `storage_layout` containing
+    /// all pages from `delta`.
+    /// The resulting overlay may consist of multiple shards.
     pub(crate) fn write(
         delta: &PageDelta,
-        path: &Path,
+        storage_layout: &dyn StorageLayout,
+        height: Height,
+        lsmt_config: &LsmtConfig,
         metrics: &StorageMetrics,
     ) -> Result<(), PersistenceError> {
         let _timer = metrics
             .write_duration
             .with_label_values(&[LABEL_OP_FLUSH])
             .start_timer();
-        let max_size = delta.num_pages();
-        let mut page_data: Vec<&[u8]> = Vec::with_capacity(max_size);
-        let mut page_indices: Vec<PageIndex> = Vec::with_capacity(max_size);
+        if delta.max_page_index().is_none() {
+            return Ok(());
+        }
+        let max_index = delta.max_page_index().unwrap().get();
+        // We actually need a division with rounding up, but we skip empty shards anyway so simple +1
+        // works.
+        let num_shards = 1 + max_index / lsmt_config.shard_num_pages;
+        let mut page_data: Vec<Vec<&[u8]>> = vec![Vec::new(); num_shards as usize];
+        let mut page_indices: Vec<Vec<PageIndex>> = vec![Vec::new(); num_shards as usize];
 
         for (index, data) in delta.iter() {
-            page_data.push(data.contents());
-            page_indices.push(index);
+            let shard = index.get() / lsmt_config.shard_num_pages;
+            page_data[shard as usize].push(data.contents());
+            page_indices[shard as usize].push(index);
         }
 
-        write_overlay(&page_data, &page_indices, path, metrics, LABEL_OP_FLUSH)
+        for shard in 0..num_shards {
+            write_overlay(
+                &page_data[shard as usize],
+                &page_indices[shard as usize],
+                &storage_layout.overlay(height, Shard::new(shard)),
+                metrics,
+                LABEL_OP_FLUSH,
+            )?
+        }
+        Ok(())
     }
 
     /// Load an overlay file from `path`.
@@ -409,6 +431,44 @@ impl OverlayFile {
         }
     }
 
+    /// Get page index ranges overlapping with input `range`; clamp all fields of `PageIndexRange`
+    /// if the overlap is partial.
+    /// E.g. if the Index is [{2, 20, 0}, {25, 26, 18}, {30, 40, 19}] and `range` is (4, 31) return
+    /// an iterator over     [{4, 20, 2}, {25, 26, 18}, {30, 31, 19}]
+    fn get_overlapping_page_ranges(
+        &self,
+        range: Range<PageIndex>,
+    ) -> impl Iterator<Item = PageIndexRange> + '_ {
+        let slice = self.index_slice();
+        // `range.start` cannot be contained in any index range before this index, no need to iterate over them.
+        let start_slice_index =
+            slice.partition_point(|probe| PageIndexRange::from(probe).end_page <= range.start);
+
+        let range_end = range.end;
+        (start_slice_index..slice.len())
+            .map(|slice_index| PageIndexRange::from(&slice[slice_index]))
+            .take_while(move |page_index_range| page_index_range.start_page < range_end)
+            .map(move |page_index_range| {
+                // Return intersection of `range` and `page_index_range`.
+                let clamped_range = PageIndex::new(std::cmp::max(
+                    page_index_range.start_page.get(),
+                    range.start.get(),
+                ))
+                    ..PageIndex::new(std::cmp::min(
+                        page_index_range.end_page.get(),
+                        range.end.get(),
+                    ));
+                PageIndexRange {
+                    start_page: clamped_range.start,
+                    end_page: clamped_range.end,
+                    start_file_index: FileIndex::from(
+                        page_index_range.start_file_index.get() + clamped_range.start.get()
+                            - page_index_range.start_page.get(),
+                    ),
+                }
+            })
+    }
+
     /// Get memory instructions for all pages in `range`.
     ///
     /// Page indices marked true in `filter` are omitted from the result where convenient.
@@ -428,73 +488,50 @@ impl OverlayFile {
         range: Range<PageIndex>,
         filter: &mut BitVec,
     ) -> Vec<MemoryInstruction> {
-        let slice = self.index_slice();
-        // `range.start` cannot be contained in any index range before this index, no need to iterate over them.
-        let start_slice_index =
-            slice.partition_point(|probe| PageIndexRange::from(probe).end_page <= range.start);
-
         let mut result = Vec::<MemoryInstruction>::new();
 
-        for page_index_range in slice[start_slice_index..].iter().map(PageIndexRange::from) {
-            if page_index_range.start_page >= range.end {
-                // Any later `PageIndexRange` in `slice` won't intersect with `range` anymore.
-                break;
-            }
-            // `clamped_range` is the intersection of `range` and `page_index_range`.
-            let clamped_range = PageIndex::new(std::cmp::max(
-                page_index_range.start_page.get(),
-                range.start.get(),
-            ))
-                ..PageIndex::new(std::cmp::min(
-                    page_index_range.end_page.get(),
-                    range.end.get(),
-                ));
-            let shifted_range = (clamped_range.start.get() - range.start.get())
-                ..(clamped_range.end.get() - range.start.get());
-
-            // Count how many pages from `shifted_range` are not covered yet by `filter`.
-            let needed_pages = shifted_range
-                .clone()
+        for page_index_range in self.get_overlapping_page_ranges(range.clone()) {
+            // Count how many pages are not covered yet by `filter`.
+            let range_start = range.start.get();
+            let needed_pages = page_index_range
+                .iter_page_indices()
                 .filter(|page| {
                     !filter
-                        .get(*page as usize)
-                        .expect("Page index in shifted_range is out of bound")
+                        .get(page.get() as usize - range_start as usize)
+                        .expect("Page index is out of bound")
                 })
                 .count() as u64;
 
             if needed_pages > MAX_COPY_MEMORY_INSTRUCTION {
                 // If we need many pages from the `page_index_range`, we mmap the entire range.
-                let offset = (page_index_range.start_file_index.get() + clamped_range.start.get()
-                    - page_index_range.start_page.get()) as usize
-                    * PAGE_SIZE;
+                let offset = page_index_range.start_file_index.get() as usize * PAGE_SIZE;
                 result.push((
-                    clamped_range,
+                    page_index_range.start_page..page_index_range.end_page,
                     MemoryMapOrData::MemoryMap(self.mapping.file_descriptor().clone(), offset),
                 ));
             } else if needed_pages > 0 {
                 // We copy the needed pages individually.
-                for page_index in clamped_range.start.get()..clamped_range.end.get() {
-                    let shifted_index = page_index - range.start.get();
-                    if !filter
-                        .get(shifted_index as usize)
-                        .expect("Page index in shifted_range is out of bound")
+                for (page_index, file_index) in page_index_range.iter_page_and_file_indices() {
+                    let filter_index = page_index.get() - range.start.get();
+                    if filter
+                        .get(filter_index as usize)
+                        .expect("Page index is out of bound")
                     {
-                        let file_index = page_index_range.start_file_index.get() + page_index
-                            - page_index_range.start_page.get();
-                        let page = get_page_in_mapping(&self.mapping, FileIndex::new(file_index));
-                        // In a valid overlay file the file index is within range.
-                        debug_assert!(page.is_some());
-                        result.push((
-                            PageIndex::new(page_index)..PageIndex::new(page_index + 1),
-                            MemoryMapOrData::Data(page.unwrap()),
-                        ));
+                        continue;
                     }
+                    let page = get_page_in_mapping(&self.mapping, file_index);
+                    // In a valid overlay file the file index is within range.
+                    debug_assert!(page.is_some());
+                    result.push((
+                        page_index..PageIndex::new(page_index.get() + 1),
+                        MemoryMapOrData::Data(page.unwrap()),
+                    ));
                 }
             }
 
             // Mark all new pages in `filter`.
-            for page in shifted_range {
-                filter.set(page as usize, true);
+            for page_index in page_index_range.iter_page_indices() {
+                filter.set(page_index.get() as usize - range.start.get() as usize, true);
             }
         }
         result
@@ -713,16 +750,35 @@ fn check_mapping_correctness(mapping: &Mapping, path: &Path) -> Result<(), Persi
     Ok(())
 }
 
+/// Too large files are hard to write within one checkpoint interval, so we split them into multiple
+/// shards. E.g. if we need 400 GiB stable memory, we can write it as 8x50GiB files.
+/// If a certain range has no data, we don't create the shard. E.g. if the 400GiB file shaded by
+/// 50GiB only contains the last page, we would have only the shard number 7.
+pub struct ShardTag {}
+pub type Shard = AmountOf<ShardTag, u64>;
 /// Provide information from `StateLayout` about paths of a specific `PageMap`.
 pub trait StorageLayout {
     /// Base file path.
     fn base(&self) -> PathBuf;
 
     /// Path for overlay of given height.
-    fn overlay(&self, height: Height) -> PathBuf;
+    fn overlay(&self, height: Height, shard: Shard) -> PathBuf;
 
     /// All existing overlay files.
     fn existing_overlays(&self) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>>;
+
+    /// Get the height of an existing overlay path.
+    fn overlay_height(&self, overlay: &Path) -> Result<Height, Box<dyn std::error::Error>>;
+
+    /// Get the shard of an existing overlay path.
+    fn overlay_shard(&self, overlay: &Path) -> Result<Shard, Box<dyn std::error::Error>>;
+}
+
+/// Whether to merge into a base file or an overlay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MergeDestination {
+    BaseFile(PathBuf),
+    OverlayFile(PathBuf),
 }
 
 /// `MergeCandidate` shows which files to merge into a single `PageMap`.
@@ -732,10 +788,10 @@ pub struct MergeCandidate {
     overlays: Vec<PathBuf>,
     /// Base to merge if any.
     base: Option<PathBuf>,
-    /// File to create. The format is based on `PersistDestination` variant, either `Base` or
+    /// File to create. The format is based on `MergeDestination` variant, either `Base` or
     /// `Overlay`.
     /// We merge all the data from `overlays` and `base` into it, and remove old files.
-    dst: PersistDestination,
+    dst: MergeDestination,
     is_full: bool,
 }
 
@@ -796,7 +852,7 @@ impl MergeCandidate {
         Ok(Some(MergeCandidate {
             overlays,
             base,
-            dst: PersistDestination::OverlayFile(layout.overlay(height).to_path_buf()),
+            dst: MergeDestination::OverlayFile(layout.overlay(height, Shard::new(0)).to_path_buf()),
             is_full,
         }))
     }
@@ -817,7 +873,7 @@ impl MergeCandidate {
                 } else {
                     None
                 },
-                dst: PersistDestination::BaseFile(base_path),
+                dst: MergeDestination::BaseFile(base_path),
                 is_full: true,
             }))
         }
@@ -882,7 +938,7 @@ impl MergeCandidate {
     }
 
     fn merge_impl(
-        dst: &PersistDestination,
+        dst: &MergeDestination,
         existing_base: Option<Checkpoint>,
         existing: &[OverlayFile],
         is_full: bool,
@@ -950,10 +1006,10 @@ impl MergeCandidate {
         }
 
         match dst {
-            PersistDestination::OverlayFile(path) => {
+            MergeDestination::OverlayFile(path) => {
                 write_overlay(&pages_data, &pages_indices, path, metrics, LABEL_OP_MERGE)
             }
-            PersistDestination::BaseFile(path) => {
+            MergeDestination::BaseFile(path) => {
                 write_base(&pages_data, &pages_indices, path, metrics, LABEL_OP_MERGE)
             }
         }
@@ -991,9 +1047,8 @@ struct FileIndexTag;
 /// has `FileIndex` 1).
 type FileIndex = Id<FileIndexTag, u64>;
 
-/// A representation of a range of `PageIndex` that is intended to be easier to use
-/// than the raw representation in the file.
-#[derive(Copy, Clone, Debug)]
+/// A representation of a range of `PageIndex` backed by an overlay file.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct PageIndexRange {
     /// Start of the range in the `PageMap`, i.e. where to mmap to.
     start_page: PageIndex,
@@ -1015,6 +1070,7 @@ impl PageIndexRange {
         result[16..].copy_from_slice(&file_index);
         result
     }
+
     /// If a page is covered by this `PageIndexRange`, returns its `FileIndex`
     /// in the the overlay file.
     fn file_index(&self, index: PageIndex) -> Option<FileIndex> {
@@ -1025,6 +1081,19 @@ impl PageIndexRange {
                 self.start_file_index.get() + index.get() - self.start_page.get(),
             ))
         }
+    }
+
+    fn iter_page_indices(&self) -> impl Iterator<Item = PageIndex> + '_ {
+        (self.start_page.get()..self.end_page.get()).map(PageIndex::from)
+    }
+
+    fn iter_page_and_file_indices(&self) -> impl Iterator<Item = (PageIndex, FileIndex)> + '_ {
+        (self.start_page.get()..self.end_page.get()).map(|i| {
+            (
+                PageIndex::from(i),
+                FileIndex::from(i - self.start_page.get() + self.start_file_index.get()),
+            )
+        })
     }
 }
 
@@ -1171,6 +1240,9 @@ fn write_overlay(
     metrics: &StorageMetrics,
     op_label: &str, // `LABEL_OP_FLUSH` or `LABEL_OP_MERGE`
 ) -> Result<(), PersistenceError> {
+    if pages.is_empty() {
+        return Ok(());
+    }
     let ranges_serialized = group_pages_into_ranges(indices)
         .into_iter()
         .map(|range| range.bytes())
@@ -1242,5 +1314,7 @@ pub struct OverlayFileSerialization {
     pub mapping: MappingSerialization,
 }
 
+#[cfg(test)]
+pub mod test_utils;
 #[cfg(test)]
 mod tests;

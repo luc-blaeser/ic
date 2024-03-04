@@ -10,6 +10,7 @@ use ic_nns_constants::{
     self, GOVERNANCE_CANISTER_ID, LEDGER_CANISTER_ID, LIFELINE_CANISTER_ID, ROOT_CANISTER_ID,
     SNS_WASM_CANISTER_ID,
 };
+use ic_nns_governance::init::TEST_NEURON_1_ID;
 use ic_nns_governance::pb::v1::{
     manage_neuron, manage_neuron_response, proposal, CreateServiceNervousSystem,
     ExecuteNnsFunction, GetNeuronsFundAuditInfoRequest, GetNeuronsFundAuditInfoResponse,
@@ -23,12 +24,12 @@ use ic_nns_test_utils::{
         build_mainnet_sns_wasms_wasm, build_root_wasm, build_sns_wasms_wasm,
         NnsInitPayloadsBuilder,
     },
-    ids::TEST_NEURON_1_ID,
     sns_wasm::{
         build_archive_sns_wasm, build_governance_sns_wasm, build_index_ng_sns_wasm,
         build_ledger_sns_wasm, build_mainnet_archive_sns_wasm, build_mainnet_governance_sns_wasm,
-        build_mainnet_index_sns_wasm, build_mainnet_ledger_sns_wasm, build_mainnet_root_sns_wasm,
-        build_mainnet_swap_sns_wasm, build_root_sns_wasm, build_swap_sns_wasm,
+        build_mainnet_index_ng_sns_wasm, build_mainnet_ledger_sns_wasm,
+        build_mainnet_root_sns_wasm, build_mainnet_swap_sns_wasm, build_root_sns_wasm,
+        build_swap_sns_wasm,
     },
 };
 use ic_sns_governance::pb::v1::{self as sns_pb, governance::Version};
@@ -135,7 +136,7 @@ pub fn add_wasms_to_sns_wasm(
                 build_mainnet_root_sns_wasm(),
                 build_mainnet_governance_sns_wasm(),
                 build_mainnet_swap_sns_wasm(),
-                build_mainnet_index_sns_wasm(),
+                build_mainnet_index_ng_sns_wasm(),
                 build_mainnet_ledger_sns_wasm(),
                 build_mainnet_archive_sns_wasm(),
             )

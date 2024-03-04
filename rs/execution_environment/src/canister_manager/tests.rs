@@ -25,9 +25,9 @@ use ic_logger::replica_logger::no_op_logger;
 use ic_management_canister_types::{
     CanisterChange, CanisterChangeDetails, CanisterChangeOrigin, CanisterIdRecord,
     CanisterInstallMode, CanisterInstallModeV2, CanisterSettingsArgsBuilder,
-    CanisterStatusResultV2, CanisterStatusType, ChunkHash, ClearChunkStoreArgs, CreateCanisterArgs,
-    EmptyBlob, InstallCodeArgsV2, Method, Payload, StoredChunksArgs, StoredChunksReply,
-    UpdateSettingsArgs, UpgradeOptions, UploadChunkArgs, UploadChunkReply,
+    CanisterStatusResultV2, CanisterStatusType, CanisterUpgradeOptions, ChunkHash,
+    ClearChunkStoreArgs, CreateCanisterArgs, EmptyBlob, InstallCodeArgsV2, Method, Payload,
+    StoredChunksArgs, StoredChunksReply, UpdateSettingsArgs, UploadChunkArgs, UploadChunkReply,
 };
 use ic_metrics::MetricsRegistry;
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
@@ -4393,7 +4393,7 @@ fn test_enhanced_orthogonal_persistence_upgrade_preserves_main_memory() {
     test.upgrade_canister_v2(
         canister_id,
         version2_wasm,
-        UpgradeOptions {
+        CanisterUpgradeOptions {
             skip_pre_upgrade: None,
             keep_main_memory: Some(true),
         },
@@ -4426,7 +4426,7 @@ fn fails_with_missing_main_memory_option_for_enhanced_orthogonal_persistence() {
         .upgrade_canister_v2(
             canister_id,
             version2_wasm,
-            UpgradeOptions {
+            CanisterUpgradeOptions {
                 skip_pre_upgrade: None,
                 keep_main_memory: None,
             },
@@ -6391,7 +6391,7 @@ fn test_upgrade_with_skip_pre_upgrade_preserves_stable_memory() {
     test.upgrade_canister_v2(
         canister_id,
         UNIVERSAL_CANISTER_WASM.to_vec(),
-        UpgradeOptions {
+        CanisterUpgradeOptions {
             skip_pre_upgrade: Some(true),
             keep_main_memory: None,
         },
@@ -6411,7 +6411,7 @@ fn test_upgrade_with_skip_pre_upgrade_preserves_stable_memory() {
         .upgrade_canister_v2(
             canister_id,
             UNIVERSAL_CANISTER_WASM.to_vec(),
-            UpgradeOptions {
+            CanisterUpgradeOptions {
                 skip_pre_upgrade: None,
                 keep_main_memory: None,
             },

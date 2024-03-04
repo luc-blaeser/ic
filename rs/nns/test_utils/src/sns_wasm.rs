@@ -1,6 +1,5 @@
 use crate::{
     common::modify_wasm_bytes,
-    ids::TEST_NEURON_1_ID,
     state_test_helpers::{query, update, update_with_sender},
 };
 use candid::{Decode, Encode};
@@ -10,6 +9,7 @@ use ic_base_types::CanisterId;
 use ic_nervous_system_common_test_keys::TEST_NEURON_1_OWNER_PRINCIPAL;
 use ic_nns_common::{pb::v1::NeuronId, types::ProposalId};
 use ic_nns_constants::GOVERNANCE_CANISTER_ID;
+use ic_nns_governance::init::TEST_NEURON_1_ID;
 use ic_nns_governance::pb::v1::{
     manage_neuron::{Command, NeuronIdOrSubaccount},
     manage_neuron_response::Command as CommandResponse,
@@ -518,9 +518,9 @@ pub fn build_archive_sns_wasm() -> SnsWasm {
     }
 }
 
-/// Builds the SnsWasm for the index canister.
-pub fn build_index_sns_wasm() -> SnsWasm {
-    let index_wasm = Project::cargo_bin_maybe_from_env("ic-icrc1-index", &[]);
+/// Builds the SnsWasm for the index-ng canister.
+pub fn build_index_ng_sns_wasm() -> SnsWasm {
+    let index_wasm = Project::cargo_bin_maybe_from_env("ic-icrc1-index-ng", &[]);
     SnsWasm {
         wasm: index_wasm.bytes(),
         canister_type: SnsCanisterType::Index.into(),
@@ -528,17 +528,8 @@ pub fn build_index_sns_wasm() -> SnsWasm {
 }
 
 /// Builds the mainnet SnsWasm for the index canister.
-pub fn build_mainnet_index_sns_wasm() -> SnsWasm {
-    let index_wasm = Project::cargo_bin_maybe_from_env("mainnet-ic-icrc1-index", &[]);
-    SnsWasm {
-        wasm: index_wasm.bytes(),
-        canister_type: SnsCanisterType::Index.into(),
-    }
-}
-
-/// Builds the SnsWasm for the index-ng canister.
-pub fn build_index_ng_sns_wasm() -> SnsWasm {
-    let index_wasm = Project::cargo_bin_maybe_from_env("ic-icrc1-index-ng", &[]);
+pub fn build_mainnet_index_ng_sns_wasm() -> SnsWasm {
+    let index_wasm = Project::cargo_bin_maybe_from_env("mainnet-ic-icrc1-index-ng", &[]);
     SnsWasm {
         wasm: index_wasm.bytes(),
         canister_type: SnsCanisterType::Index.into(),

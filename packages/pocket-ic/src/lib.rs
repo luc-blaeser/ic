@@ -89,7 +89,7 @@ impl PocketIcBuilder {
     pub fn with_nns_subnet(self) -> Self {
         Self {
             config: ExtendedSubnetConfigSet {
-                nns: Some(SubnetSpec::New),
+                nns: Some(SubnetSpec::default()),
                 ..self.config
             },
         }
@@ -131,10 +131,7 @@ impl PocketIcBuilder {
     pub fn with_nns_state(self, nns_subnet_id: SubnetId, path_to_state: PathBuf) -> Self {
         Self {
             config: ExtendedSubnetConfigSet {
-                nns: Some(SubnetSpec::FromPath(
-                    path_to_state,
-                    RawSubnetId::from(nns_subnet_id),
-                )),
+                nns: Some(SubnetSpec::default().with_state_dir(path_to_state, nns_subnet_id)),
                 ..self.config
             },
         }
@@ -144,7 +141,7 @@ impl PocketIcBuilder {
     pub fn with_sns_subnet(self) -> Self {
         Self {
             config: ExtendedSubnetConfigSet {
-                sns: Some(SubnetSpec::New),
+                sns: Some(SubnetSpec::default()),
                 ..self.config
             },
         }
@@ -153,7 +150,7 @@ impl PocketIcBuilder {
     pub fn with_ii_subnet(self) -> Self {
         Self {
             config: ExtendedSubnetConfigSet {
-                ii: Some(SubnetSpec::New),
+                ii: Some(SubnetSpec::default()),
                 ..self.config
             },
         }
@@ -163,7 +160,7 @@ impl PocketIcBuilder {
     pub fn with_fiduciary_subnet(self) -> Self {
         Self {
             config: ExtendedSubnetConfigSet {
-                fiduciary: Some(SubnetSpec::New),
+                fiduciary: Some(SubnetSpec::default()),
                 ..self.config
             },
         }
@@ -173,7 +170,7 @@ impl PocketIcBuilder {
     pub fn with_bitcoin_subnet(self) -> Self {
         Self {
             config: ExtendedSubnetConfigSet {
-                bitcoin: Some(SubnetSpec::New),
+                bitcoin: Some(SubnetSpec::default()),
                 ..self.config
             },
         }
@@ -181,13 +178,20 @@ impl PocketIcBuilder {
 
     /// Add an empty generic system subnet
     pub fn with_system_subnet(mut self) -> Self {
-        self.config.system.push(SubnetSpec::New);
+        self.config.system.push(SubnetSpec::default());
         self
     }
 
     /// Add an empty generic application subnet
     pub fn with_application_subnet(mut self) -> Self {
-        self.config.application.push(SubnetSpec::New);
+        self.config.application.push(SubnetSpec::default());
+        self
+    }
+
+    pub fn with_benchmarking_application_subnet(mut self) -> Self {
+        self.config
+            .application
+            .push(SubnetSpec::default().with_benchmarking_instruction_config());
         self
     }
 }
@@ -346,6 +350,22 @@ impl PocketIc {
     #[instrument(skip(self), fields(instance_id=self.instance_id))]
     pub fn tick(&self) {
         let endpoint = "update/tick";
+        self.post::<(), _>(endpoint, "");
+    }
+
+    /// Configures the IC to make progress automatically,
+    /// i.e., periodically update the time of the IC
+    /// to the real time and execute rounds on the subnets.
+    #[instrument(skip(self), fields(instance_id=self.instance_id))]
+    pub fn auto_progress(&self) {
+        let endpoint = "auto_progress";
+        self.post::<(), _>(endpoint, "");
+    }
+
+    /// Stops automatic progress (see `auto_progress`) on the IC.
+    #[instrument(skip(self), fields(instance_id=self.instance_id))]
+    pub fn stop_progress(&self) {
+        let endpoint = "stop_progress";
         self.post::<(), _>(endpoint, "");
     }
 
@@ -758,32 +778,47 @@ impl PocketIc {
     }
 
     fn get<T: DeserializeOwned>(&self, endpoint: &str) -> T {
-        let result = self
-            .reqwest_client
-            .get(self.instance_url().join(endpoint).unwrap())
-            .header(PROCESSING_TIME_HEADER, PROCESSING_TIME_VALUE_MS)
-            .send()
-            .expect("HTTP failure");
-        Self::check_response(result)
+        loop {
+            let result = self
+                .reqwest_client
+                .get(self.instance_url().join(endpoint).unwrap())
+                .header(PROCESSING_TIME_HEADER, PROCESSING_TIME_VALUE_MS)
+                .send()
+                .expect("HTTP failure");
+            if let Some(t) = self.check_response(result) {
+                break t;
+            }
+        }
     }
 
     fn post<T: DeserializeOwned, B: Serialize>(&self, endpoint: &str, body: B) -> T {
-        let result = self
-            .reqwest_client
-            .post(self.instance_url().join(endpoint).unwrap())
-            .header(PROCESSING_TIME_HEADER, PROCESSING_TIME_VALUE_MS)
-            .json(&body)
-            .send()
-            .expect("HTTP failure");
-        Self::check_response(result)
+        loop {
+            let result = self
+                .reqwest_client
+                .post(self.instance_url().join(endpoint).unwrap())
+                .header(PROCESSING_TIME_HEADER, PROCESSING_TIME_VALUE_MS)
+                .json(&body)
+                .send()
+                .expect("HTTP failure");
+            if let Some(t) = self.check_response(result) {
+                break t;
+            }
+        }
     }
 
-    fn check_response<T: DeserializeOwned>(result: reqwest::blocking::Response) -> T {
+    fn check_response<T: DeserializeOwned>(
+        &self,
+        result: reqwest::blocking::Response,
+    ) -> Option<T> {
         match result.into() {
-            ApiResponse::Success(t) => t,
+            ApiResponse::Success(t) => Some(t),
             ApiResponse::Error { message } => panic!("{}", message),
             ApiResponse::Busy { state_label, op_id } => {
-                panic!("Busy: state_label: {}, op_id: {}", state_label, op_id)
+                debug!(
+                    "instance_id={} Instance is busy: state_label: {}, op_id: {}",
+                    self.instance_id, state_label, op_id
+                );
+                None
             }
             ApiResponse::Started { state_label, op_id } => {
                 panic!("Started: state_label: {}, op_id: {}", state_label, op_id)

@@ -434,6 +434,9 @@ def external_crates_repository(name, cargo_lockfile, lockfile, sanitizers_enable
             "futures-util": crate.spec(
                 version = "^0.3.8",
             ),
+            "get_if_addrs": crate.spec(
+                version = "^0.5.3",
+            ),
             "getrandom": crate.spec(
                 version = "^0.2",
                 features = [
@@ -669,6 +672,7 @@ def external_crates_repository(name, cargo_lockfile, lockfile, sanitizers_enable
                     "pem",
                     "pkcs8",
                     "precomputed-tables",
+                    "schnorr",
                     "std",
                 ],
                 default_features = False,
@@ -1281,6 +1285,7 @@ def external_crates_repository(name, cargo_lockfile, lockfile, sanitizers_enable
                 package = "tower-http",
                 version = "^0.5.1",
                 features = [
+                    "cors",
                     "limit",
                     "trace",
                     "request-id",
@@ -1358,8 +1363,7 @@ def external_crates_repository(name, cargo_lockfile, lockfile, sanitizers_enable
                 ],
             ),
             "wasm-smith": crate.spec(
-                git = "https://github.com/bytecodealliance/wasm-tools",
-                rev = "4eaf9fbbc4527ecf9e7b6005b360fb82ba84cc4e",
+                version = "^0.201.0",
                 default_features = False,
                 features = [
                     "wasmparser",

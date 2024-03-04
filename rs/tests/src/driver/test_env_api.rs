@@ -485,6 +485,22 @@ impl TopologySnapshot {
         result
     }
 
+    /// Like `block_for_newer_registry_version` but with a custom `duration` and `backoff`.
+    pub async fn block_for_newer_registry_version_within_duration(
+        &self,
+        duration: Duration,
+        backoff: Duration,
+    ) -> Result<TopologySnapshot> {
+        let minimum_version = self.local_registry.get_latest_version() + RegistryVersion::from(1);
+        let result = self
+            .block_for_min_registry_version_within_duration(minimum_version, duration, backoff)
+            .await;
+        if let Ok(ref topology) = result {
+            info!(self.env.logger(), "{}", topology);
+        }
+        result
+    }
+
     /// This method blocks and repeatedly fetches updates from the registry
     /// canister until the latest available registry version is higher or equal
     /// to `min_version`.
@@ -505,6 +521,17 @@ impl TopologySnapshot {
     ) -> Result<TopologySnapshot> {
         let duration = Duration::from_secs(180);
         let backoff = Duration::from_secs(2);
+        self.block_for_min_registry_version_within_duration(min_version, duration, backoff)
+            .await
+    }
+
+    /// Like `block_for_min_registry_version` but with a custom `duration` and `backoff`.
+    pub async fn block_for_min_registry_version_within_duration(
+        &self,
+        min_version: RegistryVersion,
+        duration: Duration,
+        backoff: Duration,
+    ) -> Result<TopologySnapshot> {
         let mut latest_version = self.local_registry.get_latest_version();
         if min_version > latest_version {
             latest_version = retry_async(&self.env.logger(), duration, backoff, || async move {
@@ -1143,10 +1170,17 @@ impl<T: HasDependencies + HasTestEnv> HasIcDependencies for T {
     }
 }
 
-fn fetch_sha256(base_url: String, file: &str, logger: Logger) -> Result<String> {
-    let sha256sums_url = format!("{base_url}/SHA256SUMS");
+pub const FETCH_SHA256SUMS_RETRY_TIMEOUT: Duration = Duration::from_secs(120);
+pub const FETCH_SHA256SUMS_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
-    let response = reqwest::blocking::get(sha256sums_url)?;
+fn fetch_sha256(base_url: String, file: &str, logger: Logger) -> Result<String> {
+    let response = retry(
+        logger.clone(),
+        FETCH_SHA256SUMS_RETRY_TIMEOUT,
+        FETCH_SHA256SUMS_RETRY_BACKOFF,
+        || reqwest::blocking::get(format!("{base_url}/SHA256SUMS")).map_err(|e| anyhow!("{:?}", e)),
+    )?;
+
     if !response.status().is_success() {
         error!(
             logger,

@@ -20,6 +20,7 @@ use ic_replicated_state::{
         execution_state::{NextScheduledMethod, WasmMetadata},
         system_state::{wasm_chunk_store::WasmChunkStoreMetadata, CanisterHistory, CyclesUseCase},
     },
+    page_map::Shard,
     CallContextManager, CanisterStatus, ExecutionTask, ExportedFunctions, Global, NumWasmPages,
 };
 use ic_sys::{fs::sync_path, mmap::ScopedMmap};
@@ -165,6 +166,7 @@ pub struct CanisterStateBits {
     pub total_query_stats: TotalQueryStats,
     pub log_visibility: LogVisibility,
     pub canister_log_records: Vec<CanisterLogRecord>,
+    pub next_canister_log_record_idx: u64,
 }
 
 /// This struct contains bits of the `CanisterSnapshot` that are not already
@@ -185,6 +187,10 @@ pub struct CanisterSnapshotBits {
     pub certified_data: Vec<u8>,
     /// The metadata required for a wasm chunk store.
     pub wasm_chunk_store_metadata: WasmChunkStoreMetadata,
+    /// The size of the stable memory in pages.
+    pub stable_memory_size: NumWasmPages,
+    /// The size of the wasm memory in pages.
+    pub wasm_memory_size: NumWasmPages,
 }
 
 #[derive(Clone)]
@@ -1394,6 +1400,62 @@ pub struct CanisterLayout<Permissions: AccessPolicy> {
     permissions_tag: PhantomData<Permissions>,
 }
 
+/// Get overlay height as encoded in CanisterLayout.
+pub fn overlay_height(overlay: &Path) -> Result<Height, LayoutError> {
+    let file_name = overlay
+        .file_name()
+        .ok_or(LayoutError::CorruptedLayout {
+            path: overlay.to_path_buf(),
+            message: "No file name".to_owned(),
+        })?
+        .to_str()
+        .ok_or(LayoutError::CorruptedLayout {
+            path: overlay.to_path_buf(),
+            message: "Cannot convert file name to string".to_owned(),
+        })?;
+    let hex = file_name
+        .split('_')
+        .next()
+        .ok_or(LayoutError::CorruptedLayout {
+            path: overlay.to_path_buf(),
+            message: "Cannot parse file name".to_owned(),
+        })?;
+    u64::from_str_radix(hex, 16)
+        .map(Height::new)
+        .map_err(|err| LayoutError::CorruptedLayout {
+            path: overlay.to_path_buf(),
+            message: format!("failed to get height for overlay {}: {}", hex, err),
+        })
+}
+
+/// Get overlay height as encoded in CanisterLayout.
+pub fn overlay_shard(overlay: &Path) -> Result<Shard, LayoutError> {
+    let file_name = overlay
+        .file_name()
+        .ok_or(LayoutError::CorruptedLayout {
+            path: overlay.to_path_buf(),
+            message: "No file name".to_owned(),
+        })?
+        .to_str()
+        .ok_or(LayoutError::CorruptedLayout {
+            path: overlay.to_path_buf(),
+            message: "Cannot convert file name to string".to_owned(),
+        })?;
+    let hex = file_name
+        .split('_')
+        .nth(1)
+        .ok_or(LayoutError::CorruptedLayout {
+            path: overlay.to_path_buf(),
+            message: "Cannot parse file name".to_owned(),
+        })?;
+    u64::from_str_radix(hex, 16)
+        .map(Shard::new)
+        .map_err(|err| LayoutError::CorruptedLayout {
+            path: overlay.to_path_buf(),
+            message: format!("failed to get shard for overlay {}: {}", hex, err),
+        })
+}
+
 impl<Permissions: AccessPolicy> CanisterLayout<Permissions> {
     pub fn new(canister_root: PathBuf) -> Result<Self, LayoutError> {
         Permissions::check_dir(&canister_root)?;
@@ -1419,6 +1481,16 @@ impl<Permissions: AccessPolicy> CanisterLayout<Permissions> {
         &self,
     ) -> ProtoFileWith<pb_canister_state_bits::CanisterStateBits, Permissions> {
         self.canister_root.join(CANISTER_FILE).into()
+    }
+
+    /// Overlay path encoding, consistent with `overlay_height()` and `overlay_shard()`.
+    fn overlay_path(&self, name_end: &str, height: Height, shard: Shard) -> PathBuf {
+        self.canister_root.join(format!(
+            "{:016x}_{:04x}_{}",
+            height.get(),
+            shard.get(),
+            name_end,
+        ))
     }
 
     /// List all overlay files with a particular name ending.
@@ -1460,10 +1532,10 @@ impl<Permissions: AccessPolicy> CanisterLayout<Permissions> {
         self.overlays_impl("_vmemory_0.overlay")
     }
 
-    /// Name of a (potentially new) overlay file for the wasm memory written at `height`.
-    pub fn vmemory_0_overlay(&self, height: Height) -> PathBuf {
-        self.canister_root
-            .join(format!("{:016x}_vmemory_0.overlay", height.get()))
+    /// Name of a (potentially new) overlay file for the wasm memory written at `height` and shard
+    /// `shard`.
+    pub fn vmemory_0_overlay(&self, height: Height, shard: Shard) -> PathBuf {
+        self.overlay_path("vmemory_0.overlay", height, shard)
     }
 
     /// Base file for stable memory.
@@ -1476,10 +1548,10 @@ impl<Permissions: AccessPolicy> CanisterLayout<Permissions> {
         self.overlays_impl("_stable_memory.overlay")
     }
 
-    /// Name of a (potentially new) overlay file for the stable memory written at `height`.
-    pub fn stable_memory_overlay(&self, height: Height) -> PathBuf {
-        self.canister_root
-            .join(format!("{:016x}_stable_memory.overlay", height.get()))
+    /// Name of a (potentially new) overlay file for the stable memory written at `height` and shard
+    /// `shard`.
+    pub fn stable_memory_overlay(&self, height: Height, shard: Shard) -> PathBuf {
+        self.overlay_path("stable_memory.overlay", height, shard)
     }
 
     /// Base file for wasm chunk store.
@@ -1492,10 +1564,10 @@ impl<Permissions: AccessPolicy> CanisterLayout<Permissions> {
         self.overlays_impl("_wasm_chunk_store.overlay")
     }
 
-    /// Name of a (potentially new) overlay file for the wasm chunk store written at `height`.
-    pub fn wasm_chunk_store_overlay(&self, height: Height) -> PathBuf {
-        self.canister_root
-            .join(format!("{:016x}_wasm_chunk_store.overlay", height.get()))
+    /// Name of a (potentially new) overlay file for the wasm chunk store written at `height` and
+    /// shard `shard`.
+    pub fn wasm_chunk_store_overlay(&self, height: Height, shard: Shard) -> PathBuf {
+        self.overlay_path("wasm_chunk_store.overlay", height, shard)
     }
 }
 
@@ -1796,6 +1868,7 @@ impl From<CanisterStateBits> for pb_canister_state_bits::CanisterStateBits {
                 .into_iter()
                 .map(|record| record.into())
                 .collect(),
+            next_canister_log_record_idx: item.next_canister_log_record_idx,
         }
     }
 }
@@ -1921,6 +1994,7 @@ impl TryFrom<pb_canister_state_bits::CanisterStateBits> for CanisterStateBits {
                 .into_iter()
                 .map(|record| record.into())
                 .collect(),
+            next_canister_log_record_idx: value.next_canister_log_record_idx,
         })
     }
 }
@@ -1999,6 +2073,8 @@ impl From<&CanisterSnapshotBits> for pb_canister_snapshot_bits::CanisterSnapshot
             binary_hash: item.binary_hash.as_ref().map(|h| h.to_vec()),
             certified_data: item.certified_data.clone(),
             wasm_chunk_store_metadata: Some((&item.wasm_chunk_store_metadata).into()),
+            stable_memory_size: item.stable_memory_size.get() as u64,
+            wasm_memory_size: item.wasm_memory_size.get() as u64,
         }
     }
 }
@@ -2035,6 +2111,8 @@ impl TryFrom<pb_canister_snapshot_bits::CanisterSnapshotBits> for CanisterSnapsh
                 "CanisterSnapshotBits::wasm_chunk_store_metadata",
             )
             .unwrap_or_default(),
+            stable_memory_size: NumWasmPages::from(item.stable_memory_size as usize),
+            wasm_memory_size: NumWasmPages::from(item.wasm_memory_size as usize),
         })
     }
 }

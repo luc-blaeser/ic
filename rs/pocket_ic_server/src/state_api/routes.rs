@@ -4,25 +4,32 @@
 /// body. This has to be canonicalized into a PocketIc Operation before we can
 /// deterministically update the PocketIc state machine.
 ///
-use super::state::{InstanceState, OpOut, PocketIcApiState, PocketIcError, UpdateReply};
-use crate::pocket_ic::GetSubnet;
+use super::state::{ApiState, OpOut, PocketIcError, UpdateReply};
 use crate::pocket_ic::{
-    AddCycles, ExecuteIngressMessage, GetCyclesBalance, GetStableMemory, GetTime, PubKey, Query,
-    SetStableMemory, SetTime, Tick,
+    AddCycles, CallRequest, ExecuteIngressMessage, GetCyclesBalance, GetStableMemory, GetSubnet,
+    GetTime, PubKey, Query, QueryRequest, ReadStateRequest, SetStableMemory, SetTime,
+    StatusRequest, Tick,
 };
 use crate::{pocket_ic::PocketIc, BlobStore, InstanceId, Operation};
-use aide::axum::routing::{delete, get, post, ApiMethodRouter};
-use aide::axum::ApiRouter;
+use aide::{
+    axum::routing::{delete, get, post, ApiMethodRouter},
+    axum::ApiRouter,
+    NoApi,
+};
+
 use axum::{
+    body::{Body, Bytes},
     extract::{self, Path, State},
     http::{self, HeaderMap, HeaderName, StatusCode},
+    response::Response,
     Json,
 };
 use axum_extra::headers;
 use axum_extra::headers::HeaderMapExt;
 use backoff::backoff::Backoff;
-use backoff::exponential::ExponentialBackoffBuilder;
-use backoff::ExponentialBackoff;
+use backoff::{ExponentialBackoff, ExponentialBackoffBuilder};
+use hyper::header;
+use ic_http_endpoints_public::cors_layer;
 use ic_types::CanisterId;
 use pocket_ic::common::rest::{
     self, ApiResponse, ExtendedSubnetConfigSet, RawAddCycles, RawCanisterCall, RawCanisterId,
@@ -31,19 +38,20 @@ use pocket_ic::common::rest::{
 };
 use pocket_ic::WasmResult;
 use serde::Serialize;
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::{runtime::Runtime, sync::RwLock, time::Instant};
+use tower::ServiceBuilder;
 use tracing::trace;
+
+type PocketHttpResponse = (BTreeMap<String, Vec<u8>>, Vec<u8>);
 
 /// Name of a header that allows clients to specify for how long their are willing to wait for a
 /// response on a open http request.
 pub static TIMEOUT_HEADER_NAME: HeaderName = HeaderName::from_static("processing-timeout-ms");
 
-pub type ApiState = PocketIcApiState<PocketIc>;
-
 #[derive(Clone)]
 pub struct AppState {
-    pub api_state: ApiState,
+    pub api_state: Arc<ApiState>,
     pub min_alive_until: Arc<RwLock<Instant>>,
     pub runtime: Arc<Runtime>,
     pub blob_store: Arc<dyn BlobStore>,
@@ -55,7 +63,7 @@ where
     AppState: extract::FromRef<S>,
 {
     ApiRouter::new()
-        .directory_route("/query", post(handler_query))
+        .directory_route("/query", post(handler_json_query))
         .directory_route("/get_time", get(handler_get_time))
         .directory_route("/get_cycles", post(handler_get_cycles))
         .directory_route("/get_stable_memory", post(handler_get_stable_memory))
@@ -77,6 +85,18 @@ where
         .directory_route("/add_cycles", post(handler_add_cycles))
         .directory_route("/set_stable_memory", post(handler_set_stable_memory))
         .directory_route("/tick", post(handler_tick))
+}
+
+pub fn instance_api_v2_routes<S>() -> ApiRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+    AppState: extract::FromRef<S>,
+{
+    ApiRouter::new()
+        .directory_route("/status", get(handler_status))
+        .directory_route("/canister/:ecid/call", post(handler_call))
+        .directory_route("/canister/:ecid/query", post(handler_query))
+        .directory_route("/canister/:ecid/read_state", post(handler_read_state))
 }
 
 pub fn instances_routes<S>() -> ApiRouter<S>
@@ -101,13 +121,25 @@ where
         //
         // All the state-changing endpoints
         .nest("/:id/update", instance_update_routes())
+        //
+        // All the api v2 endpoints
+        .nest("/:id/api/v2", instance_api_v2_routes())
+        // Configures an IC instance to make progress automatically,
+        // i.e., periodically update the time of the IC instance
+        // to the real time and execute rounds on the subnets.
+        .api_route("/:id/auto_progress", post(auto_progress))
+        //
+        // Stop automatic progress (see endpoint `auto_progress`)
+        // on an IC instance.
+        .api_route("/:id/stop_progress", post(stop_progress))
+        .layer(ServiceBuilder::new().layer(cors_layer()))
 }
 
 async fn run_operation<T: Serialize>(
-    api_state: &ApiState,
+    api_state: Arc<ApiState>,
     instance_id: InstanceId,
     timeout: Option<Duration>,
-    op: impl Operation<TargetType = PocketIc> + Send + Sync + 'static,
+    op: impl Operation + Send + Sync + 'static,
 ) -> (StatusCode, ApiResponse<T>)
 where
     (StatusCode, ApiResponse<T>): From<OpOut>,
@@ -336,10 +368,39 @@ impl From<OpOut> for (StatusCode, ApiResponse<Vec<u8>>) {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct ApiV2Error(String);
+
+impl From<OpOut>
+    for (
+        StatusCode,
+        ApiResponse<Result<PocketHttpResponse, ApiV2Error>>,
+    )
+{
+    fn from(value: OpOut) -> Self {
+        match value {
+            OpOut::ApiV2Response((status, headers, bytes)) => (
+                StatusCode::from_u16(status).unwrap(),
+                ApiResponse::Success(Ok((headers, bytes))),
+            ),
+            OpOut::Error(PocketIcError::RequestRoutingError(e)) => (
+                StatusCode::BAD_REQUEST,
+                ApiResponse::Success(Err(ApiV2Error(e))),
+            ),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiResponse::Error {
+                    message: "operation returned invalid type".into(),
+                },
+            ),
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------------------------------------------- //
 // Read handlers
 
-pub async fn handler_query(
+pub async fn handler_json_query(
     State(AppState { api_state, .. }): State<AppState>,
     Path(instance_id): Path<InstanceId>,
     headers: HeaderMap,
@@ -351,7 +412,7 @@ pub async fn handler_query(
             let query_op = Query(canister_call);
             // TODO: how to know what run_operation returns, i.e. to what to parse it? (type safety?)
             // (applies to all handlers)
-            let (code, response) = run_operation(&api_state, instance_id, timeout, query_op).await;
+            let (code, response) = run_operation(api_state, instance_id, timeout, query_op).await;
             (code, Json(response))
         }
         Err(e) => (
@@ -370,7 +431,7 @@ pub async fn handler_get_time(
 ) -> (StatusCode, Json<ApiResponse<RawTime>>) {
     let timeout = timeout_or_default(headers);
     let time_op = GetTime {};
-    let (code, response) = run_operation(&api_state, instance_id, timeout, time_op).await;
+    let (code, response) = run_operation(api_state, instance_id, timeout, time_op).await;
     (code, Json(response))
 }
 
@@ -384,7 +445,7 @@ pub async fn handler_get_cycles(
     match CanisterId::try_from(raw_canister_id.canister_id) {
         Ok(canister_id) => {
             let get_op = GetCyclesBalance { canister_id };
-            let (code, response) = run_operation(&api_state, instance_id, timeout, get_op).await;
+            let (code, response) = run_operation(api_state, instance_id, timeout, get_op).await;
             (code, Json(response))
         }
         Err(e) => (
@@ -406,7 +467,7 @@ pub async fn handler_get_stable_memory(
     match CanisterId::try_from(raw_canister_id.canister_id) {
         Ok(canister_id) => {
             let get_op = GetStableMemory { canister_id };
-            let (code, response) = run_operation(&api_state, instance_id, timeout, get_op).await;
+            let (code, response) = run_operation(api_state, instance_id, timeout, get_op).await;
             (code, Json(response))
         }
         Err(e) => (
@@ -428,7 +489,7 @@ pub async fn handler_get_subnet(
     match CanisterId::try_from(raw_canister_id.canister_id) {
         Ok(canister_id) => {
             let op = GetSubnet { canister_id };
-            let (code, res) = run_operation(&api_state, instance_id, timeout, op).await;
+            let (code, res) = run_operation(api_state, instance_id, timeout, op).await;
             (code, Json(res))
         }
         Err(e) => (
@@ -451,8 +512,89 @@ pub async fn handler_pub_key(
         &subnet_id,
     )));
     let op = PubKey { subnet_id };
-    let (code, res) = run_operation(&api_state, instance_id, timeout, op).await;
+    let (code, res) = run_operation(api_state, instance_id, timeout, op).await;
     (code, Json(res))
+}
+
+pub async fn handler_status(
+    State(AppState {
+        api_state, runtime, ..
+    }): State<AppState>,
+    NoApi(Path(instance_id)): NoApi<Path<InstanceId>>,
+    bytes: Bytes,
+) -> (StatusCode, NoApi<Response<Body>>) {
+    let op = StatusRequest { bytes, runtime };
+    handler_api_v2(api_state, instance_id, op).await
+}
+
+pub async fn handler_call(
+    State(AppState {
+        api_state, runtime, ..
+    }): State<AppState>,
+    NoApi(Path((instance_id, effective_canister_id))): NoApi<Path<(InstanceId, CanisterId)>>,
+    bytes: Bytes,
+) -> (StatusCode, NoApi<Response<Body>>) {
+    let op = CallRequest {
+        effective_canister_id,
+        bytes,
+        runtime,
+    };
+    handler_api_v2(api_state, instance_id, op).await
+}
+
+pub async fn handler_query(
+    State(AppState {
+        api_state, runtime, ..
+    }): State<AppState>,
+    NoApi(Path((instance_id, effective_canister_id))): NoApi<Path<(InstanceId, CanisterId)>>,
+    bytes: Bytes,
+) -> (StatusCode, NoApi<Response<Body>>) {
+    let op = QueryRequest {
+        effective_canister_id,
+        bytes,
+        runtime,
+    };
+    handler_api_v2(api_state, instance_id, op).await
+}
+
+pub async fn handler_read_state(
+    State(AppState {
+        api_state, runtime, ..
+    }): State<AppState>,
+    NoApi(Path((instance_id, effective_canister_id))): NoApi<Path<(InstanceId, CanisterId)>>,
+    bytes: Bytes,
+) -> (StatusCode, NoApi<Response<Body>>) {
+    let op = ReadStateRequest {
+        effective_canister_id,
+        bytes,
+        runtime,
+    };
+    handler_api_v2(api_state, instance_id, op).await
+}
+
+async fn handler_api_v2<T: Operation + Send + Sync + 'static>(
+    api_state: Arc<ApiState>,
+    instance_id: InstanceId,
+    op: T,
+) -> (StatusCode, NoApi<Response<Body>>) {
+    let (code, res): (
+        StatusCode,
+        ApiResponse<Result<PocketHttpResponse, ApiV2Error>>,
+    ) = run_operation(api_state, instance_id, None, op).await;
+    let response = match res {
+        ApiResponse::Success(Ok((headers, bytes))) => {
+            let mut resp = Response::builder().status(code);
+            for (name, value) in headers {
+                resp = resp.header(name, value);
+            }
+            resp.body(Body::from(bytes)).unwrap()
+        }
+        ApiResponse::Success(Err(ApiV2Error(e))) => make_plaintext_response(code, e),
+        ApiResponse::Busy { .. } | ApiResponse::Started { .. } | ApiResponse::Error { .. } => {
+            make_plaintext_response(code, format!("{:?}", res))
+        }
+    };
+    (code, NoApi(response))
 }
 
 // ----------------------------------------------------------------------------------------------------------------- //
@@ -468,8 +610,7 @@ pub async fn handler_execute_ingress_message(
     match crate::pocket_ic::CanisterCall::try_from(raw_canister_call) {
         Ok(canister_call) => {
             let ingress_op = ExecuteIngressMessage(canister_call);
-            let (code, response) =
-                run_operation(&api_state, instance_id, timeout, ingress_op).await;
+            let (code, response) = run_operation(api_state, instance_id, timeout, ingress_op).await;
             (code, Json(response))
         }
         Err(e) => (
@@ -491,7 +632,7 @@ pub async fn handler_set_time(
     let op = SetTime {
         time: ic_types::Time::from_nanos_since_unix_epoch(time.nanos_since_epoch),
     };
-    let (code, response) = run_operation(&api_state, instance_id, timeout, op).await;
+    let (code, response) = run_operation(api_state, instance_id, timeout, op).await;
     (code, Json(response))
 }
 
@@ -504,7 +645,7 @@ pub async fn handler_add_cycles(
     let timeout = timeout_or_default(headers);
     match AddCycles::try_from(raw_add_cycles) {
         Ok(add_op) => {
-            let (code, response) = run_operation(&api_state, instance_id, timeout, add_op).await;
+            let (code, response) = run_operation(api_state, instance_id, timeout, add_op).await;
             (code, Json(response))
         }
         Err(e) => (
@@ -530,7 +671,7 @@ pub async fn handler_set_stable_memory(
     let timeout = timeout_or_default(headers);
     match SetStableMemory::from_store(raw, blob_store).await {
         Ok(set_op) => {
-            let (code, response) = run_operation(&api_state, instance_id, timeout, set_op).await;
+            let (code, response) = run_operation(api_state, instance_id, timeout, set_op).await;
             (code, Json(response))
         }
         Err(e) => (
@@ -549,7 +690,7 @@ pub async fn handler_tick(
 ) -> (StatusCode, Json<ApiResponse<()>>) {
     let timeout = timeout_or_default(headers);
     let op = Tick;
-    let (code, res) = run_operation(&api_state, instance_id, timeout, op).await;
+    let (code, res) = run_operation(api_state, instance_id, timeout, op).await;
     (code, Json(res))
 }
 
@@ -568,16 +709,12 @@ fn contains_unimplemented(config: ExtendedSubnetConfigSet) -> bool {
             .chain(config.system)
             .chain(config.application),
         |spec: pocket_ic::common::rest::SubnetSpec| {
-            spec.get_subnet_id().is_some()
-                || matches!(
-                    spec,
-                    pocket_ic::common::rest::SubnetSpec::FromBlobStore(_, _)
-                )
+            spec.get_subnet_id().is_some() || !spec.is_supported()
         },
-    ) || matches!(
-        config.nns,
-        Some(pocket_ic::common::rest::SubnetSpec::FromBlobStore(_, _))
-    )
+    ) || config
+        .nns
+        .map(|spec| !spec.is_supported())
+        .unwrap_or_default()
 }
 
 /// Create a new empty IC instance from a given subnet configuration.
@@ -599,12 +736,12 @@ pub async fn create_instance(
             }),
         );
     }
-    // TODO: Remove this once the SubnetSpec variants are implemented
+    // TODO: Remove this once the SubnetStateConfig variants are implemented
     if contains_unimplemented(subnet_configs.clone()) {
         return (
             StatusCode::BAD_REQUEST,
             Json(rest::CreateInstanceResponse::Error {
-                message: "SubnetSpec::FromPath is currently only implemented for NNS. SubnetSpec::FromBlobStore is not yet implemented".to_owned(),
+                message: "SubnetStateConfig::FromPath is currently only implemented for NNS. SubnetStateConfig::FromBlobStore is not yet implemented".to_owned(),
             }),
         );
     }
@@ -627,17 +764,7 @@ pub async fn create_instance(
 pub async fn list_instances(
     State(AppState { api_state, .. }): State<AppState>,
 ) -> Json<Vec<String>> {
-    let instances = api_state.list_instances().await;
-    let instances: Vec<String> = instances
-        .iter()
-        .map(|instance_state| match instance_state {
-            InstanceState::Busy { state_label, op_id } => {
-                format!("Busy({:?}, {:?})", state_label, op_id)
-            }
-            InstanceState::Available(_) => "Available".to_string(),
-            InstanceState::Deleted => "Deleted".to_string(),
-        })
-        .collect();
+    let instances = api_state.list_instance_states().await;
     Json(instances)
 }
 
@@ -647,6 +774,22 @@ pub async fn delete_instance(
 ) -> StatusCode {
     api_state.delete_instance(id).await;
     StatusCode::OK
+}
+
+pub async fn auto_progress(
+    State(AppState { api_state, .. }): State<AppState>,
+    Path(id): Path<InstanceId>,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    api_state.auto_progress(id).await;
+    (StatusCode::OK, Json(ApiResponse::Success(())))
+}
+
+pub async fn stop_progress(
+    State(AppState { api_state, .. }): State<AppState>,
+    Path(id): Path<InstanceId>,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    api_state.stop_progress(id).await;
+    (StatusCode::OK, Json(ApiResponse::Success(())))
 }
 
 pub trait RouterExt<S>
@@ -705,4 +848,19 @@ impl headers::Header for ProcessingTimeout {
 
 pub fn timeout_or_default(header_map: HeaderMap) -> Option<Duration> {
     header_map.typed_get::<ProcessingTimeout>().map(|x| x.0)
+}
+
+// ----------------------------------------------------------------------------------------------------------------- //
+// HTTP handler helpers
+
+const CONTENT_TYPE_TEXT: &str = "text/plain";
+
+fn make_plaintext_response(status: StatusCode, message: String) -> Response<Body> {
+    let mut resp = Response::new(Body::from(message));
+    *resp.status_mut() = status;
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static(CONTENT_TYPE_TEXT),
+    );
+    resp
 }

@@ -31,8 +31,7 @@ use ic_exhaustive_derive::ExhaustiveSet;
 use ic_management_canister_types::EcdsaKeyId;
 use ic_protobuf::{
     proxy::{try_from_option_field, ProxyDecodeError},
-    registry::crypto::v1 as crypto_pb,
-    registry::subnet::v1 as subnet_pb,
+    registry::{crypto::v1 as crypto_pb, subnet::v1 as subnet_pb},
     types::v1 as pb,
 };
 use phantom_newtype::Id;
@@ -1736,37 +1735,13 @@ pub trait EcdsaStats: Send + Sync {
     );
 
     /// Updates the set of signature requests being tracked currently.
-    fn update_active_signature_requests(&self, block_reader: &dyn EcdsaBlockReader);
+    fn update_active_signature_requests(&self, requests: Vec<RequestId>);
 
     /// Records the time taken to verify the signature share received for a request.
     fn record_sig_share_validation(&self, request_id: &RequestId, duration: Duration);
 
     /// Records the time taken to aggregate the signature shares for a request.
     fn record_sig_share_aggregation(&self, request_id: &RequestId, duration: Duration);
-}
-
-/// For testing
-pub struct EcdsaStatsNoOp {}
-impl EcdsaStats for EcdsaStatsNoOp {
-    fn update_active_transcripts(&self, _block_reader: &dyn EcdsaBlockReader) {}
-    fn update_active_quadruples(&self, _block_reader: &dyn EcdsaBlockReader) {}
-    fn record_support_validation(&self, _support: &IDkgDealingSupport, _duration: Duration) {}
-    fn record_support_aggregation(
-        &self,
-        _transcript_params: &IDkgTranscriptParams,
-        _support_shares: &[IDkgDealingSupport],
-        _duration: Duration,
-    ) {
-    }
-    fn record_transcript_creation(
-        &self,
-        _transcript_params: &IDkgTranscriptParams,
-        _duration: Duration,
-    ) {
-    }
-    fn update_active_signature_requests(&self, _block_reader: &dyn EcdsaBlockReader) {}
-    fn record_sig_share_validation(&self, _request_id: &RequestId, _duration: Duration) {}
-    fn record_sig_share_aggregation(&self, _request_id: &RequestId, _duration: Duration) {}
 }
 
 /// EcdsaObject should be implemented by the ECDSA message types

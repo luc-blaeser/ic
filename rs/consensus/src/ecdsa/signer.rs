@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
-use super::utils::build_signature_inputs;
+use super::utils::{build_signature_inputs, get_context_request_id};
 
 pub(crate) trait EcdsaSigner: Send {
     /// The on_state_change() called from the main ECDSA path.
@@ -584,9 +584,27 @@ impl EcdsaSigner for EcdsaSignerImpl {
     ) -> EcdsaChangeSet {
         let block_reader = EcdsaBlockReaderImpl::new(self.consensus_block_cache.finalized_chain());
         let metrics = self.metrics.clone();
+        let requests = if ECDSA_IMPROVED_LATENCY {
+            self.state_reader
+                .get_certified_state_snapshot()
+                .map(|snapshot| {
+                    snapshot
+                        .get_state()
+                        .sign_with_ecdsa_contexts()
+                        .values()
+                        .flat_map(get_context_request_id)
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            block_reader
+                .requested_signatures()
+                .map(|(request_id, _)| request_id.clone())
+                .collect()
+        };
         ecdsa_pool
             .stats()
-            .update_active_signature_requests(&block_reader);
+            .update_active_signature_requests(requests);
 
         let send_signature_shares = || {
             timed_call(
@@ -884,6 +902,7 @@ mod tests {
     };
     use ic_crypto_test_utils_reproducible_rng::reproducible_rng;
     use ic_interfaces::p2p::consensus::{MutablePool, UnvalidatedArtifact};
+    use ic_test_utilities::consensus::EcdsaStatsNoOp;
     use ic_test_utilities::types::ids::{
         canister_test_id, subnet_test_id, user_test_id, NODE_1, NODE_2, NODE_3,
     };

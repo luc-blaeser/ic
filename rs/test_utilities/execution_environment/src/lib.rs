@@ -22,9 +22,9 @@ use ic_interfaces_state_manager::Labeled;
 use ic_logger::{replica_logger::no_op_logger, ReplicaLogger};
 use ic_management_canister_types::{
     CanisterIdRecord, CanisterInstallMode, CanisterInstallModeV2, CanisterSettingsArgs,
-    CanisterSettingsArgsBuilder, CanisterStatusType, EcdsaKeyId, EmptyBlob, InstallCodeArgs,
-    InstallCodeArgsV2, LogVisibility, Method, Payload, ProvisionalCreateCanisterWithCyclesArgs,
-    UpdateSettingsArgs, UpgradeOptions,
+    CanisterSettingsArgsBuilder, CanisterStatusType, CanisterUpgradeOptions, EcdsaKeyId, EmptyBlob,
+    InstallCodeArgs, InstallCodeArgsV2, LogVisibility, Method, Payload,
+    ProvisionalCreateCanisterWithCyclesArgs, UpdateSettingsArgs,
 };
 use ic_metrics::MetricsRegistry;
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
@@ -801,7 +801,7 @@ impl ExecutionTest {
         &mut self,
         canister_id: CanisterId,
         wasm_binary: Vec<u8>,
-        upgrade_options: UpgradeOptions,
+        upgrade_options: CanisterUpgradeOptions,
     ) -> Result<(), UserError> {
         let args = InstallCodeArgsV2::new(
             CanisterInstallModeV2::Upgrade(Some(upgrade_options)),
