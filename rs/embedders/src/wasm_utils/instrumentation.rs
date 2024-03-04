@@ -1644,22 +1644,21 @@ fn get_data(
 ) -> Result<Segments, WasmInstrumentationError> {
     let res = data_section
         .iter()
-        .filter(|segment| !matches!(&segment.kind, ic_wasm_transform::DataSegmentKind::Passive))
-        .map(|segment| {
+        .filter_map(|segment| {
             let offset = match &segment.kind {
                 ic_wasm_transform::DataSegmentKind::Active {
                     memory_index: _,
                     offset_expr,
                 } => match offset_expr {
                     Operator::I32Const { value } => *value as usize,
-                    _ => return Err(WasmInstrumentationError::WasmDeserializeError(WasmError::new(
+                    _ => return Some(Err(WasmInstrumentationError::WasmDeserializeError(WasmError::new(
                         "complex initialization expressions for data segments are not supported!".into()
-                    ))),
+                    )))),
                 },
-                ic_wasm_transform::DataSegmentKind::Passive => unreachable!(),
+                ic_wasm_transform::DataSegmentKind::Passive => return None,
             };
 
-            Ok((offset, segment.data.to_vec()))
+            Some(Ok((offset, segment.data.to_vec())))
         })
         .collect::<Result<_,_>>()?;
 
