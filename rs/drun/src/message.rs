@@ -2,7 +2,9 @@ use super::CanisterId;
 
 use hex::decode;
 use ic_execution_environment::execution::install_code::ENHANCED_ORTHOGONAL_PERSISTENCE_SECTION;
-use ic_management_canister_types::{self as ic00, CanisterInstallModeV2, Payload, UpgradeOptions};
+use ic_management_canister_types::{
+    self as ic00, CanisterInstallModeV2, CanisterUpgradeOptions, Payload,
+};
 use ic_types::{
     messages::{SignedIngress, UserQuery},
     time::expiry_time_from_now,
@@ -262,7 +264,7 @@ fn parse_install(
             } else {
                 None
             };
-            CanisterInstallModeV2::Upgrade(Some(UpgradeOptions {
+            CanisterInstallModeV2::Upgrade(Some(CanisterUpgradeOptions {
                 skip_pre_upgrade: None,
                 keep_main_memory,
             }))
