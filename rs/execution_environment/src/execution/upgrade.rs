@@ -287,7 +287,7 @@ fn upgrade_stage_2_and_3a_create_execution_state_and_call_start(
         original.compilation_cost_handling,
     );
 
-    let main_memory_retention = match context.mode {
+    let main_memory_handling = match context.mode {
         CanisterInstallModeV2::Upgrade(Some(upgrade_options)) => {
             match upgrade_options.keep_main_memory {
                 Some(true) => MemoryHandling::Keep,
@@ -304,9 +304,8 @@ fn upgrade_stage_2_and_3a_create_execution_state_and_call_start(
                             round,
                             error,
                         );
-                    } else {
-                        MemoryHandling::Replace
                     }
+                    MemoryHandling::Replace
                 }
             }
         }
@@ -315,7 +314,7 @@ fn upgrade_stage_2_and_3a_create_execution_state_and_call_start(
 
     let memory_handling = CanisterMemoryHandling {
         stable_memory_handling: MemoryHandling::Keep,
-        main_memory_handling: main_memory_retention,
+        main_memory_handling,
     };
 
     if let Err(err) = helper.replace_execution_state_and_allocations(
