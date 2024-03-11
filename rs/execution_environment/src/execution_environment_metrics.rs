@@ -2,13 +2,13 @@ use ic_cycles_account_manager::{
     CRITICAL_ERROR_EXECUTION_CYCLES_REFUND, CRITICAL_ERROR_RESPONSE_CYCLES_REFUND,
 };
 use ic_error_types::ErrorCode;
-use ic_ic00_types as ic00;
 use ic_logger::{error, ReplicaLogger};
-use ic_metrics::buckets::decimal_buckets;
+use ic_management_canister_types as ic00;
+use ic_metrics::buckets::{decimal_buckets, decimal_buckets_with_zero};
 use ic_metrics::MetricsRegistry;
 use ic_replicated_state::metadata_state::subnet_call_context_manager::InstallCodeCallId;
 use ic_types::CanisterId;
-use prometheus::{HistogramVec, IntCounter};
+use prometheus::{Histogram, HistogramVec, IntCounter};
 use std::str::FromStr;
 
 pub const FINISHED_OUTCOME_LABEL: &str = "finished";
@@ -26,6 +26,7 @@ pub(crate) struct ExecutionEnvironmentMetrics {
     pub(crate) compute_allocation_in_install_code_total: IntCounter,
     pub(crate) memory_allocation_in_install_code_total: IntCounter,
     pub(crate) controller_in_update_settings_total: IntCounter,
+    pub(crate) call_durations: Histogram,
 
     /// Critical error for responses above the maximum allowed size.
     pub(crate) response_cycles_refund_error: IntCounter,
@@ -51,7 +52,13 @@ pub(crate) struct ExecutionEnvironmentMetrics {
     pub(crate) invalid_canister_state_error: IntCounter,
     /// Critical error for failed canister creation.
     pub(crate) canister_creation_error: IntCounter,
+    /// Intra-subnet messages that would be oversize if they were between
+    /// different subnets (not including install_code messages). This metric can
+    /// be removed if the limit for intra-subnet messages and inter-subnet
+    /// messages are brought back in sync.
+    pub(crate) oversize_intra_subnet_messages: IntCounter,
 }
+
 impl ExecutionEnvironmentMetrics {
     pub fn new(metrics_registry: &MetricsRegistry) -> Self {
         Self {
@@ -79,6 +86,12 @@ impl ExecutionEnvironmentMetrics {
                 "execution_controller_in_update_settings_total",
                 "Total number of times controller used in update_settings requests",
             ),
+            call_durations: metrics_registry.histogram(
+                "execution_call_duration_seconds",
+                "Call durations, measured as call context age when completed / dropped.",
+                // Buckets: 0s, 0.1s, 0.2s, 0.5s, ..., 5M seconds
+                decimal_buckets_with_zero(-1, 6),
+            ),
             response_cycles_refund_error: metrics_registry
                 .error_counter(CRITICAL_ERROR_RESPONSE_CYCLES_REFUND),
             execution_cycles_refund_error: metrics_registry
@@ -103,6 +116,10 @@ impl ExecutionEnvironmentMetrics {
                 .error_counter("execution_environment_invalid_canister_state"),
             canister_creation_error: metrics_registry
                 .error_counter("execution_environment_canister_creation_failed"),
+            oversize_intra_subnet_messages: metrics_registry.int_counter(
+                "execution_environment_oversize_intra_subnet_messages_total",
+                "Total number of intra-subnet messages that exceed the 2 MiB limit for inter-subnet messages."
+            ),
         }
     }
 

@@ -2,11 +2,11 @@
 //!
 //! PocketIC is the local canister smart contract testing platform for the [Internet Computer](https://internetcomputer.org/).
 //!
-//! It consists of the PocketIC-server, which can run many independent IC instances, and a client library (this crate), which provides an interface to your IC instances.
+//! It consists of the PocketIC server, which can run many independent IC instances, and a client library (this crate), which provides an interface to your IC instances.
 //!
 //! With PocketIC, testing canisters is as simple as calling rust functions. Here is a minimal example:
 //!
-//! ```rust
+//! ```rust,no_run
 //! use candid;
 //! use pocket_ic;
 //!
@@ -15,6 +15,7 @@
 //!     let pic = PocketIc::new();
 //!     // Create an empty canister as the anonymous principal.
 //!     let canister_id = pic.create_canister(None);
+//!     pic.add_cycles(canister_id, 2_000_000_000_000); // 2T cycles
 //!     let wasm_bytes = load_counter_wasm(...);
 //!     pic.install_canister(canister_id, wasm_bytes, vec![], None);
 //!     // 'inc' is a counter canister method.
@@ -32,22 +33,20 @@
 //! For more information, see the [README](https://crates.io/crates/pocket-ic).
 //!
 use crate::common::rest::{
-    ApiResponse, BlobCompression, BlobId, CreateInstanceResponse, InstanceId, RawAddCycles,
-    RawCanisterCall, RawCanisterId, RawCanisterResult, RawCycles, RawSetStableMemory,
-    RawStableMemory, RawTime, RawWasmResult,
+    ApiResponse, BlobCompression, BlobId, CreateInstanceResponse, ExtendedSubnetConfigSet,
+    InstanceId, RawAddCycles, RawCanisterCall, RawCanisterId, RawCanisterResult, RawCycles,
+    RawEffectivePrincipal, RawSetStableMemory, RawStableMemory, RawSubnetId, RawTime,
+    RawVerifyCanisterSigArg, RawWasmResult, SubnetId, SubnetSpec, Topology,
 };
 use candid::{
     decode_args, encode_args,
     utils::{ArgumentDecoder, ArgumentEncoder},
     CandidType, Nat, Principal,
 };
-use common::rest::{
-    RawEffectivePrincipal, RawSubnetId, RawVerifyCanisterSigArg, SubnetConfigSet, SubnetId,
-    Topology,
-};
-use ic_cdk::api::management_canister::{
-    main::{CanisterInstallMode, InstallCodeArgument},
-    provisional::{CanisterId, CanisterIdRecord, CanisterSettings},
+pub use ic_cdk::api::management_canister::main::CanisterSettings;
+use ic_cdk::api::management_canister::main::{
+    CanisterId, CanisterIdRecord, CanisterInstallMode, CanisterStatusResponse, InstallCodeArgument,
+    UpdateSettingsArgument,
 };
 use reqwest::Url;
 use schemars::JsonSchema;
@@ -70,14 +69,14 @@ const LOG_DIR_PATH_ENV_NAME: &str = "POCKET_IC_LOG_DIR";
 const LOG_DIR_LEVELS_ENV_NAME: &str = "POCKET_IC_LOG_DIR_LEVELS";
 
 pub struct PocketIcBuilder {
-    pub config: SubnetConfigSet,
+    config: ExtendedSubnetConfigSet,
 }
 
 #[allow(clippy::new_without_default)]
 impl PocketIcBuilder {
     pub fn new() -> Self {
         Self {
-            config: SubnetConfigSet::default(),
+            config: ExtendedSubnetConfigSet::default(),
         }
     }
 
@@ -85,67 +84,114 @@ impl PocketIcBuilder {
         PocketIc::from_config(self.config)
     }
 
+    /// Add an empty NNS subnet
     pub fn with_nns_subnet(self) -> Self {
         Self {
-            config: SubnetConfigSet {
-                nns: true,
+            config: ExtendedSubnetConfigSet {
+                nns: Some(SubnetSpec::default()),
                 ..self.config
             },
         }
     }
 
+    /// Add an NNS subnet loaded form the given state directory. Note that the provided path must
+    /// be accessible for the PocketIC server process.
+    ///
+    /// `path_to_nns_state` should lead to the `ic_state` directory which is expected to have
+    /// the following structure:
+    ///
+    /// ic_state/
+    ///  |-- backups
+    ///  |-- checkpoints
+    ///  |-- diverged_checkpoints
+    ///  |-- diverged_state_markers
+    ///  |-- fs_tmp
+    ///  |-- page_deltas
+    ///  |-- states_metadata.pbuf
+    ///  |-- tip
+    ///  `-- tmp
+    ///
+    /// `nns_subnet_id` should be the subnet ID of the NNS subnet in the state under
+    /// `path_to_state`, e.g.:
+    /// ```rust
+    /// PrincipalId(
+    ///     candid::Principal::from_text(
+    ///         "tdb26-jop6k-aogll-7ltgs-eruif-6kk7m-qpktf-gdiqx-mxtrf-vb5e6-eqe",
+    ///     )
+    ///     .unwrap(),
+    /// )
+    /// .into();
+    /// ```
+    ///
+    /// The value can be obtained, e.g., via the following command:
+    /// ```sh
+    /// ic-regedit snapshot <path-to-ic_registry_local_store> | jq -r ".nns_subnet_id"
+    /// ```
+    pub fn with_nns_state(self, nns_subnet_id: SubnetId, path_to_state: PathBuf) -> Self {
+        Self {
+            config: ExtendedSubnetConfigSet {
+                nns: Some(SubnetSpec::default().with_state_dir(path_to_state, nns_subnet_id)),
+                ..self.config
+            },
+        }
+    }
+
+    /// Add an empty sns subnet
     pub fn with_sns_subnet(self) -> Self {
         Self {
-            config: SubnetConfigSet {
-                sns: true,
+            config: ExtendedSubnetConfigSet {
+                sns: Some(SubnetSpec::default()),
                 ..self.config
             },
         }
     }
-
+    /// Add an empty internet identity subnet
     pub fn with_ii_subnet(self) -> Self {
         Self {
-            config: SubnetConfigSet {
-                ii: true,
+            config: ExtendedSubnetConfigSet {
+                ii: Some(SubnetSpec::default()),
                 ..self.config
             },
         }
     }
 
+    /// Add an empty fiduciary subnet
     pub fn with_fiduciary_subnet(self) -> Self {
         Self {
-            config: SubnetConfigSet {
-                fiduciary: true,
+            config: ExtendedSubnetConfigSet {
+                fiduciary: Some(SubnetSpec::default()),
                 ..self.config
             },
         }
     }
 
+    /// Add an empty bitcoin subnet
     pub fn with_bitcoin_subnet(self) -> Self {
         Self {
-            config: SubnetConfigSet {
-                bitcoin: true,
+            config: ExtendedSubnetConfigSet {
+                bitcoin: Some(SubnetSpec::default()),
                 ..self.config
             },
         }
     }
 
-    pub fn with_system_subnet(self) -> Self {
-        Self {
-            config: SubnetConfigSet {
-                system: self.config.system + 1,
-                ..self.config
-            },
-        }
+    /// Add an empty generic system subnet
+    pub fn with_system_subnet(mut self) -> Self {
+        self.config.system.push(SubnetSpec::default());
+        self
     }
 
-    pub fn with_application_subnet(self) -> Self {
-        Self {
-            config: SubnetConfigSet {
-                application: self.config.application + 1,
-                ..self.config
-            },
-        }
+    /// Add an empty generic application subnet
+    pub fn with_application_subnet(mut self) -> Self {
+        self.config.application.push(SubnetSpec::default());
+        self
+    }
+
+    pub fn with_benchmarking_application_subnet(mut self) -> Self {
+        self.config
+            .application
+            .push(SubnetSpec::default().with_benchmarking_instruction_config());
+        self
     }
 }
 /// Main entry point for interacting with PocketIC.
@@ -167,7 +213,8 @@ impl PocketIc {
 
     /// Creates a new PocketIC instance with the specified subnet config.
     /// The server is started if it's not already running.
-    pub fn from_config(config: SubnetConfigSet) -> Self {
+    pub fn from_config(config: impl Into<ExtendedSubnetConfigSet>) -> Self {
+        let config = config.into();
         config.validate().unwrap();
 
         let parent_pid = std::os::unix::process::parent_id();
@@ -296,9 +343,28 @@ impl PocketIc {
     }
 
     /// Make the IC produce and progress by one block.
+    /// Note that multiple ticks might be necessary to observe
+    /// an expected effect, e.g., if the effect depends on
+    /// inter-canister calls or heartbeats.
     #[instrument(skip(self), fields(instance_id=self.instance_id))]
     pub fn tick(&self) {
         let endpoint = "update/tick";
+        self.post::<(), _>(endpoint, "");
+    }
+
+    /// Configures the IC to make progress automatically,
+    /// i.e., periodically update the time of the IC
+    /// to the real time and execute rounds on the subnets.
+    #[instrument(skip(self), fields(instance_id=self.instance_id))]
+    pub fn auto_progress(&self) {
+        let endpoint = "auto_progress";
+        self.post::<(), _>(endpoint, "");
+    }
+
+    /// Stops automatic progress (see `auto_progress`) on the IC.
+    #[instrument(skip(self), fields(instance_id=self.instance_id))]
+    pub fn stop_progress(&self) {
+        let endpoint = "stop_progress";
         self.post::<(), _>(endpoint, "");
     }
 
@@ -407,6 +473,24 @@ impl PocketIc {
             method,
             payload,
         )
+    }
+
+    /// Request a canister's status.
+    #[instrument(skip(self), fields(instance_id=self.instance_id, sender = %sender.unwrap_or(Principal::anonymous()).to_string()))]
+    pub fn canister_status(
+        &self,
+        canister_id: CanisterId,
+        sender: Option<Principal>,
+    ) -> Result<CanisterStatusResponse, CallError> {
+        call_candid_as::<(CanisterIdRecord,), (CanisterStatusResponse,)>(
+            self,
+            Principal::management_canister(),
+            RawEffectivePrincipal::CanisterId(canister_id.as_slice().to_vec()),
+            sender.unwrap_or(Principal::anonymous()),
+            "canister_status",
+            (CanisterIdRecord { canister_id },),
+        )
+        .map(|responses| responses.0)
     }
 
     /// Create a canister with default settings as the anonymous principal.
@@ -586,6 +670,34 @@ impl PocketIc {
         )
     }
 
+    /// Set canister's controllers.
+    #[instrument(skip(self), fields(instance_id=self.instance_id, canister_id = %canister_id.to_string(), sender = %sender.unwrap_or(Principal::anonymous()).to_string()))]
+    pub fn set_controllers(
+        &self,
+        canister_id: CanisterId,
+        sender: Option<Principal>,
+        new_controllers: Vec<Principal>,
+    ) -> Result<(), CallError> {
+        let settings = CanisterSettings {
+            controllers: Some(new_controllers),
+            compute_allocation: None,
+            memory_allocation: None,
+            freezing_threshold: None,
+            reserved_cycles_limit: None,
+        };
+        call_candid_as::<(UpdateSettingsArgument,), ()>(
+            self,
+            Principal::management_canister(),
+            RawEffectivePrincipal::CanisterId(canister_id.as_slice().to_vec()),
+            sender.unwrap_or(Principal::anonymous()),
+            "update_settings",
+            (UpdateSettingsArgument {
+                canister_id,
+                settings,
+            },),
+        )
+    }
+
     /// Start a canister.
     #[instrument(skip(self), fields(instance_id=self.instance_id, canister_id = %canister_id.to_string(), sender = %sender.unwrap_or(Principal::anonymous()).to_string()))]
     pub fn start_canister(
@@ -665,32 +777,47 @@ impl PocketIc {
     }
 
     fn get<T: DeserializeOwned>(&self, endpoint: &str) -> T {
-        let result = self
-            .reqwest_client
-            .get(self.instance_url().join(endpoint).unwrap())
-            .header(PROCESSING_TIME_HEADER, PROCESSING_TIME_VALUE_MS)
-            .send()
-            .expect("HTTP failure");
-        Self::check_response(result)
+        loop {
+            let result = self
+                .reqwest_client
+                .get(self.instance_url().join(endpoint).unwrap())
+                .header(PROCESSING_TIME_HEADER, PROCESSING_TIME_VALUE_MS)
+                .send()
+                .expect("HTTP failure");
+            if let Some(t) = self.check_response(result) {
+                break t;
+            }
+        }
     }
 
     fn post<T: DeserializeOwned, B: Serialize>(&self, endpoint: &str, body: B) -> T {
-        let result = self
-            .reqwest_client
-            .post(self.instance_url().join(endpoint).unwrap())
-            .header(PROCESSING_TIME_HEADER, PROCESSING_TIME_VALUE_MS)
-            .json(&body)
-            .send()
-            .expect("HTTP failure");
-        Self::check_response(result)
+        loop {
+            let result = self
+                .reqwest_client
+                .post(self.instance_url().join(endpoint).unwrap())
+                .header(PROCESSING_TIME_HEADER, PROCESSING_TIME_VALUE_MS)
+                .json(&body)
+                .send()
+                .expect("HTTP failure");
+            if let Some(t) = self.check_response(result) {
+                break t;
+            }
+        }
     }
 
-    fn check_response<T: DeserializeOwned>(result: reqwest::blocking::Response) -> T {
+    fn check_response<T: DeserializeOwned>(
+        &self,
+        result: reqwest::blocking::Response,
+    ) -> Option<T> {
         match result.into() {
-            ApiResponse::Success(t) => t,
+            ApiResponse::Success(t) => Some(t),
             ApiResponse::Error { message } => panic!("{}", message),
             ApiResponse::Busy { state_label, op_id } => {
-                panic!("Busy: state_label: {}, op_id: {}", state_label, op_id)
+                debug!(
+                    "instance_id={} Instance is busy: state_label: {}, op_id: {}",
+                    self.instance_id, state_label, op_id
+                );
+                None
             }
             ApiResponse::Started { state_label, op_id } => {
                 panic!("Started: state_label: {}, op_id: {}", state_label, op_id)
@@ -950,22 +1077,35 @@ pub enum TryFromError {
     PartialOrd, Ord, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
 )]
 pub enum ErrorCode {
+    // 1xx -- `RejectCode::SysFatal`
     SubnetOversubscribed = 101,
     MaxNumberOfCanistersReached = 102,
+    // 2xx -- `RejectCode::SysTransient`
     CanisterQueueFull = 201,
     IngressMessageTimeout = 202,
     CanisterQueueNotEmpty = 203,
     IngressHistoryFull = 204,
     CanisterIdAlreadyExists = 205,
+    StopCanisterRequestTimeout = 206,
+    CanisterOutOfCycles = 207,
+    CertifiedStateUnavailable = 208,
+    CanisterInstallCodeRateLimited = 209,
+    // 3xx -- `RejectCode::DestinationInvalid`
     CanisterNotFound = 301,
     CanisterMethodNotFound = 302,
     CanisterAlreadyInstalled = 303,
     CanisterWasmModuleNotFound = 304,
+    // 4xx -- `RejectCode::CanisterReject`
+    // 401
     InsufficientMemoryAllocation = 402,
     InsufficientCyclesForCreateCanister = 403,
     SubnetNotFound = 404,
     CanisterNotHostedBySubnet = 405,
-    CanisterOutOfCycles = 501,
+    CanisterRejectedMessage = 406,
+    UnknownManagementMessage = 407,
+    InvalidManagementPayload = 408,
+    // 5xx -- `RejectCode::CanisterError`
+    // 501 (previously `CanisterOutOfCycles`)
     CanisterTrapped = 502,
     CanisterCalledTrap = 503,
     CanisterContractViolation = 504,
@@ -979,15 +1119,15 @@ pub enum ErrorCode {
     CanisterInvalidController = 512,
     CanisterFunctionNotFound = 513,
     CanisterNonEmpty = 514,
-    CertifiedStateUnavailable = 515,
-    CanisterRejectedMessage = 516,
+    // 515 (previously `CertifiedStateUnavailable`)
+    // 516 (previously `CanisterRejectedMessage`)
     QueryCallGraphLoopDetected = 517,
-    UnknownManagementMessage = 518,
-    InvalidManagementPayload = 519,
+    // 518 (previously `UnknownManagementMessage`)
+    // 519 (previously `InvalidManagementPayload`)
     InsufficientCyclesInCall = 520,
     CanisterWasmEngineError = 521,
     CanisterInstructionLimitExceeded = 522,
-    CanisterInstallCodeRateLimited = 523,
+    // 523 (previously `CanisterInstallCodeRateLimited`)
     CanisterMemoryAccessLimitExceeded = 524,
     QueryCallGraphTooDeep = 525,
     QueryCallGraphTotalInstructionLimitExceeded = 526,
@@ -1006,22 +1146,35 @@ impl TryFrom<u64> for ErrorCode {
     type Error = TryFromError;
     fn try_from(err: u64) -> Result<ErrorCode, Self::Error> {
         match err {
+            // 1xx -- `RejectCode::SysFatal`
             101 => Ok(ErrorCode::SubnetOversubscribed),
             102 => Ok(ErrorCode::MaxNumberOfCanistersReached),
+            // 2xx -- `RejectCode::SysTransient`
             201 => Ok(ErrorCode::CanisterQueueFull),
             202 => Ok(ErrorCode::IngressMessageTimeout),
             203 => Ok(ErrorCode::CanisterQueueNotEmpty),
             204 => Ok(ErrorCode::IngressHistoryFull),
             205 => Ok(ErrorCode::CanisterIdAlreadyExists),
+            206 => Ok(ErrorCode::StopCanisterRequestTimeout),
+            207 => Ok(ErrorCode::CanisterOutOfCycles),
+            208 => Ok(ErrorCode::CertifiedStateUnavailable),
+            209 => Ok(ErrorCode::CanisterInstallCodeRateLimited),
+            // 3xx -- `RejectCode::DestinationInvalid`
             301 => Ok(ErrorCode::CanisterNotFound),
             302 => Ok(ErrorCode::CanisterMethodNotFound),
             303 => Ok(ErrorCode::CanisterAlreadyInstalled),
             304 => Ok(ErrorCode::CanisterWasmModuleNotFound),
+            // 4xx -- `RejectCode::CanisterReject`
+            // 401
             402 => Ok(ErrorCode::InsufficientMemoryAllocation),
             403 => Ok(ErrorCode::InsufficientCyclesForCreateCanister),
             404 => Ok(ErrorCode::SubnetNotFound),
             405 => Ok(ErrorCode::CanisterNotHostedBySubnet),
-            501 => Ok(ErrorCode::CanisterOutOfCycles),
+            406 => Ok(ErrorCode::CanisterRejectedMessage),
+            407 => Ok(ErrorCode::UnknownManagementMessage),
+            408 => Ok(ErrorCode::InvalidManagementPayload),
+            // 5xx -- `RejectCode::CanisterError`
+            // 501 (previously `CanisterOutOfCycles`)
             502 => Ok(ErrorCode::CanisterTrapped),
             503 => Ok(ErrorCode::CanisterCalledTrap),
             504 => Ok(ErrorCode::CanisterContractViolation),
@@ -1035,15 +1188,15 @@ impl TryFrom<u64> for ErrorCode {
             512 => Ok(ErrorCode::CanisterInvalidController),
             513 => Ok(ErrorCode::CanisterFunctionNotFound),
             514 => Ok(ErrorCode::CanisterNonEmpty),
-            515 => Ok(ErrorCode::CertifiedStateUnavailable),
-            516 => Ok(ErrorCode::CanisterRejectedMessage),
+            // 515 (previously `CertifiedStateUnavailable`)
+            // 516 (previously `CanisterRejectedMessage`)
             517 => Ok(ErrorCode::QueryCallGraphLoopDetected),
-            518 => Ok(ErrorCode::UnknownManagementMessage),
-            519 => Ok(ErrorCode::InvalidManagementPayload),
+            // 518 (previously `UnknownManagementMessage`)
+            // 519 (previously `InvalidManagementPayload`)
             520 => Ok(ErrorCode::InsufficientCyclesInCall),
             521 => Ok(ErrorCode::CanisterWasmEngineError),
             522 => Ok(ErrorCode::CanisterInstructionLimitExceeded),
-            523 => Ok(ErrorCode::CanisterInstallCodeRateLimited),
+            // 523 (previously `CanisterInstallCodeRateLimited`)
             524 => Ok(ErrorCode::CanisterMemoryAccessLimitExceeded),
             525 => Ok(ErrorCode::QueryCallGraphTooDeep),
             526 => Ok(ErrorCode::QueryCallGraphTotalInstructionLimitExceeded),

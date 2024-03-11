@@ -7,8 +7,8 @@ use crate::{
     },
     storage::with_stable_neuron_indexes,
 };
-use ic_nervous_system_common::SECONDS_PER_DAY;
-use ic_nervous_system_common::{cmc::MockCMC, ledger::MockIcpLedger};
+use ic_nervous_system_common::{cmc::MockCMC, ledger::MockIcpLedger, SECONDS_PER_DAY};
+use ic_nns_constants::GOVERNANCE_CANISTER_ID;
 use maplit::{btreemap, hashmap, hashset};
 use num_traits::bounds::LowerBounded;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -101,6 +101,18 @@ fn test_add_neuron_update_indexes() {
             .unwrap()
     });
     assert_eq!(neuron_id_found_by_subaccount_index, neuron_2.id.unwrap());
+
+    let expected_account_id = AccountIdentifier::new(
+        GOVERNANCE_CANISTER_ID.get(),
+        Some(neuron_2.subaccount().unwrap()),
+    );
+    let neuron_id_found_by_account_id_index = with_stable_neuron_indexes(|indexes| {
+        indexes
+            .account_id()
+            .get_neuron_id_by_account_id(&expected_account_id)
+            .unwrap()
+    });
+    assert_eq!(neuron_id_found_by_account_id_index, neuron_2.id.unwrap());
 }
 
 #[test]
@@ -121,6 +133,17 @@ fn test_remove_neuron_update_indexes() {
             .get_neuron_id_by_subaccount(&neuron.subaccount().unwrap())
     });
     assert_eq!(neuron_id_found_by_subaccount_index, None);
+
+    let expected_account_id = AccountIdentifier::new(
+        GOVERNANCE_CANISTER_ID.get(),
+        Some(neuron.subaccount().unwrap()),
+    );
+    let neuron_id_found_by_account_id_index = with_stable_neuron_indexes(|indexes| {
+        indexes
+            .account_id()
+            .get_neuron_id_by_account_id(&expected_account_id)
+    });
+    assert_eq!(neuron_id_found_by_account_id_index, None);
 }
 
 #[test]
@@ -149,7 +172,7 @@ fn test_modify_neuron_update_indexes() {
     });
     assert_eq!(
         neuron_ids_found_by_new_controller,
-        hashset! {neuron.id.unwrap().id}
+        hashset! {neuron.id.unwrap()}
     );
     let neuron_ids_found_by_old_controller = with_stable_neuron_indexes(|indexes| {
         indexes
@@ -411,7 +434,7 @@ fn test_neuron_store_builds_index_unless_provided() {
     );
 
     let empty_topic_followee_index = HeapNeuronFollowingIndex::new(BTreeMap::new());
-    let neuron_store = NeuronStore::new_restored(neurons, empty_topic_followee_index);
+    let neuron_store = NeuronStore::new_restored((neurons, empty_topic_followee_index));
 
     assert_eq!(neuron_store.topic_followee_index.num_entries(), 0);
     assert_eq!(
@@ -425,14 +448,14 @@ fn test_neuron_store_builds_index_unless_provided() {
 fn test_neuron_store_new_then_restore() {
     // Creating a NeuronStore for the first time.
     let neurons: BTreeMap<_, _> = (0..10).map(|i| (i, simple_neuron(i))).collect();
-    let mut neuron_store = NeuronStore::new(neurons.clone());
+    let neuron_store = NeuronStore::new(neurons.clone());
 
     // Taking its states (simulating how it's called by Governance).
-    let heap_neurons = neuron_store.take_heap_neurons();
-    let heap_topic_followee_index = neuron_store.take_heap_topic_followee_index();
+    let (heap_neurons, heap_topic_followee_index) = neuron_store.take();
 
     // Restoring from those states.
-    let restored_neuron_store = NeuronStore::new_restored(heap_neurons, heap_topic_followee_index);
+    let restored_neuron_store =
+        NeuronStore::new_restored((heap_neurons, heap_topic_followee_index));
 
     for neuron in neurons.into_values() {
         assert_eq!(
@@ -497,10 +520,13 @@ fn test_batch_validate_neurons_in_stable_store_are_inactive_invalid() {
     // Step 1.4: modify the inactive in stable neuron store to make it actually active.
     with_stable_neuron_store_mut(|stable_neuron_store| {
         stable_neuron_store
-            .update(Neuron {
-                cached_neuron_stake_e8s: 1,
-                ..neuron
-            })
+            .update(
+                &neuron,
+                Neuron {
+                    cached_neuron_stake_e8s: 1,
+                    ..neuron.clone()
+                },
+            )
             .unwrap()
     });
 
@@ -580,7 +606,7 @@ fn test_from_active_to_active() {
         .with_neuron_mut(&neuron_id, |neuron| *neuron = modified_neuron.clone())
         .unwrap();
 
-    // Step 3: veriifies that the neuron is still only in heap.
+    // Step 3: verifies that the neuron is still only in heap.
     assert_neuron_in_neuron_store_eq(&neuron_store, &modified_neuron);
     assert!(is_neuron_in_heap(&neuron_store, neuron_id));
     assert!(!is_neuron_in_stable(neuron_id));
@@ -612,7 +638,7 @@ fn test_from_active_to_inactive() {
         .with_neuron_mut(&neuron_id, |neuron| *neuron = modified_neuron.clone())
         .unwrap();
 
-    // Step 3: veriifies that the neuron is in both heap and stable.
+    // Step 3: verifies that the neuron is in both heap and stable.
     assert_neuron_in_neuron_store_eq(&neuron_store, &modified_neuron);
     // Whether the inactive neuron can be found in heap depends on whether we want to store inactive neurons
     // only in stable memory.
@@ -644,7 +670,7 @@ fn test_from_inactive_to_active() {
         .with_neuron_mut(&neuron_id, |neuron| *neuron = modified_neuron.clone())
         .unwrap();
 
-    // Step 3: veriifies that the neuron is only in heap.
+    // Step 3: verifies that the neuron is only in heap.
     assert_neuron_in_neuron_store_eq(&neuron_store, &modified_neuron);
     assert!(is_neuron_in_heap(&neuron_store, neuron_id));
     assert!(!is_neuron_in_stable(neuron_id));
@@ -674,7 +700,7 @@ fn test_from_inactive_to_inactive() {
         .with_neuron_mut(&neuron_id, |neuron| *neuron = modified_neuron.clone())
         .unwrap();
 
-    // Step 3: veriifies that the neuron is modified and is only in heap.
+    // Step 3: verifies that the neuron is modified and is only in heap.
     assert_neuron_in_neuron_store_eq(&neuron_store, &modified_neuron);
     // Whether the inactive neuron can be found in heap depends on whether we want to store inactive neurons
     // only in stable memory.
@@ -701,7 +727,7 @@ fn test_from_stale_inactive_to_inactive() {
     // Step 2: call with_neuron_mut without modification.
     neuron_store.with_neuron_mut(&neuron_id, |_| {}).unwrap();
 
-    // Step 3: veriifies that the neuron is not modified but now in both heap and stable.
+    // Step 3: verifies that the neuron is not modified but now in both heap and stable.
     assert_neuron_in_neuron_store_eq(&neuron_store, &neuron);
     // Whether the inactive neuron can be found in heap depends on whether we want to store inactive neurons
     // only in stable memory.
@@ -734,7 +760,7 @@ fn test_from_stale_inactive_to_active() {
         .with_neuron_mut(&neuron_id, |neuron| *neuron = modified_neuron.clone())
         .unwrap();
 
-    // Step 3: veriifies that the neuron is modified and still only on heap.
+    // Step 3: verifies that the neuron is modified and still only on heap.
     assert_neuron_in_neuron_store_eq(&neuron_store, &modified_neuron);
     assert!(is_neuron_in_heap(&neuron_store, neuron_id));
     assert!(!is_neuron_in_stable(neuron_id));

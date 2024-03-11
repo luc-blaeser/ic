@@ -91,7 +91,7 @@ fn kyt_wasm() -> Vec<u8> {
 fn install_ledger(env: &StateMachine) -> CanisterId {
     let args = LedgerArgument::Init(
         LedgerInitArgsBuilder::for_tests()
-            .with_transfer_fee(0)
+            .with_transfer_fee(0_u8)
             .build(),
     );
     env.install_canister(ledger_wasm(), Encode!(&args).unwrap(), None)
@@ -875,6 +875,27 @@ impl CkBtcSetup {
         .unwrap()
     }
 
+    pub fn get_known_utxos(&self, account: impl Into<Account>) -> Vec<Utxo> {
+        let account = account.into();
+        Decode!(
+            &assert_reply(
+                self.env
+                    .query(
+                        self.minter_id,
+                        "get_known_utxos",
+                        Encode!(&UpdateBalanceArgs {
+                            owner: Some(account.owner),
+                            subaccount: account.subaccount,
+                        })
+                        .unwrap()
+                    )
+                    .expect("failed to query balance on the ledger")
+            ),
+            Vec<Utxo>
+        )
+        .unwrap()
+    }
+
     pub fn balance_of(&self, account: impl Into<Account>) -> Nat {
         Decode!(
             &assert_reply(
@@ -1241,9 +1262,11 @@ fn test_transaction_finalization() {
 
     let user = Principal::from(ckbtc.caller);
 
-    ckbtc.deposit_utxo(user, utxo);
+    ckbtc.deposit_utxo(user, utxo.clone());
 
     assert_eq!(ckbtc.balance_of(user), Nat::from(deposit_value - KYT_FEE));
+
+    assert_eq!(ckbtc.get_known_utxos(user), vec![utxo]);
 
     // Step 2: request a withdrawal
 
@@ -1284,6 +1307,8 @@ fn test_transaction_finalization() {
 
     ckbtc.finalize_transaction(tx);
     assert_eq!(ckbtc.await_finalization(block_index, 10), txid);
+
+    assert_eq!(ckbtc.get_known_utxos(user), vec![]);
 }
 
 #[test]
@@ -1635,8 +1660,8 @@ fn test_ledger_memo() {
     assert_eq!(ckbtc.balance_of(user), Nat::from(deposit_value - KYT_FEE));
 
     let get_transaction_request = GetTransactionsRequest {
-        start: 0.into(),
-        length: 1.into(),
+        start: 0_u8.into(),
+        length: 1_u8.into(),
     };
     let res = ckbtc.get_transactions(get_transaction_request);
     let memo = res.transactions[0].mint.clone().unwrap().memo.unwrap();
@@ -1665,7 +1690,7 @@ fn test_ledger_memo() {
 
     let get_transaction_request = GetTransactionsRequest {
         start: block_index.into(),
-        length: 1.into(),
+        length: 1_u8.into(),
     };
     let res = ckbtc.get_transactions(get_transaction_request);
     let memo = res.transactions[0].burn.clone().unwrap().memo.unwrap();
@@ -1688,8 +1713,8 @@ fn test_ledger_memo() {
         .expect("failed to transfer funds");
 
     let get_transaction_request = GetTransactionsRequest {
-        start: 3.into(),
-        length: 1.into(),
+        start: 3_u8.into(),
+        length: 1_u8.into(),
     };
     let res = ckbtc.get_transactions(get_transaction_request);
     let memo = res.transactions[0].mint.clone().unwrap().memo.unwrap();
@@ -1802,7 +1827,7 @@ fn test_retrieve_btc_with_approval() {
 
     let get_transaction_request = GetTransactionsRequest {
         start: block_index.into(),
-        length: 1.into(),
+        length: 1_u8.into(),
     };
     let res = ckbtc.get_transactions(get_transaction_request);
     let memo = res.transactions[0].burn.clone().unwrap().memo.unwrap();
@@ -1891,7 +1916,7 @@ fn test_retrieve_btc_with_approval_from_subaccount() {
 
     let get_transaction_request = GetTransactionsRequest {
         start: block_index.into(),
-        length: 1.into(),
+        length: 1_u8.into(),
     };
     let res = ckbtc.get_transactions(get_transaction_request);
     let memo = res.transactions[0].burn.clone().unwrap().memo.unwrap();

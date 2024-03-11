@@ -1,7 +1,7 @@
 # BoundaryGuestOS - Main Docker Image
 #
 # Build step for example:
-# - `docker build --pull -t dfinity/boundaryos-main --build-arg BUILD_TYPE=dev --build-arg SW=true \ `
+# - `docker build --pull -t dfinity/boundaryos-main --build-arg BUILD_TYPE=dev \ `
 #   `--build-arg BASE_IMAGE=docker.io/dfinity/boundaryos-base@sha256:dc1a2892b0241131dd97ddd4dce560ab274d00a90110a4b5fc4cb2245ff1f0db -f Dockerfile .`
 #
 #
@@ -13,11 +13,6 @@ ARG BASE_IMAGE=
 # We support prod and dev images
 ARG BUILD_TYPE=
 
-# Service worker version and sha256; only if SW is `true` the service worker from npm is used
-ARG SW=
-ARG sw_version=1.8.8
-ARG sw_sha256=0e997ba7efe03441b126dbe674beec6231b89d4a997b24df21fd32428170501b
-
 #
 # First build stage: download software (service worker) that frequently changes, build and verify it (such that it
 # does not change under our noses).
@@ -27,25 +22,6 @@ FROM $BASE_IMAGE AS download
 USER root:root
 
 WORKDIR /tmp
-
-# Download and check service worker production version
-# from: https://registry.npmjs.org/@dfinity/service-worker/-/
-ARG sw_version
-ARG sw_sha256
-RUN \
-   curl -L https://registry.npmjs.org/@dfinity/service-worker/-/service-worker-${sw_version}.tgz -o service-worker.tgz && \
-   echo "${sw_sha256}  service-worker.tgz" | shasum -c
-
-# Download Nginx NJS Plugins
-ARG NGINX_NJS_PLUGINS_PROJECT_ID=38466408
-ARG NGINX_NJS_PLUGINS_REF_NAME=v1.0.2
-ARG NGINX_NJS_PLUGINS_GITLAB_READ_ONLY_CI_TOKEN=glpat-2s2iXys15ZmVpgdxok58
-
-RUN \
-    curl -sL -o njs-plugin-is-bot.js \
-        -H "Private-Token: ${NGINX_NJS_PLUGINS_GITLAB_READ_ONLY_CI_TOKEN}" \
-        https://gitlab.com/api/v4/projects/${NGINX_NJS_PLUGINS_PROJECT_ID}/jobs/artifacts/${NGINX_NJS_PLUGINS_REF_NAME}/raw/dist/njs-plugin-is-bot.js?job=build-plugins && \
-    echo "53d6febad8f2f14bbc649ad57acd998d942a1e9f96b68e3dd28b2bbe1fbadebd4357600092d6b44914c1b83e5745b15bb6ec6db1b4e1587b24bf45a14bbb8f3f  njs-plugin-is-bot.js" | shasum -c
 
 #
 # Second build stage:
@@ -67,31 +43,11 @@ RUN printf '%s\n' >/etc/nns_public_key.pem \
     'W5u0y3FxEvhHLg1aTRRQX/10hLASkQkcX4e5iINGP5gJGguqrg==' \
     '-----END PUBLIC KEY-----'
 
-
-#
-# Third build stage:
-# - Construct base images with the differences between npm sw and local sw
-#
-FROM image-${BUILD_TYPE} as image-sw-false
-# /var/www/html/ files injected by caller
-
-FROM image-${BUILD_TYPE} as image-sw-true
-USER root:root
-
-# Fetch and install npm ic service worker for dev/prod
-COPY --from=download /tmp/service-worker.tgz /tmp/service-worker.tgz
-ARG BUILD_TYPE=
-RUN cd /tmp && \
-    tar xfvz service-worker.tgz && \
-    mkdir -p /var/www/html/ &&\
-    cp -rf /tmp/package/dist-${BUILD_TYPE}/* /var/www/html/; \
-    rm -rf /tmp/package /tmp/service-worker.tgz
-
 #
 # Fourth build stage:
 # - Construct the actual target image (IC-OS root filesystem)
 #
-FROM image-sw-${SW}
+FROM image-${BUILD_TYPE}
 
 USER root:root
 
@@ -106,10 +62,6 @@ COPY etc /etc
 COPY --chmod=644 etc/hosts /etc/hosts
 COPY --chmod=644 etc/hostname /etc/hostname
 COPY --chmod=644 etc/resolv.conf /etc/resolv.conf
-
-# Install Nginx NJS Plugins
-COPY --from=download \
-    /tmp/njs-plugin-is-bot.js /etc/nginx/njs/
 
 # Update POSIX permissions in /etc/
 RUN find /etc -type d -exec chmod 0755 {} \+ && \
@@ -154,7 +106,7 @@ RUN if [ "${ROOT_PASSWORD}" != "" ]; then \
 # to node operation.
 
 RUN for SERVICE in /etc/systemd/system/*; do \
-        if [ -f "$SERVICE" -a ! -L "$SERVICE" ] ; then systemctl enable "${SERVICE#/etc/systemd/system/}" ; fi ; \
+    if [ -f "$SERVICE" -a ! -L "$SERVICE" ] && grep -q '^.Install.' "$SERVICE" ; then systemctl enable "${SERVICE#/etc/systemd/system/}" ; fi ; \
     done && \
     systemctl enable \
     chrony \
@@ -225,15 +177,6 @@ RUN \
     chown prober:prober /var/log/prober && \
     chmod 755 /var/log/prober
 
-# Setup denylist-updater
-RUN \
-    addgroup denylist-updater && \
-    adduser --system --disabled-password --shell /usr/sbin/nologin --no-create-home denylist-updater && \
-    adduser denylist-updater denylist-updater && \
-    mkdir -p /var/opt/nginx/denylist && \
-    chown denylist-updater:denylist-updater /var/opt/nginx/denylist && \
-    chmod 644 /var/opt/nginx/denylist
-
 # Install node_exporter
 RUN chown root:root /etc/node_exporter \
                     /usr/local/bin/node_exporter && \
@@ -246,7 +189,6 @@ COPY opt /opt
 
 RUN rm -rf /etc/nginx/sites-enabled/nginx.conf
 
-# Install ic service worker production version from: https://registry.npmjs.org/@dfinity/service-worker/-/
 RUN mkdir -p /var/www/html && chown www-data:www-data /var/www/html
 
 # Install other files (e.g. the uninstall-script)
@@ -287,7 +229,6 @@ RUN find /opt -type d -exec chmod 0755 {} \+ && \
 # Take care of nginx files
 RUN chmod 0755 /etc/nginx/* && \
     chmod 0644 /etc/nginx/nginx.conf && \
-    chmod 0644 /etc/nginx/modules-enabled/ngx_http_js_module.conf && \
     rm -rf /etc/nginx/conf.d/nginx-global.conf && \
     rm -rf /etc/nginx/conf.d/default.conf && \
     rm -rf /etc/nginx/sites-enabled/default && \

@@ -45,6 +45,7 @@ fn get_hostos_version() -> Response {
     Ok(Payload::HostOSVersion(version))
 }
 
+// HostOSVsockVersion command used for backwards compatibility
 fn get_hostos_vsock_version() -> Response {
     Ok(Payload::HostOSVsockVersion(VSOCK_VERSION))
 }
@@ -101,7 +102,14 @@ fn notify(notify_data: &NotifyData) -> Response {
 }
 
 fn create_hostos_upgrade_file(upgrade_url: &str) -> Result<(), String> {
-    let response = reqwest::blocking::get(upgrade_url)
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60 * 5))
+        .build()
+        .map_err(|err| format!("Could not build download client: {}", err))?;
+
+    let response = client
+        .get(upgrade_url)
+        .send()
         .map_err(|err| format!("Could not download url: {}", err))?;
 
     let hostos_upgrade_contents = response
@@ -170,11 +178,15 @@ fn run_upgrade() -> Response {
 }
 
 fn upgrade_hostos(upgrade_data: &UpgradeData) -> Response {
-    println!("Creating hostos upgrade file...");
-    create_hostos_upgrade_file(&upgrade_data.url)?;
+    // Attempt to re-use any previously downloaded upgrades, so long as the
+    // hash matches.
+    if verify_hash(&upgrade_data.target_hash).is_err() {
+        println!("Creating hostos upgrade file...");
+        create_hostos_upgrade_file(&upgrade_data.url)?;
 
-    println!("Verifying hostos upgrade file hash...");
-    verify_hash(&upgrade_data.target_hash)?;
+        println!("Verifying hostos upgrade file hash...");
+        verify_hash(&upgrade_data.target_hash)?;
+    }
 
     println!("Starting upgrade...");
     run_upgrade()

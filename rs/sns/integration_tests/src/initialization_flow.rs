@@ -1,5 +1,4 @@
 use candid::Nat;
-use dfn_candid::candid_one;
 use ic_base_types::{CanisterId, PrincipalId};
 use ic_nervous_system_common::{ExplosiveTokens, E8, ONE_TRILLION};
 use ic_nervous_system_common_test_keys::TEST_NEURON_1_OWNER_PRINCIPAL;
@@ -7,9 +6,7 @@ use ic_nervous_system_proto::pb::v1::{
     Canister, Duration, GlobalTimeOfDay, Image, Percentage, Tokens,
 };
 use ic_nns_common::pb::v1::{NeuronId, ProposalId};
-use ic_nns_constants::{
-    GOVERNANCE_CANISTER_ID, IS_MATCHED_FUNDING_ENABLED, ROOT_CANISTER_ID, SNS_WASM_CANISTER_ID,
-};
+use ic_nns_constants::{ROOT_CANISTER_ID, SNS_WASM_CANISTER_ID};
 use ic_nns_governance::pb::v1::{
     create_service_nervous_system::{
         governance_parameters::VotingRewardParameters,
@@ -27,7 +24,6 @@ use ic_nns_governance::pb::v1::{
 use ic_nns_test_utils::neuron_helpers::get_test_neurons_maturity_snapshot;
 use ic_nns_test_utils::state_test_helpers::{
     get_controllers, nns_wait_for_proposal_failure, sns_swap_get_auto_finalization_status,
-    update_with_sender,
 };
 use ic_nns_test_utils::{
     common::NnsInitPayloadsBuilder,
@@ -44,10 +40,7 @@ use ic_sns_governance::pb::v1::{
     ListNeurons,
 };
 use ic_sns_governance::types::ONE_DAY_SECONDS;
-use ic_sns_swap::pb::v1::{
-    Lifecycle, NeuronBasketConstructionParameters as SwapNeuronBasketConstructionParameters,
-    OpenRequest, Params,
-};
+use ic_sns_swap::pb::v1::Lifecycle;
 use ic_sns_test_utils::state_test_helpers::{
     get_lifecycle, get_sns_canisters_summary, list_community_fund_participants,
     participate_in_swap, sns_governance_list_neurons,
@@ -109,8 +102,6 @@ lazy_static! {
             }),
             swap_parameters: Some(SwapParameters {
                 minimum_participants: Some(5),
-                minimum_icp: if IS_MATCHED_FUNDING_ENABLED {None} else {Some(Tokens::from_tokens(500_000))},
-                maximum_icp: if IS_MATCHED_FUNDING_ENABLED {None} else {Some(Tokens::from_tokens(750_000))},
                 minimum_direct_participation_icp: Some(Tokens::from_tokens(499_900)),
                 maximum_direct_participation_icp: Some(Tokens::from_tokens(749_900)),
                 minimum_participant_icp: Some(Tokens::from_tokens(1)),
@@ -123,8 +114,12 @@ lazy_static! {
                 restricted_countries: None,
                 start_time: GlobalTimeOfDay::from_hh_mm(12, 0).ok(),
                 duration: Some(Duration::from_secs(60 * 60 * 24 * 7)),
-                neurons_fund_investment_icp: if IS_MATCHED_FUNDING_ENABLED { None } else { Some(Tokens::from_tokens(100)) },
-                neurons_fund_participation: if IS_MATCHED_FUNDING_ENABLED { Some(true) } else { None },
+                neurons_fund_participation: Some(true),
+
+                // Deprecated fields must not be set.
+                neurons_fund_investment_icp: None,
+                minimum_icp: None,
+                maximum_icp: None,
             }),
             governance_parameters: Some(GovernanceParameters {
                 proposal_rejection_fee: Some(Tokens::from_e8s(1_000_000_000)),
@@ -217,6 +212,12 @@ impl SnsInitializationFlowTestSetup {
         state_machine.add_cycles(SNS_WASM_CANISTER_ID, 2_000 * ONE_TRILLION as u128);
 
         // Create a dapp_canister and add NNS Root as a controller of it
+        {
+            // but first let's set up some phony canisters just to make sure the dapp canister's canister ID doesn't collide with a "real" canister
+            set_up_universal_canister(&state_machine, None);
+            set_up_universal_canister(&state_machine, None);
+            set_up_universal_canister(&state_machine, None);
+        }
         let dapp_canister = set_up_universal_canister(&state_machine, None);
         set_controllers(
             &state_machine,
@@ -309,8 +310,6 @@ impl SnsInitializationFlowTestSetup {
     }
 }
 
-/// TODO[NNS1-2636]: Reenable this test after Swap starts calling settle_neurons_fund_participation.
-#[ignore]
 #[test]
 fn test_one_proposal_sns_initialization_success_with_neurons_fund_participation() {
     // Step 0: Setup the world and record its state
@@ -361,7 +360,7 @@ fn test_one_proposal_sns_initialization_success_with_neurons_fund_participation(
     // Assert the SNS was created and get its info
     let snses = list_deployed_snses(&mut sns_initialization_flow_test.state_machine).instances;
     assert_eq!(snses.len(), 1);
-    let test_sns = snses.get(0).unwrap();
+    let test_sns = snses.first().unwrap();
 
     // Get the cycle balance of the SNS-W canister and verify it has been decremented
     let sns_wasm_cycles_balance = get_canister_status_from_root(
@@ -443,26 +442,12 @@ fn test_one_proposal_sns_initialization_success_with_neurons_fund_participation(
         &0,   // offset
     )
     .cf_participants;
-    assert!(!cf_participants.is_empty());
-
-    for cf_participant in &cf_participants {
-        for cf_neuron in &cf_participant.cf_neurons {
-            let pledged_icp = cf_neuron.amount_icp_e8s;
-            let cf_neuron_nns_id = NeuronId {
-                id: cf_neuron.nns_neuron_id,
-            };
-
-            let initial_maturity = initial_nns_neurons_maturity_snapshot
-                .get(&cf_neuron_nns_id)
-                .unwrap();
-
-            let current_maturity = current_nns_neurons_maturity_snapshot
-                .get(&cf_neuron_nns_id)
-                .unwrap();
-
-            assert_eq!(*current_maturity + pledged_icp, *initial_maturity);
-        }
-    }
+    // With Matched Funding, this field remains unset set until the swap finalization phase.
+    assert!(
+        cf_participants.is_empty(),
+        "Unexpected Neurons' Fund participants: {:#?}",
+        cf_participants
+    );
 
     // Step 3: Advance time to open the swap for participation, and then finish it
     sns_initialization_flow_test.advance_time_to_open_swap(test_sns.swap_canister_id.unwrap());
@@ -507,6 +492,9 @@ fn test_one_proposal_sns_initialization_success_with_neurons_fund_participation(
         &canister_id_or_panic(test_sns.swap_canister_id),
     );
     assert_eq!(get_lifecycle_response.lifecycle(), Lifecycle::Committed);
+    assert!(get_lifecycle_response
+        .decentralization_swap_termination_timestamp_seconds
+        .is_some());
 
     // Step 4: Verify the Swap auto-finalizes and the SNS is in the correct state
     sns_initialization_flow_test
@@ -534,6 +522,17 @@ fn test_one_proposal_sns_initialization_success_with_neurons_fund_participation(
         .map(|amount_icp_e8| amount_icp_e8 - icp_transfer_fee_e8s)
         .sum::<u64>();
 
+    // The Neurons' Fund participants should be known by now.
+    let cf_participants = list_community_fund_participants(
+        &sns_initialization_flow_test.state_machine,
+        &CanisterId::try_from(test_sns.swap_canister_id.unwrap()).unwrap(),
+        &PrincipalId::new_anonymous(),
+        &100, // Limit
+        &0,   // offset
+    )
+    .cf_participants;
+    assert!(!cf_participants.is_empty());
+
     // Unlike the direct participants, since NNS Governance is sending minted ICP, there is no
     // transfer fee.
     let expected_cf_participation_amount_e8s: u64 = cf_participants
@@ -547,7 +546,28 @@ fn test_one_proposal_sns_initialization_success_with_neurons_fund_participation(
         expected_direct_participation_amount_e8s + expected_cf_participation_amount_e8s,
     );
 
-    // Check that the NF neurons are configured correctly
+    // Check that the Neurons' Fund maturity is conserved, i.e., the amount of maturity in each
+    // Neurons' Fund neuron has decreased by how much that neuron participated in the swap (as
+    // per the rules of Matched Funding).
+    for cf_participant in &cf_participants {
+        for cf_neuron in &cf_participant.cf_neurons {
+            let pledged_icp = cf_neuron.amount_icp_e8s;
+            let cf_neuron_nns_id = NeuronId {
+                id: cf_neuron.nns_neuron_id,
+            };
+
+            let initial_maturity = initial_nns_neurons_maturity_snapshot
+                .get(&cf_neuron_nns_id)
+                .unwrap();
+
+            let current_maturity = current_nns_neurons_maturity_snapshot
+                .get(&cf_neuron_nns_id)
+                .unwrap();
+
+            assert_eq!(*current_maturity + pledged_icp, *initial_maturity);
+        }
+    }
+
     let cf_participants_principals = cf_participants
         .iter()
         .map(|cf_participant| cf_participant.hotkey_principal.clone())
@@ -575,8 +595,6 @@ fn test_one_proposal_sns_initialization_success_with_neurons_fund_participation(
     assert!(at_least_one_sns_neuron_is_nf_controlled);
 }
 
-/// TODO[NNS1-2636]: Reenable this test after Swap starts calling settle_neurons_fund_participation.
-#[ignore]
 #[test]
 fn test_one_proposal_sns_initialization_success_without_neurons_fund_participation() {
     // Step 0: Setup the world and record its state
@@ -603,9 +621,9 @@ fn test_one_proposal_sns_initialization_success_without_neurons_fund_participati
         .swap_parameters
         .clone();
 
-    // Set the Neurons Fund investment to zero
+    // Disable Neurons' Fund participation
     if let Some(s) = &mut swap_parameters {
-        s.neurons_fund_investment_icp = Some(Tokens::from_tokens(0));
+        s.neurons_fund_participation = Some(false);
         if s.minimum_icp.is_some() {
             s.minimum_direct_participation_icp = s.minimum_icp;
         }
@@ -643,7 +661,7 @@ fn test_one_proposal_sns_initialization_success_without_neurons_fund_participati
     // Assert the SNS was created and get its info
     let snses = list_deployed_snses(&mut sns_initialization_flow_test.state_machine).instances;
     assert_eq!(snses.len(), 1);
-    let test_sns = snses.get(0).unwrap();
+    let test_sns = snses.first().unwrap();
 
     // Get the cycle balance of the SNS-W canister and verify it has been decremented
     let sns_wasm_cycles_balance = get_canister_status_from_root(
@@ -774,6 +792,9 @@ fn test_one_proposal_sns_initialization_success_without_neurons_fund_participati
         &canister_id_or_panic(test_sns.swap_canister_id),
     );
     assert_eq!(get_lifecycle_response.lifecycle(), Lifecycle::Committed);
+    assert!(get_lifecycle_response
+        .decentralization_swap_termination_timestamp_seconds
+        .is_some());
 
     // Step 4: Verify the Swap auto-finalizes and the SNS is in the correct state
     sns_initialization_flow_test
@@ -917,149 +938,6 @@ fn test_one_proposal_sns_initialization_fails_to_initialize_and_returns_dapps_an
 }
 
 #[test]
-fn test_one_proposal_sns_initialization_swap_cannot_be_opened_by_legacy_method() {
-    // Step 0: Setup the world and record its state
-    let mut sns_initialization_flow_test = SnsInitializationFlowTestSetup::default_setup();
-
-    // There should be no SNSes deployed.
-    assert_eq!(
-        list_deployed_snses(&mut sns_initialization_flow_test.state_machine).instances,
-        vec![]
-    );
-
-    // Step 1: Submit and execute the proposal in the NNS
-
-    // Create the proposal and splice in the dapp canisters
-    let proposal = CreateServiceNervousSystem {
-        dapp_canisters: sns_initialization_flow_test
-            .dapp_canisters
-            .iter()
-            .map(|cid| Canister::new(cid.get()))
-            .collect(),
-        ..CREATE_SERVICE_NERVOUS_SYSTEM_PROPOSAL.clone()
-    };
-
-    // Submit the proposal! :)
-    let proposal_id = sns_initialization_flow_test.propose_create_service_nervous_system(
-        get_neuron_1().principal_id,
-        get_neuron_1().neuron_id,
-        &proposal,
-    );
-
-    // Wait for the proposal to be executed, and therefore the SNS to be deployed
-    nns_wait_for_proposal_execution(
-        &mut sns_initialization_flow_test.state_machine,
-        proposal_id.id,
-    );
-
-    // Step 2: Inspect the newly created SNS
-
-    // Assert the SNS was created and get its info
-    let snses = list_deployed_snses(&mut sns_initialization_flow_test.state_machine).instances;
-    assert_eq!(snses.len(), 1);
-    let test_sns = snses.get(0).unwrap();
-
-    // Assert the lifecycle of the Swap canister is adopted
-    let get_lifecycle_response = get_lifecycle(
-        &sns_initialization_flow_test.state_machine,
-        &canister_id_or_panic(test_sns.swap_canister_id),
-    );
-    assert_eq!(get_lifecycle_response.lifecycle(), Lifecycle::Adopted);
-
-    // Assert that the timestamp of the Swap is at least 24 hours in the future
-    let now = sns_initialization_flow_test.now_seconds();
-    assert!(
-        get_lifecycle_response
-            .decentralization_sale_open_timestamp_seconds
-            .unwrap()
-            >= now + ONE_DAY_SECONDS
-    );
-
-    // Step 3: Try to open the decentralization swap by impersonating the NNS Governance canister
-    let swap_parameters = CREATE_SERVICE_NERVOUS_SYSTEM_PROPOSAL
-        .swap_parameters
-        .clone()
-        .unwrap();
-    let sns_token_e8s = CREATE_SERVICE_NERVOUS_SYSTEM_PROPOSAL
-        .initial_token_distribution
-        .clone()
-        .unwrap()
-        .swap_distribution
-        .unwrap()
-        .total
-        .unwrap()
-        .e8s
-        .unwrap();
-
-    let open_swap_request = OpenRequest {
-        params: Some(Params {
-            min_participants: swap_parameters.minimum_participants() as u32,
-            min_icp_e8s: swap_parameters
-                .minimum_icp
-                .and_then(|icp| icp.e8s)
-                .unwrap_or_else(|| {
-                    swap_parameters
-                        .minimum_direct_participation_icp
-                        .unwrap()
-                        .e8s()
-                }),
-            max_icp_e8s: swap_parameters
-                .maximum_icp
-                .and_then(|icp| icp.e8s)
-                .unwrap_or_else(|| {
-                    swap_parameters
-                        .maximum_direct_participation_icp
-                        .unwrap()
-                        .e8s()
-                }),
-            min_direct_participation_icp_e8s: Some(
-                swap_parameters
-                    .minimum_direct_participation_icp
-                    .unwrap()
-                    .e8s(),
-            ),
-            max_direct_participation_icp_e8s: Some(
-                swap_parameters
-                    .maximum_direct_participation_icp
-                    .unwrap()
-                    .e8s(),
-            ),
-            min_participant_icp_e8s: swap_parameters.minimum_participant_icp.unwrap().e8s(),
-            max_participant_icp_e8s: swap_parameters.maximum_participant_icp.unwrap().e8s(),
-            swap_due_timestamp_seconds: now + (2 * ONE_DAY_SECONDS),
-            sns_token_e8s,
-            neuron_basket_construction_parameters: Some(
-                SwapNeuronBasketConstructionParameters::try_from(
-                    swap_parameters
-                        .neuron_basket_construction_parameters
-                        .unwrap(),
-                )
-                .unwrap(),
-            ),
-            sale_delay_seconds: None,
-        }),
-        cf_participants: vec![], // Lets set this to None for now
-        open_sns_token_swap_proposal_id: Some(proposal_id.id),
-    };
-
-    // Opening the swap with this request should result in an error due to invariants being violated
-    let error_msg: String = update_with_sender(
-        &sns_initialization_flow_test.state_machine,
-        canister_id_or_panic(test_sns.swap_canister_id),
-        "open",
-        candid_one::<String, OpenRequest>,
-        open_swap_request,
-        GOVERNANCE_CANISTER_ID.get(), // Spoof the NNS Gov canister id
-    )
-    .unwrap_err();
-
-    assert!(error_msg
-        .contains("Invalid lifecycle state to open the swap: must be Pending, was Adopted"));
-}
-
-/// TODO[NNS1-2636]: Reenable this test after Swap starts calling settle_neurons_fund_participation.
-#[ignore]
-#[test]
 fn test_one_proposal_sns_initialization_failed_swap_returns_neurons_fund_and_dapps() {
     // Step 0: Setup the world and record its state
     let mut sns_initialization_flow_test = SnsInitializationFlowTestSetup::default_setup();
@@ -1109,7 +987,7 @@ fn test_one_proposal_sns_initialization_failed_swap_returns_neurons_fund_and_dap
     // Assert the SNS was created and get its info
     let snses = list_deployed_snses(&mut sns_initialization_flow_test.state_machine).instances;
     assert_eq!(snses.len(), 1);
-    let test_sns = snses.get(0).unwrap();
+    let test_sns = snses.first().unwrap();
 
     // Get the cycle balance of the SNS-W canister and verify it has been decremented
     let sns_wasm_cycles_balance = get_canister_status_from_root(
@@ -1323,7 +1201,7 @@ fn test_one_proposal_sns_initialization_supports_multiple_open_swaps() {
     // Assert the SNS was created and get its info
     let snses = list_deployed_snses(&mut sns_initialization_flow_test.state_machine).instances;
     assert_eq!(snses.len(), 1);
-    let test_sns_1 = snses.get(0).unwrap();
+    let test_sns_1 = snses.first().unwrap();
 
     // Assert the lifecycle of the Swap canister is adopted
     let get_lifecycle_response = get_lifecycle(

@@ -36,7 +36,9 @@ impl SummaryPayload {
     /// P2P should keep up connections to all nodes registered in any registry
     /// between the one returned from this function and the current
     /// `RegistryVersion`.
-    pub fn get_oldest_registry_version_in_use(&self) -> RegistryVersion {
+    ///
+    /// Note that this function should generally be called on the CUP instead.
+    pub(crate) fn get_oldest_registry_version_in_use(&self) -> RegistryVersion {
         let dkg_version = self.dkg.get_oldest_registry_version_in_use();
         if let Some(ecdsa_version) = self
             .ecdsa
@@ -235,28 +237,13 @@ impl AsRef<BlockPayload> for Payload {
     }
 }
 
-impl From<(dkg::Summary, ecdsa::Summary)> for BlockPayload {
-    fn from((dkg, ecdsa): (dkg::Summary, ecdsa::Summary)) -> BlockPayload {
-        BlockPayload::Summary(SummaryPayload { dkg, ecdsa })
-    }
-}
-
-impl From<(BatchPayload, dkg::Dealings, ecdsa::Payload)> for BlockPayload {
-    fn from(
-        (batch, dealings, ecdsa): (BatchPayload, dkg::Dealings, ecdsa::Payload),
-    ) -> BlockPayload {
-        BlockPayload::Data(DataPayload {
-            batch,
-            dealings,
-            ecdsa,
-        })
-    }
-}
-
 impl From<dkg::Payload> for BlockPayload {
     fn from(payload: dkg::Payload) -> BlockPayload {
         match payload {
-            dkg::Payload::Summary(summary) => (summary, None).into(),
+            dkg::Payload::Summary(summary) => BlockPayload::Summary(SummaryPayload {
+                dkg: summary,
+                ecdsa: None,
+            }),
             dkg::Payload::Dealings(dealings) => BlockPayload::Data(DataPayload {
                 batch: BatchPayload::default(),
                 dealings,

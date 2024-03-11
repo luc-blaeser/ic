@@ -1,4 +1,3 @@
-use crate::address::Address;
 use crate::eth_rpc::Hash;
 use crate::eth_rpc_client::responses::{TransactionReceipt, TransactionStatus};
 use crate::lifecycle::EthereumNetwork;
@@ -10,6 +9,7 @@ use crate::tx::{
     AccessList, Eip1559Signature, Eip1559TransactionRequest, SignedEip1559TransactionRequest,
     TransactionPrice,
 };
+use ic_ethereum_types::Address;
 
 const DEFAULT_WITHDRAWAL_AMOUNT: u128 = 1_100_000_000_000_000;
 const DEFAULT_PRINCIPAL: &str = "k2t6j-2nvnp-4zjm3-25dtz-6xhaa-c7boj-5gayf-oj3xs-i43lp-teztq-6ae";
@@ -25,9 +25,10 @@ mod eth_transactions {
     mod record_withdrawal_request {
         use super::*;
         use crate::state::transactions::tests::{
-            create_and_record_signed_transaction, create_and_record_transaction,
-            expect_panic_with_message, transaction_price, transaction_receipt,
+            create_and_record_signed_transaction, create_and_record_transaction, transaction_price,
+            transaction_receipt,
         };
+        use crate::test_fixtures::expect_panic_with_message;
 
         #[test]
         fn should_record_withdrawal_request() {
@@ -113,7 +114,7 @@ mod eth_transactions {
             let requests = transactions.withdrawal_requests_batch(1);
             assert_eq!(
                 requests,
-                vec![withdrawal_request_with_index(LedgerBurnIndex::new(0)),]
+                vec![withdrawal_request_with_index(LedgerBurnIndex::new(0))]
             );
 
             let requests = transactions.withdrawal_requests_batch(2);
@@ -244,7 +245,7 @@ mod eth_transactions {
                 vec![
                     first_request.clone(),
                     second_request.clone(),
-                    third_request.clone()
+                    third_request.clone(),
                 ]
             );
 
@@ -255,7 +256,7 @@ mod eth_transactions {
                 vec![
                     second_request.clone(),
                     third_request.clone(),
-                    first_request.clone()
+                    first_request.clone(),
                 ]
             );
 
@@ -266,7 +267,7 @@ mod eth_transactions {
                 vec![
                     third_request.clone(),
                     first_request.clone(),
-                    second_request.clone()
+                    second_request.clone(),
                 ]
             );
 
@@ -280,15 +281,15 @@ mod eth_transactions {
     }
 
     mod record_created_transaction {
-        use crate::address::Address;
         use crate::lifecycle::EthereumNetwork;
         use crate::numeric::{LedgerBurnIndex, TransactionNonce};
         use crate::state::transactions::tests::{
-            create_and_record_transaction, expect_panic_with_message, transaction_price,
-            withdrawal_request_with_index,
+            create_and_record_transaction, transaction_price, withdrawal_request_with_index,
         };
         use crate::state::transactions::{create_transaction, EthTransactions};
+        use crate::test_fixtures::expect_panic_with_message;
         use crate::tx::Eip1559TransactionRequest;
+        use ic_ethereum_types::Address;
         use proptest::prelude::any;
         use proptest::{prop_assert_ne, proptest};
 
@@ -441,11 +442,11 @@ mod eth_transactions {
         use super::super::arbitrary::arb_signed_eip_1559_transaction_request_with_nonce;
         use crate::numeric::{LedgerBurnIndex, TransactionNonce};
         use crate::state::transactions::tests::{
-            create_and_record_transaction, create_and_record_withdrawal_request,
-            expect_panic_with_message, sign_transaction, signed_transaction_with_nonce,
-            transaction_price,
+            create_and_record_transaction, create_and_record_withdrawal_request, sign_transaction,
+            signed_transaction_with_nonce, transaction_price,
         };
         use crate::state::transactions::EthTransactions;
+        use crate::test_fixtures::expect_panic_with_message;
         use proptest::{prop_assume, proptest};
 
         #[test]
@@ -753,10 +754,10 @@ mod eth_transactions {
         };
         use crate::state::transactions::tests::{
             create_and_record_signed_transaction, create_and_record_transaction,
-            create_and_record_withdrawal_request, expect_panic_with_message, sign_transaction,
-            transaction_price,
+            create_and_record_withdrawal_request, sign_transaction, transaction_price,
         };
         use crate::state::transactions::{equal_ignoring_fee_and_amount, EthTransactions};
+        use crate::test_fixtures::expect_panic_with_message;
         use crate::tx::{Eip1559TransactionRequest, TransactionPrice};
         use proptest::{prop_assume, proptest};
         use std::iter;
@@ -1005,7 +1006,7 @@ mod eth_transactions {
                         &TransactionNonce::ONE,
                         &second_ledger_burn_index,
                         &vec![second_tx.clone()]
-                    )
+                    ),
                 ],
                 transactions.sent_transactions_iter().collect::<Vec<_>>()
             );
@@ -1147,15 +1148,16 @@ mod eth_transactions {
         use crate::numeric::{LedgerBurnIndex, TransactionNonce, Wei};
         use crate::state::transactions::tests::{
             create_and_record_signed_transaction, create_and_record_transaction,
-            create_and_record_withdrawal_request, dummy_signature, expect_panic_with_message,
-            transaction_price, transaction_receipt, withdrawal_request_with_index,
-            DEFAULT_CREATED_AT, DEFAULT_PRINCIPAL, DEFAULT_RECIPIENT_ADDRESS, DEFAULT_SUBACCOUNT,
+            create_and_record_withdrawal_request, dummy_signature, transaction_price,
+            transaction_receipt, withdrawal_request_with_index, DEFAULT_CREATED_AT,
+            DEFAULT_PRINCIPAL, DEFAULT_RECIPIENT_ADDRESS, DEFAULT_SUBACCOUNT,
             DEFAULT_WITHDRAWAL_AMOUNT,
         };
         use crate::state::transactions::{
             Address, EthTransactions, EthWithdrawalRequest, ReimbursementRequest, Subaccount,
             TransactionStatus,
         };
+        use crate::test_fixtures::expect_panic_with_message;
         use crate::tx::SignedEip1559TransactionRequest;
         use std::str::FromStr;
 
@@ -1267,7 +1269,7 @@ mod eth_transactions {
                     withdrawal_amount: Wei::new(DEFAULT_WITHDRAWAL_AMOUNT),
                     destination: Address::from_str(DEFAULT_RECIPIENT_ADDRESS).unwrap(),
                     ledger_burn_index,
-                    from: candid::Principal::from_str(DEFAULT_PRINCIPAL,).unwrap(),
+                    from: candid::Principal::from_str(DEFAULT_PRINCIPAL).unwrap(),
                     from_subaccount: Some(Subaccount(DEFAULT_SUBACCOUNT)),
                     created_at: Some(DEFAULT_CREATED_AT),
                 }
@@ -1291,7 +1293,7 @@ mod eth_transactions {
                 &ReimbursementRequest {
                     transaction_hash: Some(receipt.transaction_hash),
                     withdrawal_id: ledger_burn_index,
-                    to: candid::Principal::from_str(DEFAULT_PRINCIPAL,).unwrap(),
+                    to: candid::Principal::from_str(DEFAULT_PRINCIPAL).unwrap(),
                     to_subaccount: Some(Subaccount(DEFAULT_SUBACCOUNT)),
                     reimbursed_amount: *finalized_transaction.transaction_amount(),
                 }
@@ -1460,7 +1462,7 @@ mod eth_transactions {
             assert_eq!(
                 transactions.transaction_status(&ledger_burn_index),
                 RetrieveEthStatus::TxFinalized(TxFinalizedStatus::Reimbursed {
-                    reimbursed_in_block: candid::Nat::from(16),
+                    reimbursed_in_block: candid::Nat::from(16_u8),
                     transaction_hash: signed_tx.hash().to_string(),
                     reimbursed_amount: Wei::new(DEFAULT_WITHDRAWAL_AMOUNT)
                         .checked_sub(effective_fee_paid)
@@ -1706,7 +1708,6 @@ mod withdrawal_flow {
 }
 
 pub mod arbitrary {
-    use crate::address::Address;
     use crate::checked_amount::CheckedAmountOf;
     use crate::numeric::{GasAmount, TransactionNonce, WeiPerGas};
     use crate::state::transactions::{EthWithdrawalRequest, Subaccount};
@@ -1715,6 +1716,7 @@ pub mod arbitrary {
         SignedEip1559TransactionRequest, StorageKey, TransactionPrice,
     };
     use candid::Principal;
+    use ic_ethereum_types::Address;
     use phantom_newtype::Id;
     use proptest::arbitrary::any;
     use proptest::array::{uniform20, uniform32};
@@ -1734,7 +1736,7 @@ pub mod arbitrary {
     }
 
     fn arb_address() -> impl Strategy<Value = Address> {
-        uniform20(any::<u8>()).prop_map(|bytes| Address::new(bytes))
+        uniform20(any::<u8>()).prop_map(Address::new)
     }
 
     fn arb_principal() -> impl Strategy<Value = Principal> {
@@ -1854,26 +1856,6 @@ pub mod arbitrary {
             },
         )
     }
-}
-
-fn expect_panic_with_message<F: FnOnce() -> R, R: std::fmt::Debug>(f: F, expected_message: &str) {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-    let error = result.unwrap_err();
-    let panic_message = {
-        if let Some(s) = error.downcast_ref::<String>() {
-            s.to_string()
-        } else if let Some(s) = error.downcast_ref::<&str>() {
-            s.to_string()
-        } else {
-            format!("{:?}", error)
-        }
-    };
-    assert!(
-        panic_message.contains(expected_message),
-        "Expected panic message to contain: {}, but got: {}",
-        expected_message,
-        panic_message
-    );
 }
 
 fn withdrawal_request_with_index(ledger_burn_index: LedgerBurnIndex) -> EthWithdrawalRequest {

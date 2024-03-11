@@ -410,7 +410,13 @@ impl<T: ConsensusPool> ChangeSetProducer<T> for ConsensusImpl {
     /// moment it is important to call finalizer first, because otherwise
     /// we'll just keep producing notarized blocks indefinitely without
     /// finalizing anything, due to the above decision of having to return
-    /// early. The order of the rest subcomponents decides whom is given
+    /// early.
+    /// Additionally, we call the purger after every function that may increment
+    /// the finalized or CUP height (currently aggregation & validation), as
+    /// these heights determine which artifacts we can purge. This reduces the
+    /// number of excess artifacts, which allows us to maintain a stricter bound
+    /// on the memory consumption of our advertised validated pool.
+    /// The order of the rest subcomponents decides whom is given
     /// a priority, but it should not affect liveness or correctness.
     fn on_state_change(&self, pool: &T) -> ChangeSet {
         let pool_reader = PoolReader::new(pool);
@@ -515,16 +521,17 @@ impl<T: ConsensusPool> ChangeSetProducer<T> for ConsensusImpl {
                 self.purger.on_state_change(&pool_reader)
             })
         };
-        let calls: [&'_ dyn Fn() -> ChangeSet; 9] = [
+        let calls: [&'_ dyn Fn() -> ChangeSet; 10] = [
             &finalize,
             &make_catch_up_package,
-            &purge,
             &aggregate,
+            &purge,
             &notarize,
             &make_random_beacon,
             &make_random_tape,
             &make_block,
             &validate,
+            &purge,
         ];
 
         let changeset = self.schedule.call_next(&calls);
@@ -538,7 +545,8 @@ impl<T: ConsensusPool> ChangeSetProducer<T> for ConsensusImpl {
             let unit_delay = settings.unit_delay;
             let current_time = self.time_source.get_relative_time();
             for (component, last_invoked_time) in self.last_invoked.borrow().iter() {
-                let time_since_last_invoked = current_time.saturating_sub(*last_invoked_time);
+                let time_since_last_invoked =
+                    current_time.saturating_duration_since(*last_invoked_time);
                 let component_name = component.as_ref();
                 self.metrics
                     .time_since_last_invoked
@@ -727,6 +735,7 @@ mod tests {
     use ic_config::artifact_pool::ArtifactPoolConfig;
     use ic_consensus_mocks::{dependencies_with_subnet_params, Dependencies};
     use ic_https_outcalls_consensus::test_utils::FakeCanisterHttpPayloadBuilder;
+    use ic_interfaces::time_source::TimeSource;
     use ic_logger::replica_logger::no_op_logger;
     use ic_metrics::MetricsRegistry;
     use ic_protobuf::registry::subnet::v1::SubnetRecord;
@@ -739,9 +748,9 @@ mod tests {
         self_validating_payload_builder::FakeSelfValidatingPayloadBuilder,
         types::ids::{node_test_id, subnet_test_id},
         xnet_payload_builder::FakeXNetPayloadBuilder,
-        FastForwardTimeSource,
     };
     use ic_test_utilities_registry::{FakeLocalStoreCertifiedTimeReader, SubnetRecordBuilder};
+    use ic_test_utilities_time::FastForwardTimeSource;
     use ic_types::{crypto::CryptoHash, CryptoHashOfState, SubnetId};
     use std::{sync::Arc, time::Duration};
 

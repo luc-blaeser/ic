@@ -2,8 +2,8 @@ use crate::itest_helpers::{populate_canister_ids, SnsTestsInitPayloadBuilder};
 use candid::{CandidType, Decode, Encode};
 use canister_test::Project;
 use ic_base_types::{CanisterId, PrincipalId};
-use ic_ic00_types::CanisterInstallMode;
 use ic_ledger_core::Tokens;
+use ic_management_canister_types::CanisterInstallMode;
 use ic_nervous_system_clients::{
     canister_id_record::CanisterIdRecord, canister_status::CanisterStatusResultV2,
 };
@@ -14,18 +14,25 @@ use ic_nns_constants::{
 };
 use ic_nns_test_utils::{
     sns_wasm::{
-        build_governance_sns_wasm, build_index_sns_wasm, build_ledger_sns_wasm,
+        build_governance_sns_wasm, build_index_ng_sns_wasm, build_ledger_sns_wasm,
         build_root_sns_wasm, build_swap_sns_wasm,
     },
     state_test_helpers::set_controllers,
 };
-use ic_sns_governance::pb::v1::{ListNeurons, ListNeuronsResponse, NervousSystemParameters};
-use ic_sns_init::SnsCanisterInitPayloads;
-use ic_sns_root::pb::v1::{
-    RegisterDappCanisterRequest, RegisterDappCanisterResponse, RegisterDappCanistersRequest,
-    RegisterDappCanistersResponse,
+use ic_sns_governance::pb::v1::{
+    governance::Version,
+    manage_neuron::{self, RegisterVote},
+    ListNeurons, ListNeuronsResponse, ManageNeuron, ManageNeuronResponse, NervousSystemParameters,
+    NeuronId, ProposalId, Vote,
 };
-use ic_sns_root::{GetSnsCanistersSummaryRequest, GetSnsCanistersSummaryResponse};
+use ic_sns_init::SnsCanisterInitPayloads;
+use ic_sns_root::{
+    pb::v1::{
+        RegisterDappCanisterRequest, RegisterDappCanisterResponse, RegisterDappCanistersRequest,
+        RegisterDappCanistersResponse,
+    },
+    GetSnsCanistersSummaryRequest, GetSnsCanistersSummaryResponse,
+};
 use ic_sns_swap::pb::v1::{
     self as swap_pb, ErrorRefundIcpResponse, FinalizeSwapResponse, GetBuyerStateResponse,
     GetBuyersTotalResponse, GetLifecycleResponse, GetOpenTicketResponse, GetSaleParametersResponse,
@@ -40,7 +47,7 @@ use icp_ledger::{
 };
 use icrc_ledger_types::icrc1::account::Account;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct SnsTestCanisterIds {
     pub root_canister_id: CanisterId,
     pub governance_canister_id: CanisterId,
@@ -103,41 +110,61 @@ pub fn setup_sns_canisters(
         ledger_canister_id,
         swap_canister_id,
         index_canister_id,
+        vec![],
         &mut payloads,
     );
 
     let SnsCanisterInitPayloads {
-        governance,
+        mut governance,
         ledger,
         root,
         swap,
-        index,
+        index_ng,
     } = payloads;
+
+    let (root_sns_wasm, governance_sns_wasm, ledger_sns_wasm, swap_sns_wasm, index_sns_wasm) = (
+        build_root_sns_wasm(),
+        build_governance_sns_wasm(),
+        build_ledger_sns_wasm(),
+        build_swap_sns_wasm(),
+        build_index_ng_sns_wasm(),
+    );
+
+    let deployed_version = Version {
+        root_wasm_hash: root_sns_wasm.sha256_hash().to_vec(),
+        governance_wasm_hash: governance_sns_wasm.sha256_hash().to_vec(),
+        ledger_wasm_hash: ledger_sns_wasm.sha256_hash().to_vec(),
+        swap_wasm_hash: swap_sns_wasm.sha256_hash().to_vec(),
+        archive_wasm_hash: vec![], // tests don't need it for now so we don't compile it.
+        index_wasm_hash: index_sns_wasm.sha256_hash().to_vec(),
+    };
+
+    governance.deployed_version = Some(deployed_version);
 
     install_canister(
         root_canister_id,
-        build_root_sns_wasm().wasm,
+        root_sns_wasm.wasm,
         Encode!(&root).unwrap(),
     );
     install_canister(
         governance_canister_id,
-        build_governance_sns_wasm().wasm,
+        governance_sns_wasm.wasm,
         Encode!(&governance).unwrap(),
     );
     install_canister(
         ledger_canister_id,
-        build_ledger_sns_wasm().wasm,
+        ledger_sns_wasm.wasm,
         Encode!(&ledger).unwrap(),
     );
     install_canister(
         swap_canister_id,
-        build_swap_sns_wasm().wasm,
+        swap_sns_wasm.wasm,
         Encode!(&swap).unwrap(),
     );
     install_canister(
         index_canister_id,
-        build_index_sns_wasm().wasm,
-        Encode!(&index).unwrap(),
+        index_sns_wasm.wasm,
+        Encode!(&index_ng.expect("Index payload was None")).unwrap(),
     );
 
     SnsTestCanisterIds {
@@ -194,6 +221,57 @@ pub fn sns_governance_get_nervous_system_parameters(
         }
     };
     Decode!(&result, NervousSystemParameters).unwrap()
+}
+
+#[must_use]
+fn manage_neuron(
+    state_machine: &mut StateMachine,
+    sns_governance_canister_id: CanisterId,
+    sender: PrincipalId,
+    neuron_id: NeuronId,
+    command: manage_neuron::Command,
+) -> ManageNeuronResponse {
+    let result = state_machine
+        .execute_ingress_as(
+            sender,
+            sns_governance_canister_id,
+            "manage_neuron",
+            Encode!(&ManageNeuron {
+                command: Some(command),
+                subaccount: neuron_id.id,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+    let result = match result {
+        WasmResult::Reply(result) => result,
+        WasmResult::Reject(s) => panic!("Call to manage_neuron failed: {:#?}", s),
+    };
+
+    Decode!(&result, ManageNeuronResponse).unwrap()
+}
+
+pub fn sns_cast_vote(
+    state_machine: &mut StateMachine,
+    sns_governance_canister_id: CanisterId,
+    sender: PrincipalId,
+    neuron_id: NeuronId,
+    proposal_id: ProposalId,
+    vote: Vote,
+) -> ManageNeuronResponse {
+    let command = manage_neuron::Command::RegisterVote(RegisterVote {
+        proposal: Some(proposal_id),
+        vote: vote as i32,
+    });
+
+    manage_neuron(
+        state_machine,
+        sns_governance_canister_id,
+        sender,
+        neuron_id,
+        command,
+    )
 }
 
 pub fn participate_in_swap(
@@ -497,6 +575,7 @@ impl Scenario {
             ledger_canister_id,
             swap_canister_id,
             index_canister_id,
+            vec![],
             &mut configuration,
         );
 

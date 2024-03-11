@@ -9,9 +9,8 @@ use ic_config::artifact_pool::ArtifactPoolConfig;
 use ic_constants::MAX_INGRESS_TTL;
 use ic_interfaces::{
     ingress_pool::{
-        ChangeAction, ChangeSet, IngressPool, IngressPoolObject, IngressPoolSelect,
-        IngressPoolThrottler, PoolSection, SelectResult, UnvalidatedIngressArtifact,
-        ValidatedIngressArtifact,
+        ChangeAction, ChangeSet, IngressPool, IngressPoolObject, IngressPoolThrottler, PoolSection,
+        UnvalidatedIngressArtifact, ValidatedIngressArtifact,
     },
     p2p::consensus::{
         ChangeResult, MutablePool, PriorityFnAndFilterProducer, UnvalidatedArtifact,
@@ -30,6 +29,8 @@ use ic_types::{
 use prometheus::IntCounter;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+const INGRESS_MESSAGE_ARTIFACT_TYPE: &str = "ingress_message";
 
 #[derive(Clone)]
 struct IngressPoolSection<T: AsRef<IngressPoolObject>> {
@@ -64,12 +65,14 @@ impl<T: AsRef<IngressPoolObject>> IngressPoolSection<T> {
             .with_label_values(&["insert"])
             .start_timer();
         let new_artifact_size = artifact.as_ref().count_bytes();
-        self.metrics.observe_insert(new_artifact_size);
+        self.metrics
+            .observe_insert(new_artifact_size, INGRESS_MESSAGE_ARTIFACT_TYPE);
         if let Some(previous) = self.artifacts.insert(message_id, artifact) {
             let prev_size = previous.as_ref().count_bytes();
             self.byte_size -= prev_size;
             self.byte_size += new_artifact_size;
-            self.metrics.observe_duplicate(prev_size);
+            self.metrics
+                .observe_duplicate(prev_size, INGRESS_MESSAGE_ARTIFACT_TYPE);
         } else {
             self.byte_size += new_artifact_size;
         }
@@ -86,7 +89,10 @@ impl<T: AsRef<IngressPoolObject>> IngressPoolSection<T> {
         let removed = self.artifacts.remove(message_id);
         if let Some(artifact) = &removed {
             self.byte_size -= artifact.as_ref().count_bytes();
-            self.metrics.observe_remove(artifact.as_ref().count_bytes());
+            self.metrics.observe_remove(
+                artifact.as_ref().count_bytes(),
+                INGRESS_MESSAGE_ARTIFACT_TYPE,
+            );
         }
         // SAFETY: Checking byte size invariant
         section_ok(self);
@@ -117,7 +123,8 @@ impl<T: AsRef<IngressPoolObject>> IngressPoolSection<T> {
         for artifact in to_remove.values() {
             let artifact_size = artifact.as_ref().count_bytes();
             self.byte_size -= artifact_size;
-            self.metrics.observe_remove(artifact_size);
+            self.metrics
+                .observe_remove(artifact_size, INGRESS_MESSAGE_ARTIFACT_TYPE);
         }
         // SAFETY: Checking byte size invariant
         section_ok(self);
@@ -412,38 +419,6 @@ impl ValidatedPoolReader<IngressArtifact> for IngressPoolImpl {
     }
 }
 
-/// Implement the select interface required by IngressSelector (and consequently
-/// by consensus). It allows the caller to select qualifying artifacts from the
-/// validated pool without exposing extra functionalities.
-impl IngressPoolSelect for IngressPoolImpl {
-    fn select_validated<'a>(
-        &self,
-        range: std::ops::RangeInclusive<Time>,
-        mut f: Box<dyn FnMut(&IngressPoolObject) -> SelectResult<SignedIngress> + 'a>,
-    ) -> Vec<SignedIngress> {
-        let mut collected = Vec::new();
-
-        let mut artifacts = self
-            .validated()
-            .get_all_by_expiry_range(range)
-            .collect::<Vec<_>>();
-
-        // At this point [artifacts] are sorted by the expiry time. In order to prevent malicious
-        // users from putting their messages ahead of others by carefully crafting the expiry
-        // times, we sort the ingress messages by the time they were delivered to the pool.
-        artifacts.sort_unstable_by_key(|artifact| artifact.timestamp);
-
-        for artifact in artifacts {
-            match f(&artifact.msg) {
-                SelectResult::Selected(msg) => collected.push(msg),
-                SelectResult::Skip => (),
-                SelectResult::Abort => break,
-            }
-        }
-        collected
-    }
-}
-
 impl IngressPoolThrottler for IngressPoolImpl {
     fn exceeds_threshold(&self) -> bool {
         let ingress_count = self.validated.size() + self.unvalidated.size();
@@ -500,11 +475,10 @@ mod tests {
     use ic_constants::MAX_INGRESS_TTL;
     use ic_interfaces::p2p::consensus::MutablePool;
     use ic_interfaces::time_source::TimeSource;
-    use ic_test_utilities::{
-        mock_time, types::ids::node_test_id, types::messages::SignedIngressBuilder,
-        FastForwardTimeSource,
-    };
+    use ic_test_utilities::{types::ids::node_test_id, types::messages::SignedIngressBuilder};
     use ic_test_utilities_logger::with_test_replica_logger;
+    use ic_test_utilities_time::FastForwardTimeSource;
+    use ic_types::time::UNIX_EPOCH;
     use rand::Rng;
     use std::time::Duration;
 
@@ -520,7 +494,7 @@ mod tests {
                 UnvalidatedIngressArtifact {
                     message: IngressPoolObject::from(ingress_msg),
                     peer_id: node_test_id(0),
-                    timestamp: mock_time(),
+                    timestamp: UNIX_EPOCH,
                 },
             );
             assert_eq!(ingress_pool.size(), 1);
@@ -548,7 +522,7 @@ mod tests {
                     message_id.clone(),
                     ValidatedIngressArtifact {
                         msg: IngressPoolObject::from(ingress_msg),
-                        timestamp: mock_time(),
+                        timestamp: UNIX_EPOCH,
                     },
                 );
                 assert!(ingress_pool.contains(&message_id));
@@ -577,7 +551,7 @@ mod tests {
                     message_id,
                     ValidatedIngressArtifact {
                         msg: IngressPoolObject::from(ingress_msg),
-                        timestamp: mock_time(),
+                        timestamp: UNIX_EPOCH,
                     },
                 );
 
@@ -642,7 +616,7 @@ mod tests {
                         message_id.clone(),
                         ValidatedIngressArtifact {
                             msg: IngressPoolObject::from(ingress_msg),
-                            timestamp: mock_time(),
+                            timestamp: UNIX_EPOCH,
                         },
                     );
                 }
@@ -869,99 +843,11 @@ mod tests {
         })
     }
 
-    #[test]
-    fn select_validated_sorts_messages() {
-        with_test_replica_logger(|log| {
-            ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
-                let time = |millis: u64| Time::from_millis_since_unix_epoch(millis).unwrap();
-                let nonce = |nonce: u64| nonce.to_le_bytes().to_vec();
-                let metrics_registry = MetricsRegistry::new();
-                let mut ingress_pool =
-                    IngressPoolImpl::new(node_test_id(0), pool_config, metrics_registry, log);
-
-                insert_validated_artifact_with_timestamps(&mut ingress_pool, 0, time(1), time(30));
-                insert_validated_artifact_with_timestamps(&mut ingress_pool, 1, time(3), time(40));
-                insert_validated_artifact_with_timestamps(&mut ingress_pool, 2, time(2), time(50));
-                insert_validated_artifact_with_timestamps(&mut ingress_pool, 3, time(5), time(10));
-                insert_validated_artifact_with_timestamps(&mut ingress_pool, 4, time(4), time(20));
-                insert_validated_artifact_with_timestamps(&mut ingress_pool, 5, time(6), time(60));
-                insert_validated_artifact_with_timestamps(&mut ingress_pool, 6, time(6), time(0));
-
-                let selected = ingress_pool.select_validated(
-                    time(10)..=time(50),
-                    Box::new(|ingress_obj| {
-                        SelectResult::Selected(ingress_obj.signed_ingress.clone())
-                    }),
-                );
-                assert_eq!(
-                    selected
-                        .iter()
-                        .map(|message| message.nonce().unwrap())
-                        .collect::<Vec<_>>(),
-                    // Artifacts with nonce = 5, 6 are filtered out because of their expiry times
-                    // being outside the range
-                    &[nonce(0), nonce(2), nonce(1), nonce(4), nonce(3)]
-                );
-            });
-        });
-    }
-
-    #[test]
-    fn select_validated_applies_closure() {
-        with_test_replica_logger(|log| {
-            ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
-                let time = |millis: u64| Time::from_millis_since_unix_epoch(millis).unwrap();
-                let nonce = |nonce: u64| nonce.to_le_bytes().to_vec();
-                let metrics_registry = MetricsRegistry::new();
-                let mut ingress_pool =
-                    IngressPoolImpl::new(node_test_id(0), pool_config, metrics_registry, log);
-
-                insert_validated_artifact_with_timestamps(&mut ingress_pool, 0, time(0), time(10));
-                insert_validated_artifact_with_timestamps(&mut ingress_pool, 1, time(1), time(10));
-                insert_validated_artifact_with_timestamps(&mut ingress_pool, 2, time(2), time(10));
-                insert_validated_artifact_with_timestamps(&mut ingress_pool, 3, time(3), time(10));
-                insert_validated_artifact_with_timestamps(&mut ingress_pool, 4, time(4), time(10));
-                insert_validated_artifact_with_timestamps(&mut ingress_pool, 5, time(5), time(10));
-                insert_validated_artifact_with_timestamps(&mut ingress_pool, 6, time(6), time(10));
-
-                let mut counter = 0;
-
-                let selected = ingress_pool.select_validated(
-                    time(10)..=time(10),
-                    Box::new(|ingress_obj| {
-                        let result = match counter {
-                            1 | 3 => SelectResult::Skip,
-                            4 => SelectResult::Abort,
-                            _ => SelectResult::Selected(ingress_obj.signed_ingress.clone()),
-                        };
-                        counter += 1;
-                        result
-                    }),
-                );
-
-                // nonce = 0 Selected
-                // nonce = 1 Skipped
-                // nonce = 2 Selected
-                // nonce = 3 Skipped
-                // nonce = 4 Aborted
-                // nonce = 5 not selected because already aborted
-                // nonce = 6 not selected because already aborted
-                assert_eq!(
-                    selected
-                        .iter()
-                        .map(|message| message.nonce().unwrap())
-                        .collect::<Vec<_>>(),
-                    &[nonce(0), nonce(2)]
-                );
-            });
-        });
-    }
-
     fn insert_validated_artifact(ingress_pool: &mut IngressPoolImpl, nonce: u64) {
         insert_validated_artifact_with_timestamps(
             ingress_pool,
             nonce,
-            mock_time(),
+            UNIX_EPOCH,
             ic_types::time::expiry_time_from_now(),
         );
     }

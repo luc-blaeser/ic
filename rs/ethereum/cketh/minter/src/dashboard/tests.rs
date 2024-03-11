@@ -1,7 +1,6 @@
 use crate::dashboard::tests::assertions::DashboardAssert;
 use crate::dashboard::DashboardTemplate;
 use candid::Principal;
-use ic_cketh_minter::address::Address;
 use ic_cketh_minter::eth_logs::{EventSource, ReceivedEthEvent};
 use ic_cketh_minter::eth_rpc_client::responses::{TransactionReceipt, TransactionStatus};
 use ic_cketh_minter::lifecycle::EthereumNetwork;
@@ -15,6 +14,7 @@ use ic_cketh_minter::state::State;
 use ic_cketh_minter::tx::{
     Eip1559Signature, Eip1559TransactionRequest, SignedEip1559TransactionRequest, TransactionPrice,
 };
+use ic_ethereum_types::Address;
 use maplit::btreeset;
 use std::str::FromStr;
 
@@ -22,7 +22,7 @@ use std::str::FromStr;
 fn should_display_metadata() {
     let dashboard = DashboardTemplate {
         minter_address: "0x1789F79e95324A47c5Fd6693071188e82E9a3558".to_string(),
-        contract_address: "0xb44B5e756A894775FC32EDdf3314Bb1B1944dC34".to_string(),
+        eth_helper_contract_address: "0xb44B5e756A894775FC32EDdf3314Bb1B1944dC34".to_string(),
         ledger_id: Principal::from_text("apia6-jaaaa-aaaar-qabma-cai")
             .expect("BUG: invalid principal"),
         ecdsa_key_name: "key_1".to_string(),
@@ -34,7 +34,7 @@ fn should_display_metadata() {
     DashboardAssert::assert_that(dashboard)
         .has_ethereum_network("Ethereum Testnet Sepolia")
         .has_minter_address("0x1789F79e95324A47c5Fd6693071188e82E9a3558")
-        .has_contract_address("0xb44B5e756A894775FC32EDdf3314Bb1B1944dC34")
+        .has_eth_helper_contract_address("0xb44B5e756A894775FC32EDdf3314Bb1B1944dC34")
         .has_ledger_canister_id("apia6-jaaaa-aaaar-qabma-cai")
         .has_tecdsa_key_name("key_1")
         .has_next_transaction_nonce("42")
@@ -617,7 +617,7 @@ fn initial_state() -> State {
         ethereum_block_height: Default::default(),
         minimum_withdrawal_amount: Wei::TWO.into(),
         next_transaction_nonce: TransactionNonce::ZERO.into(),
-        last_scraped_block_number: candid::Nat::from(3_956_206),
+        last_scraped_block_number: candid::Nat::from(3_956_206_u32),
     })
     .expect("valid init args")
 }
@@ -806,9 +806,9 @@ mod assertions {
             )
         }
 
-        pub fn has_contract_address(&self, expected_address: &str) -> &Self {
+        pub fn has_eth_helper_contract_address(&self, expected_address: &str) -> &Self {
             self.has_string_value(
-                "#contract-address > td",
+                "#eth-helper-contract-address > td",
                 expected_address,
                 "wrong contract address",
             )

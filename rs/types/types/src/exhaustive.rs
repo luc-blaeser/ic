@@ -23,7 +23,7 @@ use ic_btc_types_internal::{BitcoinAdapterResponse, BitcoinAdapterResponseWrappe
 use ic_crypto_test_utils_canister_threshold_sigs::random_node_id_excluding;
 use ic_error_types::RejectCode;
 use ic_exhaustive_derive::ExhaustiveSet;
-use ic_ic00_types::{EcdsaCurve, EcdsaKeyId};
+use ic_management_canister_types::{EcdsaCurve, EcdsaKeyId};
 use ic_protobuf::types::v1 as pb;
 use phantom_newtype::{AmountOf, Id};
 use prost::Message;
@@ -348,9 +348,18 @@ impl<V: ExhaustiveSet + CryptoHashable> ExhaustiveSet for Hashed<CryptoHashOf<V>
 
 impl ExhaustiveSet for CatchUpContent {
     fn exhaustive_set<R: RngCore + CryptoRng>(rng: &mut R) -> Vec<Self> {
+        let registry_versions = Option::<RegistryVersion>::exhaustive_set(rng);
         <(HashedBlock, HashedRandomBeacon, CryptoHashOfState)>::exhaustive_set(rng)
             .into_iter()
-            .map(|tuple| Self::new(tuple.0, tuple.1, tuple.2))
+            .enumerate()
+            .map(|(i, tuple)| {
+                Self::new(
+                    tuple.0,
+                    tuple.1,
+                    tuple.2,
+                    registry_versions[i % registry_versions.len()],
+                )
+            })
             .collect()
     }
 }

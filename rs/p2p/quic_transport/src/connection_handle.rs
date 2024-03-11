@@ -4,8 +4,8 @@
 //! The `ConnectionHandle` implements `rpc` and `push` methods for the given
 //! connection.
 //!
+use axum::http::{Request, Response};
 use bytes::Bytes;
-use http::{Request, Response};
 use ic_base_types::NodeId;
 use quinn::Connection;
 
@@ -15,7 +15,7 @@ use crate::{
         ERROR_TYPE_WRITE, REQUEST_TYPE_PUSH, REQUEST_TYPE_RPC,
     },
     utils::{read_response, write_request},
-    ConnId, SendError,
+    ConnId,
 };
 
 #[derive(Clone, Debug)]
@@ -48,7 +48,7 @@ impl ConnectionHandle {
     pub(crate) async fn rpc(
         &self,
         mut request: Request<Bytes>,
-    ) -> Result<Response<Bytes>, SendError> {
+    ) -> Result<Response<Bytes>, anyhow::Error> {
         let _timer = self
             .metrics
             .connection_handle_duration_seconds
@@ -66,41 +66,37 @@ impl ConnectionHandle {
         // Propagate PeerId from this connection to lower layers.
         request.extensions_mut().insert(self.peer_id);
 
-        let (mut send_stream, recv_stream) = self.connection.open_bi().await.map_err(|e| {
+        let (mut send_stream, recv_stream) = self.connection.open_bi().await.map_err(|err| {
             self.metrics
                 .connection_handle_errors_total
                 .with_label_values(&[REQUEST_TYPE_RPC, ERROR_TYPE_OPEN]);
-            SendError::SendRequestFailed {
-                reason: e.to_string(),
-            }
+            err
         })?;
 
         write_request(&mut send_stream, request)
             .await
-            .map_err(|e| {
+            .map_err(|err| {
                 self.metrics
                     .connection_handle_errors_total
                     .with_label_values(&[REQUEST_TYPE_RPC, ERROR_TYPE_WRITE])
                     .inc();
-                SendError::SendRequestFailed { reason: e }
+                err
             })?;
 
-        send_stream.finish().await.map_err(|e| {
+        send_stream.finish().await.map_err(|err| {
             self.metrics
                 .connection_handle_errors_total
                 .with_label_values(&[REQUEST_TYPE_RPC, ERROR_TYPE_FINISH])
                 .inc();
-            SendError::SendRequestFailed {
-                reason: e.to_string(),
-            }
+            err
         })?;
 
-        let mut response = read_response(recv_stream).await.map_err(|e| {
+        let mut response = read_response(recv_stream).await.map_err(|err| {
             self.metrics
                 .connection_handle_errors_total
                 .with_label_values(&[REQUEST_TYPE_RPC, ERROR_TYPE_READ])
                 .inc();
-            SendError::RecvResponseFailed { reason: e }
+            err
         })?;
 
         // Propagate PeerId from this request to upper layers.
@@ -110,7 +106,7 @@ impl ConnectionHandle {
         Ok(response)
     }
 
-    pub(crate) async fn push(&self, mut request: Request<Bytes>) -> Result<(), SendError> {
+    pub(crate) async fn push(&self, mut request: Request<Bytes>) -> Result<(), anyhow::Error> {
         let _timer = self
             .metrics
             .connection_handle_duration_seconds
@@ -124,33 +120,29 @@ impl ConnectionHandle {
         // Propagate PeerId from this connection to lower layers.
         request.extensions_mut().insert(self.peer_id);
 
-        let mut send_stream = self.connection.open_uni().await.map_err(|e| {
+        let mut send_stream = self.connection.open_uni().await.map_err(|err| {
             self.metrics
                 .connection_handle_errors_total
                 .with_label_values(&[REQUEST_TYPE_PUSH, ERROR_TYPE_OPEN]);
-            SendError::SendRequestFailed {
-                reason: e.to_string(),
-            }
+            err
         })?;
 
         write_request(&mut send_stream, request)
             .await
-            .map_err(|e| {
+            .map_err(|err| {
                 self.metrics
                     .connection_handle_errors_total
                     .with_label_values(&[REQUEST_TYPE_PUSH, ERROR_TYPE_WRITE])
                     .inc();
-                SendError::SendRequestFailed { reason: e }
+                err
             })?;
 
-        send_stream.finish().await.map_err(|e| {
+        send_stream.finish().await.map_err(|err| {
             self.metrics
                 .connection_handle_errors_total
                 .with_label_values(&[REQUEST_TYPE_PUSH, ERROR_TYPE_FINISH])
                 .inc();
-            SendError::SendRequestFailed {
-                reason: e.to_string(),
-            }
+            err
         })?;
 
         Ok(())

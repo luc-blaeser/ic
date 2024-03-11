@@ -16,18 +16,7 @@ Success::
 . The calls succeed with the expected values.
 end::catalog[] */
 
-use crate::{
-    driver::{
-        asset_canister::{DeployAssetCanister, UploadAssetRequest},
-        boundary_node::BoundaryNodeVm,
-        test_env::TestEnv,
-        test_env_api::{
-            retry_async, HasPublicApiUrl, HasTopologySnapshot, HasVm, HasWasm, IcNodeContainer,
-            RetrieveIpv4Addr, SshSession, READY_WAIT_TIMEOUT, RETRY_BACKOFF,
-        },
-    },
-    util::{agent_observes_canister_module, assert_create_agent, block_on},
-};
+use k256::SecretKey;
 
 use crate::boundary_nodes::{
     constants::{BOUNDARY_NODE_NAME, COUNTER_CANISTER_WAT},
@@ -35,14 +24,48 @@ use crate::boundary_nodes::{
         create_canister, get_install_url, install_canisters, read_counters_on_counter_canisters,
         set_counters_on_counter_canisters,
     },
+    setup::TEST_PRIVATE_KEY,
 };
-use std::{iter, net::SocketAddrV6, time::Duration};
+use crate::{
+    driver::{
+        asset_canister::{DeployAssetCanister, UploadAssetRequest},
+        boundary_node::BoundaryNodeVm,
+        test_env::TestEnv,
+        test_env_api::{
+            retry_async, GetFirstHealthyNodeSnapshot, HasPublicApiUrl, HasTopologySnapshot, HasVm,
+            HasWasm, IcNodeContainer, RetrieveIpv4Addr, SshSession, READY_WAIT_TIMEOUT,
+            RETRY_BACKOFF,
+        },
+    },
+    nns::{self, vote_execute_proposal_assert_executed},
+    util::{agent_observes_canister_module, assert_create_agent, block_on, runtime_from_url},
+};
+use candid::{Decode, Encode};
+use discower_bowndary::api_nodes_discovery::{Fetch, RegistryFetcher};
+use ic_canister_client::Sender;
+use ic_nervous_system_common_test_keys::TEST_NEURON_1_OWNER_KEYPAIR;
+use ic_nns_common::types::NeuronId;
+use ic_nns_constants::REGISTRY_CANISTER_ID;
+use ic_nns_governance::{init::TEST_NEURON_1_ID, pb::v1::NnsFunction};
+use ic_nns_test_utils::governance::submit_external_update_proposal;
+use registry_canister::mutations::{
+    do_add_api_boundary_node::AddApiBoundaryNodePayload,
+    node_management::do_update_node_domain_directly::UpdateNodeDomainDirectlyPayload,
+};
+
+use reqwest::{redirect::Policy, ClientBuilder};
+use std::{
+    iter,
+    net::{SocketAddr, SocketAddrV6},
+    time::Duration,
+};
 
 use anyhow::{anyhow, bail, Error};
 use futures::stream::FuturesUnordered;
 use ic_agent::{
-    agent::http_transport::reqwest_transport::ReqwestHttpReplicaV2Transport, export::Principal,
-    Agent,
+    agent::{http_transport::reqwest_transport::ReqwestHttpReplicaV2Transport, Agent},
+    export::Principal,
+    identity::Secp256k1Identity,
 };
 
 use serde::Deserialize;
@@ -613,7 +636,7 @@ pub fn http_canister_test(env: TestEnv) {
                 .await?;
 
             if res != "'/foo' not found" {
-                bail!(res)
+                bail!("expected not found");
             }
 
             Ok(())
@@ -635,7 +658,7 @@ pub fn http_canister_test(env: TestEnv) {
                 .await?;
 
             if res != "'/foo' set to 'bar'" {
-                bail!(res)
+                bail!("exptected set to bar");
             }
 
             Ok(())
@@ -652,7 +675,7 @@ pub fn http_canister_test(env: TestEnv) {
                 .await?;
 
             if res != "bar" {
-                bail!(res)
+                bail!("expected bar");
             }
 
             Ok(())
@@ -670,7 +693,7 @@ pub fn http_canister_test(env: TestEnv) {
                 .await?;
 
             if res != "bar" {
-                bail!(res)
+                bail!("expected bar");
             }
 
             Ok(())
@@ -683,12 +706,10 @@ pub fn http_canister_test(env: TestEnv) {
             let res = client
                 .get(format!("https://{invalid_host}/?canisterId={canister_id}"))
                 .send()
-                .await?
-                .text()
                 .await?;
 
-            if res != "Could not find a canister id to forward to." {
-                bail!(res)
+            if res.status() != http::StatusCode::BAD_REQUEST {
+                bail!("expected 400");
             }
 
             Ok(())
@@ -780,7 +801,7 @@ pub fn prefix_canister_id_test(env: TestEnv) {
                 .await?;
 
             if res != "'/foo' not found" {
-                bail!(res)
+                bail!("expected foo not found");
             }
 
             Ok(())
@@ -802,7 +823,7 @@ pub fn prefix_canister_id_test(env: TestEnv) {
                 .await?;
 
             if res != "'/foo' set to 'bar'" {
-                bail!(res)
+                bail!("expected set to bar");
             }
 
             Ok(())
@@ -819,7 +840,7 @@ pub fn prefix_canister_id_test(env: TestEnv) {
                 .await?;
 
             if res != "bar" {
-                bail!(res)
+                bail!("expected bar");
             }
 
             Ok(())
@@ -837,7 +858,7 @@ pub fn prefix_canister_id_test(env: TestEnv) {
                 .await?;
 
             if res != "bar" {
-                bail!(res)
+                bail!("expected bar");
             }
 
             Ok(())
@@ -930,7 +951,7 @@ pub fn proxy_http_canister_test(env: TestEnv) {
                 .await?;
 
             if res != "'/foo' not found" {
-                bail!(res)
+                bail!("expected foo not found");
             }
 
             Ok(())
@@ -952,7 +973,7 @@ pub fn proxy_http_canister_test(env: TestEnv) {
                 .await?;
 
             if res != "'/foo' set to 'bar'" {
-                bail!(res)
+                bail!("expected set to bar");
             }
 
             Ok(())
@@ -969,7 +990,7 @@ pub fn proxy_http_canister_test(env: TestEnv) {
                 .await?;
 
             if res != "bar" {
-                bail!(res)
+                bail!("expected bar");
             }
 
             Ok(())
@@ -987,8 +1008,8 @@ pub fn proxy_http_canister_test(env: TestEnv) {
                 .await?;
 
             if res != "bar" {
-                bail!(res)
-            }
+                bail!("expected bar");
+            };
 
             Ok(())
         })
@@ -1000,12 +1021,10 @@ pub fn proxy_http_canister_test(env: TestEnv) {
             let res = client
                 .get(format!("https://{invalid_host}/?canisterId={canister_id}"))
                 .send()
-                .await?
-                .text()
                 .await?;
 
-            if res != "Could not find a canister id to forward to." {
-                bail!(res)
+            if res.status() != http::StatusCode::BAD_REQUEST {
+                bail!("expected 400");
             }
 
             Ok(())
@@ -1106,17 +1125,18 @@ pub fn denylist_test(env: TestEnv) {
 
         info!(&logger, "created canister={canister_id}");
 
-        // Update the denylist and reload nginx
-        let denylist_command = format!(r#"printf "\"~^{} .*$\" \"1\";\n" | sudo tee /var/opt/nginx/denylist/denylist.map && sudo service nginx reload"#, canister_id);
-        let cmd_output = boundary_node.block_on_bash_script(&denylist_command).unwrap();
+        // Update the denylist and restart icx-proxy
+        let denylist_command = format!(r#"echo "{{\"canisters\":{{\"{}\": {{}}}}}}" | sudo tee /run/ic-node/etc/icx-proxy/denylist.json && sudo service icx-proxy restart"#, canister_id);
         info!(
             logger,
-            "update denylist {BOUNDARY_NODE_NAME} with {denylist_command} to \n'{}'\n",
-            cmd_output,
+            "update denylist {BOUNDARY_NODE_NAME} with {denylist_command}"
         );
+        if let Err(e) = boundary_node.block_on_bash_script(&denylist_command) {
+            panic!("bash script failed: {:?}", e);
+        }
 
-        // Wait a bit for the reload to complete
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Wait a bit for the restart to complete
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
         let client_builder = reqwest::ClientBuilder::new();
         let (client_builder, host) = if let Some(playnet) = boundary_node.get_playnet() {
@@ -1140,9 +1160,8 @@ pub fn denylist_test(env: TestEnv) {
                 .status();
 
             if res != reqwest::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS {
-                bail!(res)
+                bail!("expected 451, got {res}");
             }
-
 
             Ok(())
         }).await.unwrap();
@@ -1214,89 +1233,78 @@ pub fn canister_allowlist_test(env: TestEnv) {
         let client = client_builder.build().unwrap();
 
         // Check canister is available
-        let res = client
-            .get(format!("https://{canister_id}.raw.{host}/"))
-            .send()
-            .await
-            .expect("Could not perform get request.")
-            .status();
+        retry_async(&logger, READY_WAIT_TIMEOUT, RETRY_BACKOFF, || async {
+            let res = client
+                .get(format!("https://{canister_id}.raw.{host}/"))
+                .send()
+                .await
+                .expect("Could not perform get request.")
+                .status();
 
-        assert_eq!(res, reqwest::StatusCode::OK, "expected OK, got {}", res);
+            if res != reqwest::StatusCode::OK {
+                bail!("expected OK, got {}", res);
+            }
 
-        // Update denylist with canister ID
-        let cmd_output = boundary_node.block_on_bash_script(
-            &format!(
-                r#"printf "\"~^{} .*$\" 1;\n" | sudo tee /var/opt/nginx/denylist/denylist.map"#,
-                canister_id
-            ),
-        )
-        .unwrap();
+            Ok(())
+        }).await.unwrap();
 
+        // Update the denylist and restart icx-proxy
+        let denylist_command = format!(r#"echo "{{\"canisters\":{{\"{}\": {{}}}}}}" | sudo tee /run/ic-node/etc/icx-proxy/denylist.json && sudo service icx-proxy restart"#, canister_id);
         info!(
             logger,
-            "update denylist {BOUNDARY_NODE_NAME}: '{}'",
-            cmd_output.trim(),
+            "update denylist {BOUNDARY_NODE_NAME} with {denylist_command}"
         );
+        if let Err(e) = boundary_node.block_on_bash_script(&denylist_command) {
+            panic!("bash script failed: {:?}", e);
+        }
 
-        // Reload Nginx
-        let cmd_output = boundary_node.block_on_bash_script(
-            "sudo service nginx restart",
-        )
-        .unwrap();
-
-        info!(
-            logger,
-            "reload nginx on {BOUNDARY_NODE_NAME}: '{}'",
-            cmd_output.trim(),
-        );
-
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Wait a bit for the restart to complete
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
         // Check canister is restricted
-        let res = client
-            .get(format!("https://{canister_id}.raw.{host}/"))
-            .send()
-            .await
-            .expect("Could not perform get request.")
-            .status();
+        retry_async(&logger, READY_WAIT_TIMEOUT, RETRY_BACKOFF, || async {
+            let res = client
+                .get(format!("https://{canister_id}.raw.{host}/"))
+                .send()
+                .await
+                .expect("Could not perform get request.")
+                .status();
 
-        assert_eq!(res, reqwest::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, "expected 451, got {}", res);
+            if res != reqwest::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS {
+                bail!("expected 451, got {}", res);
+            }
 
-        // Update allowlist with canister ID
-        let cmd_output = boundary_node.block_on_bash_script(
-            &format!(r#"printf "{} 1;\n" | sudo tee /run/ic-node/allowlist_canisters.map && sudo mount -o ro,bind /run/ic-node/allowlist_canisters.map /etc/nginx/allowlist_canisters.map"#, canister_id),
-        )
-        .unwrap();
+            Ok(())
+        }).await.unwrap();
 
+        // Update the allowlist and restart icx-proxy
+        let allowlist_command = format!(r#"echo "{}" | sudo tee /run/ic-node/etc/icx-proxy/allowlist.txt && sudo service icx-proxy restart"#, canister_id);
         info!(
             logger,
-            "update allowlist {BOUNDARY_NODE_NAME}: '{}'",
-            cmd_output.trim(),
+            "update allowlist {BOUNDARY_NODE_NAME} with {allowlist_command}"
         );
+        if let Err(e) = boundary_node.block_on_bash_script(&allowlist_command) {
+            panic!("bash script failed: {:?}", e);
+        }
 
-        // Reload Nginx
-        let cmd_output = boundary_node.block_on_bash_script(
-            "sudo service nginx restart",
-        )
-        .unwrap();
-
-        info!(
-            logger,
-            "reload nginx on {BOUNDARY_NODE_NAME}: '{}'",
-            cmd_output.trim(),
-        );
-
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Wait a bit for the restart to complete
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
         // Check canister is available
-        let res = client
-            .get(format!("https://{canister_id}.raw.{host}/"))
-            .send()
-            .await
-            .expect("Could not perform get request.")
-            .status();
+        retry_async(&logger, READY_WAIT_TIMEOUT, RETRY_BACKOFF, || async {
+            let res = client
+                .get(format!("https://{canister_id}.raw.{host}/"))
+                .send()
+                .await
+                .expect("Could not perform get request.")
+                .status();
 
-        assert_eq!(res, reqwest::StatusCode::OK, "expected OK, got {}", res);
+            if res != reqwest::StatusCode::OK {
+                bail!("expected OK, got {}", res);
+            }
+
+            Ok(())
+        }).await.unwrap();
     });
 }
 
@@ -1650,7 +1658,10 @@ pub fn redirect_to_non_raw_test(env: TestEnv) {
     .expect("test suite failed");
 }
 
-pub fn sw_test(env: TestEnv) {
+// this tests the HTTP endpoint of the boundary node (anything that goes to icx-proxy)
+// in particular, it ensure that the service worker uninstall script is served for
+// anyone still having a service worker lingering around.
+pub fn http_endpoint_test(env: TestEnv) {
     let logger_orig = env.logger();
 
     let boundary_node = env
@@ -1679,12 +1690,13 @@ pub fn sw_test(env: TestEnv) {
 
     let futs = FuturesUnordered::new();
 
+    // fetching standard assets (html page, JS script) through icx-proxy
     let host = host_orig.clone();
     let logger = logger_orig.clone();
     let asset_canister = asset_canister_orig.clone();
     futs.push(rt.spawn({
         let client = client.clone();
-        let name = "get index.html with sw.js include from root path";
+        let name = "get index.html with response verification";
         info!(&logger, "Starting subtest {}", name);
 
         async move {
@@ -1754,6 +1766,7 @@ pub fn sw_test(env: TestEnv) {
         }
     }));
 
+    // fetching assets from non-root path
     let host = host_orig.clone();
     let logger = logger_orig.clone();
     let asset_canister = asset_canister_orig.clone();
@@ -1801,6 +1814,9 @@ pub fn sw_test(env: TestEnv) {
         }
     }));
 
+    // making sure the BN serves the uninstall script for service worker requests
+    // on the root path (/sw.js). This is necessary as clients that haven't visited
+    // a dapp for a long time, still have a service worker installed.
     let host = host_orig.clone();
     let logger = logger_orig.clone();
     let asset_canister = asset_canister_orig.clone();
@@ -1812,7 +1828,7 @@ pub fn sw_test(env: TestEnv) {
         async move {
             let res = client
                 .get(format!(
-                    "https://{}.{host}/anything.js",
+                    "https://{}.{host}/sw.js",
                     asset_canister.canister_id
                 ))
                 .header("Service-Worker", "script")
@@ -1847,6 +1863,74 @@ pub fn sw_test(env: TestEnv) {
         }
     }));
 
+    // Make sure, we don't serve our uninstall script for any other request than
+    // the one for /sw.js.
+    let host = host_orig.clone();
+    let logger = logger_orig.clone();
+    let asset_canister = asset_canister_orig.clone();
+    futs.push(rt.spawn({
+        let client = client.clone();
+        let name = "do not get uninstall script on nested JS";
+        info!(&logger, "Starting subtest {}", name);
+
+        async move {
+            let hello_world_js = vec![
+                99, 111, 110, 115, 111, 108, 101, 46, 108, 111, 103, 40, 34, 72, 101, 108, 108,
+                111, 32, 87, 111, 114, 108, 100, 33, 34, 41,
+            ];
+            info!(&logger, "Uploading hello world JS response...");
+            asset_canister
+                .upload_asset(&UploadAssetRequest {
+                    key: "/anything.js".to_string(),
+                    content: hello_world_js.clone(),
+                    content_type: "application/javascript".to_string(),
+                    content_encoding: "identity".to_string(),
+                    sha_override: None,
+                })
+                .await?;
+
+            let res = client
+                .get(format!(
+                    "https://{}.{host}/anything.js",
+                    asset_canister.canister_id
+                ))
+                .header("Service-Worker", "script")
+                .send()
+                .await?;
+
+            if res.status() != reqwest::StatusCode::OK {
+                let status = res.status();
+                let body = res.bytes().await?.to_vec();
+                let body = String::from_utf8_lossy(&body);
+                bail!("{name} failed: {} with body: {}", status, body)
+            }
+
+            if !res
+                .headers()
+                .get("Content-Type")
+                .unwrap()
+                .as_bytes()
+                .eq(b"application/javascript")
+            {
+                let status = res.status();
+                let body = res.bytes().await?.to_vec();
+                let body = String::from_utf8_lossy(&body);
+                bail!("{name} failed: {} with body: {}", status, body)
+            }
+
+            let body = res.bytes().await?.to_vec();
+            let body = String::from_utf8_lossy(&body);
+
+            if !body.contains(r#"console.log("Hello World!")"#) {
+                bail!("{name} failed: expected canister javascript file but got {body}")
+            }
+
+            Ok(())
+        }
+    }));
+
+    // Make sure, we don't serve our uninstall script on any other path than
+    // the root path.
     let host = host_orig.clone();
     let logger = logger_orig.clone();
     let asset_canister = asset_canister_orig.clone();
@@ -2822,6 +2906,207 @@ pub fn canister_routing_test(env: TestEnv) {
     let counters = block_on(read_counters_on_counter_canisters(
         &log,
         bn_agent,
+        canister_ids,
+        CANISTER_RETRY_BACKOFF,
+        CANISTER_RETRY_TIMEOUT,
+    ));
+    assert_eq!(counters, canister_values);
+}
+
+/* tag::catalog[]
+Title:: API Boundary Nodes Decentralization
+
+Goal:: Verify that API Boundary Nodes added to the registry via proposals are functional
+
+Runbook:
+. IC with two unassigned nodes
+. Both unassigned nodes are converted to the API Boundary Nodes via proposals
+. Assert that API BN records are present in the registry
+. TODO: assert that calls to the IC via the domains of the newly added API BN are successful
+
+end::catalog[] */
+
+pub fn decentralization_test(env: TestEnv) {
+    let log = env.logger();
+    let nns_node = env.get_first_healthy_nns_node_snapshot();
+    let nns_url = nns_node.get_public_url();
+    let unassigned_nodes: Vec<_> = env.topology_snapshot().unassigned_nodes().collect();
+    info!(log, "Asserting no API BN domains exist in the registry");
+    let fetcher = RegistryFetcher::new(nns_url);
+    let api_domains: Vec<String> =
+        block_on(fetcher.api_node_domains_from_registry()).expect("failed to get API BN domains");
+    assert_eq!(api_domains, Vec::<&str>::new());
+    info!(
+        log,
+        "Adding two API BNs from the unassigned nodes to the registry via proposals"
+    );
+    let nns_runtime = runtime_from_url(nns_node.get_public_url(), nns_node.effective_canister_id());
+    let governance = nns::get_governance_canister(&nns_runtime);
+    let version = block_on(crate::nns::get_software_version_from_snapshot(&nns_node))
+        .expect("could not obtain replica software version");
+    // Identity is needed to execute `update_node_domain_directly` as the caller is checked.
+    let agent_with_identity = {
+        let mut agent = nns_node.build_default_agent();
+        let identity = Secp256k1Identity::from_private_key(
+            SecretKey::from_sec1_pem(TEST_PRIVATE_KEY).unwrap(),
+        );
+        agent.set_identity(identity);
+        agent
+    };
+
+    for (idx, node) in unassigned_nodes.iter().enumerate() {
+        let domain = format!("api{}.com", idx + 1);
+
+        // Create an empty ACME json to signal ic-boundary that we don't need to create a new ACME account
+        // Create self-signed certificate & update permissions
+        node.block_on_bash_script(&format!(
+            "sudo touch /var/lib/ic/data/ic-boundary-acme.json && \
+            sudo openssl req -x509 -newkey rsa:2048 \
+            -keyout /var/lib/ic/data/ic-boundary-tls.key \
+            -out /var/lib/ic/data/ic-boundary-tls.crt -sha256 -days 3650 -nodes \
+            -subj \"/C=CH/ST=Zurich/L=Zurich/O=DFINITY/OU=BoundaryNodes/CN={}\" && \
+            sudo chmod +r /var/lib/ic/data/ic-boundary-tls.key",
+            domain
+        ))
+        .expect("unable to setup TLS files");
+
+        let update_domain_payload = UpdateNodeDomainDirectlyPayload {
+            node_id: node.node_id,
+            domain: Some(domain.clone()),
+        };
+        info!(
+            log,
+            "Setting domain name of the unassigned node with id={} to {} ...", node.node_id, domain
+        );
+        let call_result: Vec<u8> = block_on(
+            agent_with_identity
+                .update(&REGISTRY_CANISTER_ID.into(), "update_node_domain_directly")
+                .with_arg(Encode!(&update_domain_payload).unwrap())
+                .call_and_wait(),
+        )
+        .expect("Could not change domain name of the node");
+        assert_eq!(Decode!(&call_result, Result<(), String>).unwrap(), Ok(()));
+        info!(
+            log,
+            "Successfully updated domain name of the unassigned node with id={}", node.node_id
+        );
+        let proposal_payload = AddApiBoundaryNodePayload {
+            node_id: node.node_id,
+            version: version.clone().into(),
+        };
+        let proposal_id = block_on(submit_external_update_proposal(
+            &governance,
+            Sender::from_keypair(&TEST_NEURON_1_OWNER_KEYPAIR),
+            NeuronId(TEST_NEURON_1_ID),
+            NnsFunction::AddApiBoundaryNode,
+            proposal_payload,
+            String::from("Add an API boundary node"),
+            "Motivation: API boundary node testing".to_string(),
+        ));
+        block_on(vote_execute_proposal_assert_executed(
+            &governance,
+            proposal_id,
+        ));
+        info!(
+            log,
+            "Proposal with id={} for unassigned node with id={} has been executed successfully",
+            proposal_id,
+            node.node_id
+        );
+    }
+
+    info!(
+        log,
+        "Asserting API BN domains are now present in the registry"
+    );
+    let api_domains: Vec<String> =
+        block_on(fetcher.api_node_domains_from_registry()).expect("failed to get API BN domains");
+    assert_eq!(api_domains, vec!["api1.com", "api2.com"]);
+
+    // open the firewall ports - this is temporary until we complete the firewall for API BNs in the orchestrator
+    for node in unassigned_nodes.iter() {
+        node.block_on_bash_script(&indoc::formatdoc! {r#"
+            sudo nft add rule ip6 filter INPUT tcp dport 443 accept
+        "#})
+            .expect("unable to open firewall port");
+    }
+
+    // create an HTTP client for the two API BNs
+    let http_client = {
+        let mut client_builder = ClientBuilder::new()
+            .redirect(Policy::none())
+            .danger_accept_invalid_certs(true);
+
+        for (idx, node) in unassigned_nodes.iter().enumerate() {
+            // set port to 0 as it is being ignored by the client
+            let node_addr = SocketAddr::new(node.get_ip_addr(), 0);
+            client_builder = client_builder.resolve(&api_domains[idx], node_addr);
+            info!(
+                log,
+                "API BN {:?}: url {:?}, node addr {:?}", idx, api_domains[idx], node_addr
+            );
+        }
+
+        client_builder.build().expect("failed to build http client")
+    };
+
+    info!(log, "Checking API BNs health ...");
+    for (idx, node) in unassigned_nodes.iter().enumerate() {
+        block_on(retry_async(
+            &log,
+            READY_WAIT_TIMEOUT,
+            RETRY_BACKOFF,
+            || async {
+                let response = http_client
+                    .get(format!("https://{}/health", api_domains[idx]))
+                    .send()
+                    .await?;
+                if response.status().is_success() {
+                    info!(log, "API BN {:?} ({:?}) came up healthy", idx, node.node_id);
+                    return Ok(());
+                }
+                bail!("API BN {:?} ({:?}) is not yet healthy", idx, node.node_id);
+            },
+        ))
+        .expect("API BNs didn't report healthy");
+    }
+
+    info!(log, "Installing counter canisters");
+    let canister_values: Vec<u32> = vec![1, 3];
+    let canister_ids: Vec<Principal> = block_on(install_canisters(
+        env.topology_snapshot(),
+        wat::parse_str(COUNTER_CANISTER_WAT).unwrap().as_slice(),
+        1,
+    ));
+
+    info!(
+        log,
+        "Successfully installed {} counter canisters",
+        canister_ids.len()
+    );
+    let api_bn_agent = {
+        let api_bn_url = format!(
+            "https://[{:?}]",
+            unassigned_nodes.first().unwrap().get_ip_addr()
+        );
+        info!(log, "Creating an agent for the API BN {api_bn_url:?}");
+        block_on(assert_create_agent(&api_bn_url))
+    };
+
+    info!(log, "Incrementing counters on canisters");
+    block_on(set_counters_on_counter_canisters(
+        &log,
+        api_bn_agent.clone(),
+        canister_ids.clone(),
+        canister_values.clone(),
+        CANISTER_RETRY_BACKOFF,
+        CANISTER_RETRY_TIMEOUT,
+    ));
+
+    info!(log, "Asserting expected counter values on canisters");
+    let counters = block_on(read_counters_on_counter_canisters(
+        &log,
+        api_bn_agent,
         canister_ids,
         CANISTER_RETRY_BACKOFF,
         CANISTER_RETRY_TIMEOUT,

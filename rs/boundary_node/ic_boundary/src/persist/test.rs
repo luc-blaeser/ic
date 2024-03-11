@@ -58,8 +58,8 @@ fn test_principal_to_u256() -> Result<(), Error> {
     Ok(())
 }
 
-pub fn node(i: u64, subnet_id: Principal) -> Node {
-    Node {
+pub fn node(i: u64, subnet_id: Principal) -> Arc<Node> {
+    Arc::new(Node {
         id: node_test_id(1001 + i).get().0,
         subnet_id,
         subnet_type: SubnetType::Application,
@@ -69,7 +69,7 @@ pub fn node(i: u64, subnet_id: Principal) -> Node {
             .0
             .certificate_der,
         replica_version: "7742d96ddd30aa6b607c9d2d4093a7b714f5b25b".to_string(),
-    }
+    })
 }
 
 pub fn generate_test_subnets(offset: u64) -> Vec<Subnet> {
@@ -193,8 +193,8 @@ fn generate_test_routes(offset: u64) -> Routes {
     }
 }
 
-#[tokio::test]
-async fn test_persist() -> Result<(), Error> {
+#[test]
+fn test_persist() -> Result<(), Error> {
     let routes = generate_test_routes(0);
     let subnets = generate_test_subnets(0);
 
@@ -202,21 +202,21 @@ async fn test_persist() -> Result<(), Error> {
     let persister = Persister::new(Arc::clone(&rt_init));
 
     // Persist the routing table
-    let result = persister.persist(subnets.clone()).await;
+    let result = persister.persist(subnets.clone());
     // Check the result
     assert!(matches!(result, PersistStatus::Completed(_)));
     // Compare the persisted table state with expected
     assert_eq!(&routes, rt_init.load_full().unwrap().as_ref());
 
     // Check empty table
-    let result = persister.persist(vec![]).await;
+    let result = persister.persist(vec![]);
     assert!(matches!(result, PersistStatus::SkippedEmpty));
     // Check if the table hasn't changed
     assert_eq!(&routes, rt_init.load_full().unwrap().as_ref());
 
     // Generate different table
     let subnets = generate_test_subnets(1);
-    let result = persister.persist(subnets).await;
+    let result = persister.persist(subnets);
     // Check if it was updated
     assert!(matches!(result, PersistStatus::Completed(_)));
     // Check if the routing table matches expected one

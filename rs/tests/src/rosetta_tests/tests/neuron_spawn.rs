@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 const PORT: u32 = 8106;
-const VM_NAME: &str = "rosetta-test-neuron-spawn";
+const VM_NAME: &str = "rosetta-neuron-spawn";
 
 pub fn test(env: TestEnv) {
     let _logger = env.logger();
@@ -128,7 +128,7 @@ async fn test_spawn(
     assert_eq!(1, res.operations.len());
     let metadata: &ObjectMap = res
         .operations
-        .get(0)
+        .first()
         .unwrap()
         .metadata
         .as_ref()

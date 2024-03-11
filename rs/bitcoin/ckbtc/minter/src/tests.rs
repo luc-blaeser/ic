@@ -182,6 +182,82 @@ fn greedy_smoke_test() {
 }
 
 #[test]
+fn should_have_same_input_and_output_count() {
+    let mut available_utxos = BTreeSet::new();
+    for i in 0..crate::UTXOS_COUNT_THRESHOLD {
+        available_utxos.insert(Utxo {
+            outpoint: OutPoint {
+                txid: [9; 32].into(),
+                vout: i as u32,
+            },
+            value: 0,
+            height: 10,
+        });
+    }
+    available_utxos.insert(Utxo {
+        outpoint: OutPoint {
+            txid: [0; 32].into(),
+            vout: 0,
+        },
+        value: 100_000,
+        height: 10,
+    });
+
+    available_utxos.insert(Utxo {
+        outpoint: OutPoint {
+            txid: [1; 32].into(),
+            vout: 1,
+        },
+        value: 100_000,
+        height: 10,
+    });
+
+    available_utxos.insert(Utxo {
+        outpoint: OutPoint {
+            txid: [2; 32].into(),
+            vout: 1,
+        },
+        value: 100,
+        height: 10,
+    });
+
+    available_utxos.insert(Utxo {
+        outpoint: OutPoint {
+            txid: [3; 32].into(),
+            vout: 1,
+        },
+        value: 100,
+        height: 11,
+    });
+
+    let minter_addr = BitcoinAddress::P2wpkhV0([0; 20]);
+    let out1_addr = BitcoinAddress::P2wpkhV0([1; 20]);
+    let out2_addr = BitcoinAddress::P2wpkhV0([2; 20]);
+    let fee_per_vbyte = 10000;
+
+    let (tx, change_output, _) = build_unsigned_transaction(
+        &mut available_utxos,
+        vec![(out1_addr.clone(), 100_000), (out2_addr.clone(), 99_999)],
+        minter_addr.clone(),
+        fee_per_vbyte,
+    )
+    .expect("failed to build a transaction");
+
+    let minter_fee = crate::MINTER_FEE_PER_INPUT * tx.inputs.len() as u64
+        + crate::MINTER_FEE_PER_OUTPUT * tx.outputs.len() as u64
+        + crate::MINTER_FEE_CONSTANT;
+
+    assert_eq!(tx.outputs.len(), tx.inputs.len());
+    assert_eq!(
+        change_output,
+        ChangeOutput {
+            vout: 2,
+            value: 1 + minter_fee
+        }
+    );
+}
+
+#[test]
 fn test_min_change_amount() {
     let mut available_utxos = BTreeSet::new();
     available_utxos.insert(Utxo {
@@ -1043,4 +1119,59 @@ proptest! {
             lower_bound
         );
     }
+}
+
+#[test]
+fn can_form_a_batch_conditions() {
+    let mut state = CkBtcMinterState::from(InitArgs {
+        btc_network: Network::Regtest.into(),
+        ecdsa_key_name: "".to_string(),
+        retrieve_btc_min_amount: 0,
+        ledger_id: CanisterId::from_u64(42),
+        max_time_in_queue_nanos: 1000,
+        min_confirmations: None,
+        mode: Mode::GeneralAvailability,
+        kyt_fee: None,
+        kyt_principal: None,
+    });
+    // no request, can't form a batch, fail.
+    assert!(!state.can_form_a_batch(1, 0));
+
+    let req = RetrieveBtcRequest {
+        amount: 1,
+        address: BitcoinAddress::P2wpkhV0([0; 20]),
+        block_index: 0,
+        received_at: 10000,
+        kyt_provider: None,
+        reimbursement_account: None,
+    };
+    state.pending_retrieve_btc_requests.push(req);
+    // One request, >= min_pending, pass.
+    assert!(state.can_form_a_batch(1, 10));
+
+    // One request, <= max_time_in_queue, fail.
+    assert!(!state.can_form_a_batch(10, 10500));
+
+    // One request, > max_time_in_queue, pass.
+    assert!(state.can_form_a_batch(10, state.max_time_in_queue_nanos + 10500));
+
+    state.last_transaction_submission_time_ns = Some(5000);
+    // One request, too long since last_transaction_submission_time, pass.
+    assert!(state.can_form_a_batch(10, 10500));
+
+    state.last_transaction_submission_time_ns = Some(9500);
+    // One request, not long since last_transaction_submission_time, fail.
+    assert!(!state.can_form_a_batch(10, 10500));
+
+    let req = RetrieveBtcRequest {
+        amount: 1,
+        address: BitcoinAddress::P2wpkhV0([0; 20]),
+        block_index: 0,
+        received_at: 10501,
+        kyt_provider: None,
+        reimbursement_account: None,
+    };
+    state.pending_retrieve_btc_requests.push(req);
+    // Two request, long enough since last_transaction_submission_time, pass.
+    assert!(state.can_form_a_batch(10, 10600));
 }

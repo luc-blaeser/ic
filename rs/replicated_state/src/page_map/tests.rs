@@ -1,17 +1,41 @@
 use super::{
-    checkpoint::{Checkpoint, MappingSerialization},
-    page_allocator::PageAllocatorSerialization,
-    Buffer, FileDescriptor, MemoryInstructions, MemoryMapOrData, PageAllocatorRegistry, PageIndex,
-    PageMap, PageMapSerialization, PersistDestination, StorageMetrics,
-    TestPageAllocatorFileDescriptorImpl, WRITE_BUCKET_PAGES,
+    checkpoint::Checkpoint, page_allocator::PageAllocatorSerialization,
+    storage::test_utils::TestStorageLayout, storage::BaseFileSerialization, Buffer, FileDescriptor,
+    MemoryInstructions, MemoryMapOrData, PageAllocatorRegistry, PageIndex, PageMap,
+    PageMapSerialization, PersistenceError, StorageMetrics, TestPageAllocatorFileDescriptorImpl,
+    WRITE_BUCKET_PAGES,
 };
+use ic_config::flag_status::FlagStatus;
+use ic_config::state_manager::LsmtConfig;
 use ic_metrics::MetricsRegistry;
 use ic_sys::PAGE_SIZE;
 use ic_types::{Height, MAX_STABLE_MEMORY_IN_BYTES};
 use nix::unistd::dup;
-use static_assertions::const_assert_ne;
 use std::sync::Arc;
-use std::{fs::OpenOptions, path::Path};
+use std::{
+    fs::OpenOptions,
+    path::{Path, PathBuf},
+};
+
+fn persist_delta_to_base(
+    pagemap: &PageMap,
+    base_path: PathBuf,
+    metrics: &StorageMetrics,
+) -> Result<(), PersistenceError> {
+    pagemap.persist_delta(
+        &TestStorageLayout {
+            base: base_path.to_path_buf(),
+            overlay_dst: "".into(),
+            existing_overlays: Vec::new(),
+        },
+        Height::new(0),
+        &LsmtConfig {
+            lsmt_status: FlagStatus::Disabled,
+            shard_num_pages: u64::MAX,
+        },
+        metrics,
+    )
+}
 
 fn assert_equal_page_maps(page_map1: &PageMap, page_map2: &PageMap) {
     assert_eq!(page_map1.num_host_pages(), page_map2.num_host_pages());
@@ -28,18 +52,26 @@ fn assert_equal_page_maps(page_map1: &PageMap, page_map2: &PageMap) {
 fn duplicate_file_descriptors(
     mut serialized_page_map: PageMapSerialization,
 ) -> PageMapSerialization {
-    // TODO(IC-1306): Duplicate overlay fds
-    serialized_page_map.storage.base.mapping =
-        serialized_page_map
-            .storage
-            .base
-            .mapping
-            .map(|mapping| MappingSerialization {
-                file_descriptor: FileDescriptor {
+    match serialized_page_map.storage.base {
+        BaseFileSerialization::Base(ref mut base) => {
+            for mapping in base.mapping.iter_mut() {
+                mapping.file_descriptor = FileDescriptor {
                     fd: dup(mapping.file_descriptor.fd).unwrap(),
-                },
-                ..mapping
-            });
+                };
+            }
+        }
+        BaseFileSerialization::Overlay(ref mut overlay) => {
+            overlay.mapping.file_descriptor = FileDescriptor {
+                fd: dup(overlay.mapping.file_descriptor.fd).unwrap(),
+            }
+        }
+    }
+    for overlay in serialized_page_map.storage.overlays.iter_mut() {
+        overlay.mapping.file_descriptor = FileDescriptor {
+            fd: dup(overlay.mapping.file_descriptor.fd).unwrap(),
+        };
+    }
+
     serialized_page_map.page_allocator = PageAllocatorSerialization {
         id: serialized_page_map.page_allocator.id,
         fd: FileDescriptor {
@@ -118,12 +150,7 @@ fn persisted_map_is_equivalent_to_the_original() {
                 .map(|(idx, p)| (*idx, p))
                 .collect::<Vec<_>>(),
         );
-        pagemap
-            .persist_delta(
-                PersistDestination::BaseFile(heap_file.to_path_buf()),
-                metrics,
-            )
-            .unwrap();
+        persist_delta_to_base(pagemap, heap_file.to_path_buf(), metrics).unwrap();
         let persisted_map = PageMap::open(
             heap_file,
             &[],
@@ -202,12 +229,7 @@ fn can_persist_and_load_an_empty_page_map() {
 
     let original_map = PageMap::new_for_testing();
     let metrics = StorageMetrics::new(&MetricsRegistry::new());
-    original_map
-        .persist_delta(
-            PersistDestination::BaseFile(heap_file.to_path_buf()),
-            &metrics,
-        )
-        .unwrap();
+    persist_delta_to_base(&original_map, heap_file.to_path_buf(), &metrics).unwrap();
     let persisted_map = PageMap::open(
         &heap_file,
         &[],
@@ -218,6 +240,26 @@ fn can_persist_and_load_an_empty_page_map() {
 
     // base_height will be different, but is not part of eq
     assert_eq!(original_map, persisted_map);
+}
+
+#[test]
+fn can_load_a_page_map_without_files() {
+    let tmp = tempfile::Builder::new()
+        .prefix("checkpoints")
+        .tempdir()
+        .unwrap();
+    let heap_file = tmp.path().join("missing_file");
+
+    let loaded_map = PageMap::open(
+        &heap_file,
+        &[],
+        Height::new(0),
+        Arc::new(TestPageAllocatorFileDescriptorImpl::new()),
+    )
+    .expect("opening an empty page map must succeed");
+
+    // base_height will be different, but is not part of eq
+    assert_eq!(PageMap::new_for_testing(), loaded_map);
 }
 
 #[test]
@@ -440,12 +482,7 @@ fn get_memory_instructions_returns_deltas() {
         page_map.get_memory_instructions(range.clone(), range.clone(), 0)
     );
     let metrics = StorageMetrics::new(&MetricsRegistry::new());
-    page_map
-        .persist_delta(
-            PersistDestination::BaseFile(heap_file.to_path_buf()),
-            &metrics,
-        )
-        .unwrap();
+    persist_delta_to_base(&page_map, heap_file.to_path_buf(), &metrics).unwrap();
 
     let mut page_map = PageMap::open(
         &heap_file,
@@ -496,17 +533,12 @@ fn get_memory_instructions_returns_deltas() {
     );
 
     // Add a page that is not an end of the bucket.
-    const_assert_ne!((24 + 1) % WRITE_BUCKET_PAGES, 0);
+    assert_ne!((24 + 1) % WRITE_BUCKET_PAGES, 0);
     let pages = &[(PageIndex::new(24), &[1u8; PAGE_SIZE])];
     page_map.update(pages);
 
     // No trailing zero pages are serialized.
-    page_map
-        .persist_delta(
-            PersistDestination::BaseFile(heap_file.to_path_buf()),
-            &metrics,
-        )
-        .unwrap();
+    persist_delta_to_base(&page_map, heap_file.to_path_buf(), &metrics).unwrap();
     assert_eq!(25 * PAGE_SIZE as u64, heap_file.metadata().unwrap().len());
 }
 

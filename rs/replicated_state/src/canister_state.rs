@@ -8,7 +8,7 @@ use crate::canister_state::queues::CanisterOutputQueuesIterator;
 use crate::canister_state::system_state::{CanisterStatus, ExecutionTask, SystemState};
 use crate::{InputQueueType, StateError};
 pub use execution_state::{EmbedderCache, ExecutionState, ExportedFunctions, Global};
-use ic_ic00_types::CanisterStatusType;
+use ic_management_canister_types::{CanisterLog, CanisterStatusType, LogVisibility};
 use ic_registry_subnet_type::SubnetType;
 use ic_types::batch::TotalQueryStats;
 use ic_types::methods::SystemMethod;
@@ -152,6 +152,10 @@ impl CanisterState {
 
     pub fn controllers(&self) -> &BTreeSet<PrincipalId> {
         &self.system_state.controllers
+    }
+
+    pub fn log_visibility(&self) -> LogVisibility {
+        self.system_state.log_visibility
     }
 
     /// Returns the difference in time since the canister was last charged for resource allocations.
@@ -336,18 +340,6 @@ impl CanisterState {
         )
     }
 
-    pub fn from_parts(
-        execution_state: Option<ExecutionState>,
-        system_state: SystemState,
-        scheduler_state: SchedulerState,
-    ) -> Self {
-        Self {
-            system_state,
-            execution_state,
-            scheduler_state,
-        }
-    }
-
     /// Checks the constraints that a canister should always respect.
     /// These invariants will be verified at the end of each execution round.
     pub fn check_invariants(&self, default_limit: NumBytes) -> Result<(), StateError> {
@@ -429,7 +421,7 @@ impl CanisterState {
     }
 
     /// Returns the memory usage of the wasm chunk store in bytes.
-    fn wasm_chunk_store_memory_usage(&self) -> NumBytes {
+    pub(super) fn wasm_chunk_store_memory_usage(&self) -> NumBytes {
         self.system_state.wasm_chunk_store.memory_usage()
     }
 
@@ -557,6 +549,10 @@ impl CanisterState {
             }
         }
     }
+
+    pub fn append_log(&mut self, other: &mut CanisterLog) {
+        self.system_state.canister_log.append(other);
+    }
 }
 
 /// The result of `next_execution()` function.
@@ -596,28 +592,4 @@ pub fn num_bytes_try_from(pages: NumWasmPages) -> Result<NumBytes, String> {
 
 pub mod testing {
     pub use super::queues::testing::{new_canister_queues_for_test, CanisterQueuesTesting};
-    use super::*;
-
-    /// Exposes `CanisterState` internals for use in other crates' unit tests.
-    pub trait CanisterStateTesting {
-        /// Testing only: Publicly exposes `CanisterState::push_input()`.
-        fn push_input(
-            &mut self,
-            msg: RequestOrResponse,
-        ) -> Result<(), (StateError, RequestOrResponse)>;
-    }
-
-    impl CanisterStateTesting for CanisterState {
-        fn push_input(
-            &mut self,
-            msg: RequestOrResponse,
-        ) -> Result<(), (StateError, RequestOrResponse)> {
-            (self as &mut CanisterState).push_input(
-                msg,
-                &mut (i64::MAX / 2),
-                SubnetType::Application,
-                InputQueueType::RemoteSubnet,
-            )
-        }
-    }
 }

@@ -1,10 +1,5 @@
-use ic_test_utilities::{
-    crypto::mock_random_number_generator,
-    mock_time,
-    types::messages::{IngressBuilder, RequestBuilder, SignedIngressBuilder},
-};
-
 use ic_base_types::{NumBytes, NumSeconds, PrincipalId, SubnetId};
+use ic_config::embedders::MeteringType;
 use ic_config::{
     embedders::Config as EmbeddersConfig, execution_environment::Config, flag_status::FlagStatus,
     subnet_config::SchedulerConfig, subnet_config::SubnetConfig,
@@ -15,22 +10,21 @@ use ic_embedders::{wasm_utils::compile, WasmtimeEmbedder};
 use ic_error_types::{ErrorCode, RejectCode, UserError};
 pub use ic_execution_environment::ExecutionResponse;
 use ic_execution_environment::{
-    execute_canister, init_query_stats, CompilationCostHandling, ExecuteMessageResult,
-    ExecutionEnvironment, Hypervisor, IngressFilterMetrics, IngressHistoryWriterImpl,
-    InternalHttpQueryHandler, RoundInstructions, RoundLimits,
-};
-use ic_ic00_types::{
-    CanisterIdRecord, CanisterInstallMode, CanisterInstallModeV2, CanisterSettingsArgs,
-    CanisterSettingsArgsBuilder, CanisterStatusType, EcdsaKeyId, EmptyBlob, InstallCodeArgs,
-    InstallCodeArgsV2, Method, Payload, ProvisionalCreateCanisterWithCyclesArgs,
-    UpdateSettingsArgs, UpgradeOptions,
+    execute_canister, CompilationCostHandling, ExecuteMessageResult, ExecutionEnvironment,
+    Hypervisor, IngressFilterMetrics, IngressHistoryWriterImpl, InternalHttpQueryHandler,
+    RoundInstructions, RoundLimits,
 };
 use ic_interfaces::execution_environment::{
-    ExecutionMode, IngressHistoryWriter, QueryHandler, RegistryExecutionSettings,
-    SubnetAvailableMemory,
+    ExecutionMode, IngressHistoryWriter, RegistryExecutionSettings, SubnetAvailableMemory,
 };
 use ic_interfaces_state_manager::Labeled;
 use ic_logger::{replica_logger::no_op_logger, ReplicaLogger};
+use ic_management_canister_types::{
+    CanisterIdRecord, CanisterInstallMode, CanisterInstallModeV2, CanisterSettingsArgs,
+    CanisterSettingsArgsBuilder, CanisterStatusType, CanisterUpgradeOptions, EcdsaKeyId, EmptyBlob,
+    InstallCodeArgs, InstallCodeArgsV2, LogVisibility, Method, Payload,
+    ProvisionalCreateCanisterWithCyclesArgs, UpdateSettingsArgs,
+};
 use ic_metrics::MetricsRegistry;
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_registry_routing_table::{
@@ -47,6 +41,10 @@ use ic_replicated_state::{
 };
 use ic_replicated_state::{page_map::TestPageAllocatorFileDescriptorImpl, PageMap};
 use ic_system_api::InstructionLimits;
+use ic_test_utilities::{
+    crypto::mock_random_number_generator,
+    types::messages::{IngressBuilder, RequestBuilder, SignedIngressBuilder},
+};
 use ic_types::{
     batch::QueryStats,
     crypto::{canister_threshold_sig::MasterEcdsaPublicKey, AlgorithmId},
@@ -55,13 +53,12 @@ use ic_types::{
         AnonymousQuery, CallbackId, CanisterCall, CanisterMessage, CanisterTask, MessageId,
         RequestOrResponse, Response, UserQuery, MAX_INTER_CANISTER_PAYLOAD_IN_BYTES,
     },
+    time::UNIX_EPOCH,
     CanisterId, Cycles, Height, NumInstructions, NumPages, QueryStatsEpoch, Time, UserId,
 };
 use ic_types_test_utils::ids::{node_test_id, subnet_test_id, user_test_id};
 use ic_universal_canister::UNIVERSAL_CANISTER_WASM;
 use ic_wasm_types::BinaryEncodedWasm;
-
-use ic_config::embedders::MeteringType;
 use maplit::{btreemap, btreeset};
 use std::convert::TryFrom;
 use std::sync::Arc;
@@ -134,6 +131,7 @@ pub fn test_registry_settings() -> RegistryExecutionSettings {
         max_number_of_canisters: 0x2000,
         provisional_whitelist: ProvisionalWhitelist::Set(BTreeSet::new()),
         max_ecdsa_queue_size: 20,
+        quadruples_to_create_in_advance: 5,
         subnet_size: SMALL_APP_SUBNET_MAX_SIZE,
     }
 }
@@ -455,7 +453,7 @@ impl ExecutionTest {
                     .call_context_manager()
                     .unwrap();
                 let callback = call_context_manager
-                    .callback(&callback_id)
+                    .callback(callback_id)
                     .expect("Unknown callback id.");
                 call_context_manager
                     .call_context(callback.call_context_id)
@@ -473,6 +471,12 @@ impl ExecutionTest {
         CanisterIdRecord::decode(&get_reply(result))
             .unwrap()
             .get_canister_id()
+    }
+
+    /// Deletes the specified canister.
+    pub fn delete_canister(&mut self, canister_id: CanisterId) -> Result<WasmResult, UserError> {
+        let payload = CanisterIdRecord::from(canister_id).encode();
+        self.subnet_message(Method::DeleteCanister, payload)
     }
 
     pub fn create_canister_with_allocation(
@@ -539,7 +543,9 @@ impl ExecutionTest {
     ) -> Result<WasmResult, UserError> {
         let payload = UpdateSettingsArgs {
             canister_id: canister_id.into(),
-            settings: CanisterSettingsArgs::new(Some(controllers), None, None, None, None),
+            settings: CanisterSettingsArgsBuilder::new()
+                .with_controllers(controllers)
+                .build(),
             sender_canister_version: None,
         }
         .encode();
@@ -646,6 +652,23 @@ impl ExecutionTest {
             canister_id: canister_id.into(),
             settings: CanisterSettingsArgsBuilder::new()
                 .with_controllers(vec![controller])
+                .build(),
+            sender_canister_version: None,
+        }
+        .encode();
+        self.subnet_message(Method::UpdateSettings, payload)
+    }
+
+    /// Sets the log visibility of the canister.
+    pub fn set_log_visibility(
+        &mut self,
+        canister_id: CanisterId,
+        log_visibility: LogVisibility,
+    ) -> Result<WasmResult, UserError> {
+        let payload = UpdateSettingsArgs {
+            canister_id: canister_id.into(),
+            settings: CanisterSettingsArgsBuilder::new()
+                .with_log_visibility(log_visibility)
                 .build(),
             sender_canister_version: None,
         }
@@ -773,12 +796,13 @@ impl ExecutionTest {
         Ok(())
     }
 
-    /// Installs the given canister with the given Wasm binary.
+    /// Upgrades the given canister with the given Wasm binary and
+    /// upgrade options.
     pub fn upgrade_canister_v2(
         &mut self,
         canister_id: CanisterId,
         wasm_binary: Vec<u8>,
-        upgrade_options: UpgradeOptions,
+        upgrade_options: CanisterUpgradeOptions,
     ) -> Result<(), UserError> {
         let args = InstallCodeArgsV2::new(
             CanisterInstallModeV2::Upgrade(Some(upgrade_options)),
@@ -1049,7 +1073,7 @@ impl ExecutionTest {
             canister,
             Arc::new(response),
             self.instruction_limits.clone(),
-            mock_time(),
+            UNIX_EPOCH,
             network_topology,
             &mut round_limits,
             self.subnet_size(),
@@ -1060,6 +1084,7 @@ impl ExecutionTest {
                 response,
                 instructions_used,
                 heap_delta,
+                call_duration: _,
             } => (canister, response, instructions_used, heap_delta),
             ExecuteMessageResult::Paused { .. } => {
                 unreachable!("Unexpected paused execution")
@@ -1448,6 +1473,8 @@ impl ExecutionTest {
     }
 
     /// Executes a query call on the given state.
+    ///
+    /// Consider to use the simplified `non_replicated_query()` instead.
     pub fn query(
         &self,
         query: UserQuery,
@@ -1458,8 +1485,8 @@ impl ExecutionTest {
         // in these tests and therefore there isn't any height.
         //
         // Currently, this height is only used for query stats collection and it doesn't matter which one we pass in here.
-        // Even if consensus was running, it could be that all queries are actually runnning at height 0. The state passed in to
-        // the query handler shouldn't have the height encoded, so there shouldn't be a missmatch between the two.
+        // Even if consensus was running, it could be that all queries are actually running at height 0. The state passed in to
+        // the query handler shouldn't have the height encoded, so there shouldn't be a mismatch between the two.
         self.query_handler.query(
             query,
             Labeled::new(Height::from(0), state),
@@ -1575,11 +1602,8 @@ impl Default for ExecutionTestBuilder {
         Self {
             execution_config: Config {
                 rate_limiting_of_instructions: FlagStatus::Disabled,
-                deterministic_time_slicing: FlagStatus::Disabled,
                 canister_sandboxing_flag: FlagStatus::Enabled,
                 composite_queries: FlagStatus::Disabled,
-                query_caching: FlagStatus::Disabled,
-                query_cache_capacity: NumBytes::new(100_000_000), // 100MB
                 allocatable_compute_capacity_in_percent: 100,
                 ..Config::default()
             },
@@ -1603,7 +1627,7 @@ impl Default for ExecutionTestBuilder {
             manual_execution: false,
             subnet_features: String::default(),
             bitcoin_get_successors_follow_up_responses: BTreeMap::default(),
-            time: mock_time(),
+            time: UNIX_EPOCH,
             resource_saturation_scaling: 1,
             heap_delta_rate_limit: scheduler_config.heap_delta_rate_limit,
             upload_wasm_chunk_instructions: scheduler_config.upload_wasm_chunk_instructions,
@@ -1778,8 +1802,8 @@ impl ExecutionTestBuilder {
         self
     }
 
-    pub fn with_deterministic_time_slicing(mut self) -> Self {
-        self.execution_config.deterministic_time_slicing = FlagStatus::Enabled;
+    pub fn with_deterministic_time_slicing_disabled(mut self) -> Self {
+        self.execution_config.deterministic_time_slicing = FlagStatus::Disabled;
         self
     }
 
@@ -1793,11 +1817,6 @@ impl ExecutionTestBuilder {
         self
     }
 
-    pub fn with_query_caching(mut self) -> Self {
-        self.execution_config.query_caching = FlagStatus::Enabled;
-        self
-    }
-
     pub fn with_query_cache_capacity(mut self, capacity_bytes: u64) -> Self {
         self.execution_config.query_cache_capacity = capacity_bytes.into();
         self
@@ -1805,6 +1824,12 @@ impl ExecutionTestBuilder {
 
     pub fn with_query_cache_max_expiry_time(mut self, max_expiry_time: Duration) -> Self {
         self.execution_config.query_cache_max_expiry_time = max_expiry_time;
+        self
+    }
+
+    pub fn with_query_cache_data_certificate_expiry_time(mut self, time: Duration) -> Self {
+        self.execution_config
+            .query_cache_data_certificate_expiry_time = time;
         self
     }
 
@@ -1883,8 +1908,8 @@ impl ExecutionTestBuilder {
         self
     }
 
-    pub fn with_wasm_chunk_store(mut self) -> Self {
-        self.execution_config.wasm_chunk_store = FlagStatus::Enabled;
+    pub fn with_wasm_chunk_store(mut self, status: FlagStatus) -> Self {
+        self.execution_config.wasm_chunk_store = status;
         self
     }
 
@@ -1893,6 +1918,16 @@ impl ExecutionTestBuilder {
             .embedders_config
             .feature_flags
             .wasm_native_stable_memory = FlagStatus::Disabled;
+        self
+    }
+
+    pub fn with_snapshots(mut self, status: FlagStatus) -> Self {
+        self.execution_config.canister_snapshots = status;
+        self
+    }
+
+    pub fn with_canister_logging(mut self, status: FlagStatus) -> Self {
+        self.execution_config.canister_logging = status;
         self
     }
 
@@ -1908,6 +1943,13 @@ impl ExecutionTestBuilder {
 
     pub fn with_heap_delta_rate_limit(mut self, heap_delta_rate_limit: NumBytes) -> Self {
         self.heap_delta_rate_limit = heap_delta_rate_limit;
+        self
+    }
+
+    pub fn with_max_dirty_pages_optimization_embedder_config(mut self, no_pages: usize) -> Self {
+        self.execution_config
+            .embedders_config
+            .max_dirty_pages_without_optimization = no_pages;
         self
     }
 
@@ -2048,7 +2090,8 @@ impl ExecutionTestBuilder {
             self.heap_delta_rate_limit,
             self.upload_wasm_chunk_instructions,
         );
-        let (query_stats_collector, _) = init_query_stats(self.log.clone());
+        let (query_stats_collector, _) =
+            ic_query_stats::init_query_stats(self.log.clone(), &config, &metrics_registry);
 
         let query_handler = InternalHttpQueryHandler::new(
             self.log.clone(),
@@ -2155,7 +2198,7 @@ pub fn check_ingress_status(ingress_status: IngressStatus) -> Result<WasmResult,
     }
 }
 
-fn get_output_messages(state: &mut ReplicatedState) -> Vec<(CanisterId, RequestOrResponse)> {
+pub fn get_output_messages(state: &mut ReplicatedState) -> Vec<(CanisterId, RequestOrResponse)> {
     let mut output: Vec<(CanisterId, RequestOrResponse)> = vec![];
     let output_iter = state.output_into_iter();
 

@@ -311,6 +311,56 @@ pub mod neuron {
         DissolveDelaySeconds(u64),
     }
 }
+/// Subset of Neuron that has no collections or big fields that might not exist in most neurons, and
+/// the goal is to keep the size of the struct consistent and can be easily stored in a
+/// StableBTreeMap. For the meaning of each field, see the Neuron struct.
+#[derive(candid::CandidType, candid::Deserialize, serde::Serialize, comparable::Comparable)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AbridgedNeuron {
+    #[prost(bytes = "vec", tag = "2")]
+    pub account: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "3")]
+    pub controller: ::core::option::Option<::ic_base_types::PrincipalId>,
+    #[prost(uint64, tag = "5")]
+    pub cached_neuron_stake_e8s: u64,
+    #[prost(uint64, tag = "6")]
+    pub neuron_fees_e8s: u64,
+    #[prost(uint64, tag = "7")]
+    pub created_timestamp_seconds: u64,
+    #[prost(uint64, tag = "8")]
+    pub aging_since_timestamp_seconds: u64,
+    #[prost(uint64, optional, tag = "19")]
+    pub spawn_at_timestamp_seconds: ::core::option::Option<u64>,
+    #[prost(bool, tag = "13")]
+    pub kyc_verified: bool,
+    #[prost(uint64, tag = "15")]
+    pub maturity_e8s_equivalent: u64,
+    #[prost(uint64, optional, tag = "20")]
+    pub staked_maturity_e8s_equivalent: ::core::option::Option<u64>,
+    #[prost(bool, optional, tag = "21")]
+    pub auto_stake_maturity: ::core::option::Option<bool>,
+    #[prost(bool, tag = "16")]
+    pub not_for_profit: bool,
+    #[prost(uint64, optional, tag = "17")]
+    pub joined_community_fund_timestamp_seconds: ::core::option::Option<u64>,
+    #[prost(enumeration = "NeuronType", optional, tag = "22")]
+    pub neuron_type: ::core::option::Option<i32>,
+    #[prost(oneof = "abridged_neuron::DissolveState", tags = "9, 10")]
+    pub dissolve_state: ::core::option::Option<abridged_neuron::DissolveState>,
+}
+/// Nested message and enum types in `AbridgedNeuron`.
+pub mod abridged_neuron {
+    #[derive(candid::CandidType, candid::Deserialize, serde::Serialize, comparable::Comparable)]
+    #[allow(clippy::derive_partial_eq_without_eq)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum DissolveState {
+        #[prost(uint64, tag = "9")]
+        WhenDissolvedTimestampSeconds(u64),
+        #[prost(uint64, tag = "10")]
+        DissolveDelaySeconds(u64),
+    }
+}
 /// Payload of a proposal that calls a function on another NNS
 /// canister. The canister and function to call is derived from the
 /// `nns_function`.
@@ -483,7 +533,7 @@ pub struct Proposal {
     #[prost(string, optional, tag = "20")]
     pub title: ::core::option::Option<::prost::alloc::string::String>,
     /// Text providing a short description of the proposal, composed
-    /// using a maximum of 15000 bytes of characters.
+    /// using a maximum of 30000 bytes of characters.
     #[prost(string, tag = "1")]
     pub summary: ::prost::alloc::string::String,
     /// The Web address of additional content required to evaluate the
@@ -1024,6 +1074,8 @@ pub mod manage_neuron_response {
         /// The ID of the created proposal
         #[prost(message, optional, tag = "1")]
         pub proposal_id: ::core::option::Option<::ic_nns_common::pb::v1::ProposalId>,
+        #[prost(string, optional, tag = "2")]
+        pub message: ::core::option::Option<::prost::alloc::string::String>,
     }
     #[derive(candid::CandidType, candid::Deserialize, serde::Serialize, comparable::Comparable)]
     #[allow(clippy::derive_partial_eq_without_eq)]
@@ -1819,6 +1871,62 @@ pub struct NetworkEconomics {
     /// If unspecified or zero, all proposals are kept.
     #[prost(uint32, tag = "10")]
     pub max_proposals_to_keep_per_topic: u32,
+    /// Global Neurons' Fund participation thresholds.
+    #[prost(message, optional, tag = "11")]
+    pub neurons_fund_economics: ::core::option::Option<NeuronsFundEconomics>,
+}
+/// The thresholds specify the shape of the matching function used by the Neurons' Fund to
+/// determine how much to contribute for a given direct participation amount. Note that the actual
+/// swap participation is in ICP, whereas these thresholds are specifid in XDR; the conversion rate
+/// is determined at the time of execution of the CreateServiceNervousSystem proposal.
+#[derive(candid::CandidType, candid::Deserialize, serde::Serialize, comparable::Comparable)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NeuronsFundMatchedFundingCurveCoefficients {
+    /// Up to this amount of direct participation, the Neurons' Fund does not contribute to this SNS.
+    #[prost(message, optional, tag = "1")]
+    pub contribution_threshold_xdr:
+        ::core::option::Option<::ic_nervous_system_proto::pb::v1::Decimal>,
+    /// At this amount of direct participation, the Neurons' Fund contributes 50% of that amount.
+    #[prost(message, optional, tag = "2")]
+    pub one_third_participation_milestone_xdr:
+        ::core::option::Option<::ic_nervous_system_proto::pb::v1::Decimal>,
+    /// At this amount of direct participation, the Neurons' Fund contributes 100% of that amount.
+    /// This is the maximum participation rate of the Neurons' Fund.
+    #[prost(message, optional, tag = "3")]
+    pub full_participation_milestone_xdr:
+        ::core::option::Option<::ic_nervous_system_proto::pb::v1::Decimal>,
+}
+/// When the Neurons' Fund decides to participates in an SNS swap, the amount of participation is
+/// determined according to the rules of Matched Funding. The amount of ICP tokens contributed by
+/// the Neurons' Fund depends on four factors:
+/// (1) Direct participation amount at the time of the swap's successful finalization.
+/// (2) Amount of maturity held by all eligible neurons that were members of the Neurons' Fund
+///      at the time of the CreateServiceNervousSystem proposal execution.
+/// (3) Global Neurons' Fund participation thresholds, held in this structure (defined in XDR).
+/// (4) ICP/XDR conversion rate at the time of the CreateServiceNervousSystem proposal execution.
+#[derive(candid::CandidType, candid::Deserialize, serde::Serialize, comparable::Comparable)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NeuronsFundEconomics {
+    /// This is a theoretical limit which should be smaller than any realistic amount of maturity
+    /// that practically needs to be reserved from the Neurons' Fund for a given SNS swap.
+    #[prost(message, optional, tag = "1")]
+    pub max_theoretical_neurons_fund_participation_amount_xdr:
+        ::core::option::Option<::ic_nervous_system_proto::pb::v1::Decimal>,
+    /// Thresholds specifying the shape of the matching function used by the Neurons' Fund to
+    /// determine how much to contribute for a given direct participation amount.
+    #[prost(message, optional, tag = "2")]
+    pub neurons_fund_matched_funding_curve_coefficients:
+        ::core::option::Option<NeuronsFundMatchedFundingCurveCoefficients>,
+    /// The minimum value of the ICP/XDR conversion rate used by the Neurons' Fund for converting
+    /// XDR values into ICP.
+    #[prost(message, optional, tag = "3")]
+    pub minimum_icp_xdr_rate: ::core::option::Option<::ic_nervous_system_proto::pb::v1::Percentage>,
+    /// The maximum value of the ICP/XDR conversion rate used by the Neurons' Fund for converting
+    /// XDR values into ICP.
+    #[prost(message, optional, tag = "4")]
+    pub maximum_icp_xdr_rate: ::core::option::Option<::ic_nervous_system_proto::pb::v1::Percentage>,
 }
 /// A reward event is an event at which neuron maturity is increased
 #[derive(candid::CandidType, candid::Deserialize, serde::Serialize, comparable::Comparable)]
@@ -2272,8 +2380,9 @@ pub struct Governance {
     /// This is the inverse of what is stored in a Neuron (its followees).
     #[prost(map = "int32, message", tag = "22")]
     pub topic_followee_index: ::std::collections::HashMap<i32, governance::FollowersMap>,
-    #[prost(message, optional, tag = "23")]
-    pub seed_accounts: ::core::option::Option<governance::SeedAccounts>,
+    /// Local cache for XDR-related conversion rates (the source of truth is in the CMC canister).
+    #[prost(message, optional, tag = "26")]
+    pub xdr_conversion_rate: ::core::option::Option<XdrConversionRate>,
 }
 /// Nested message and enum types in `Governance`.
 pub mod governance {
@@ -2552,49 +2661,17 @@ pub mod governance {
             pub followers: ::prost::alloc::vec::Vec<::ic_nns_common::pb::v1::NeuronId>,
         }
     }
-    /// The list of seed accounts existing in the Genesis Token Canister (GTC). These accounts are used during the
-    /// tagging process of Seed Neurons in the NNS.
-    #[derive(candid::CandidType, candid::Deserialize, serde::Serialize, comparable::Comparable)]
-    #[allow(clippy::derive_partial_eq_without_eq)]
-    #[derive(Clone, PartialEq, ::prost::Message)]
-    pub struct SeedAccounts {
-        #[prost(message, repeated, tag = "1")]
-        pub accounts: ::prost::alloc::vec::Vec<seed_accounts::SeedAccount>,
-    }
-    /// Nested message and enum types in `SeedAccounts`.
-    pub mod seed_accounts {
-        /// An individual seed account existing in the Genesis Token Canister (GTC). This account is used during the
-        /// tagging process of Seed Neurons in the NNS. The structure of the Seed Account allows for idempotent
-        /// processing of all SeedAccounts in the NNS Governance Canister's heartbeat.
-        #[derive(
-            candid::CandidType, candid::Deserialize, serde::Serialize, comparable::Comparable,
-        )]
-        #[allow(clippy::derive_partial_eq_without_eq)]
-        #[derive(Clone, PartialEq, ::prost::Message)]
-        pub struct SeedAccount {
-            /// The id of the Account in the GTC.
-            #[prost(string, tag = "1")]
-            pub account_id: ::prost::alloc::string::String,
-            /// The timestamp in seconds of when this SeedAccount began tagging of its Seed Neurons. If set to None,
-            /// this account has yet to be processed. If set to Some, this account has began or finished processing.
-            #[prost(uint64, optional, tag = "2")]
-            pub tag_start_timestamp_seconds: ::core::option::Option<u64>,
-            /// The timestamp in seconds of when this SeedAccount finished tagging of its Seed Neurons. If set to None,
-            /// this account has yet to be processed, or has started processing. If set to Some, this account has
-            /// finished processing.
-            #[prost(uint64, optional, tag = "3")]
-            pub tag_end_timestamp_seconds: ::core::option::Option<u64>,
-            /// The count of errors encountered when processing this SeedAccount. This is used when considering whether
-            /// this SeedAccount is eligible for tagging. If the error_count is too high, the tagging process will ignore
-            /// it and continue on to the next SeedAccount.
-            #[prost(uint64, tag = "4")]
-            pub error_count: u64,
-            /// The type of the Neuron (either Seed or ECT). This type will be applied to all neurons found in
-            /// the tagging process for this account.
-            #[prost(enumeration = "super::super::NeuronType", tag = "5")]
-            pub neuron_type: i32,
-        }
-    }
+}
+#[derive(candid::CandidType, candid::Deserialize, serde::Serialize, comparable::Comparable)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct XdrConversionRate {
+    /// / Time at which this rate has been fetched.
+    #[prost(uint64, optional, tag = "1")]
+    pub timestamp_seconds: ::core::option::Option<u64>,
+    /// / One ICP is worth this number of 1/10,000ths parts of an XDR.
+    #[prost(uint64, optional, tag = "2")]
+    pub xdr_permyriad_per_icp: ::core::option::Option<u64>,
 }
 /// Proposals with restricted voting are not included unless the caller
 /// is allowed to vote on them.
@@ -2761,7 +2838,7 @@ pub struct MostRecentMonthlyNodeProviderRewards {
 }
 /// TODO(NNS1-1589): Until the Jira ticket gets solved, changes here need to be
 /// manually propagated to (sns) swap.proto.
-/// / TODO\[NNS1-2617\]: Deprecate this message.
+/// This message is obsolete; please use SettleNeuronsFundParticipation instead.
 #[derive(candid::CandidType, candid::Deserialize, serde::Serialize, comparable::Comparable)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -3552,8 +3629,6 @@ pub enum NnsFunction {
     AddApiBoundaryNode = 43,
     /// A proposal to remove a set of API Boundary Nodes, which will designate them as unassigned nodes
     RemoveApiBoundaryNodes = 44,
-    /// A proposal to update an API Boundary Node with a new domain name
-    UpdateApiBoundaryNodeDomain = 45,
     /// A proposal to update the version of a set of API Boundary Nodes
     UpdateApiBoundaryNodesVersion = 46,
 }
@@ -3617,9 +3692,6 @@ impl NnsFunction {
             NnsFunction::HardResetNnsRootToVersion => "NNS_FUNCTION_HARD_RESET_NNS_ROOT_TO_VERSION",
             NnsFunction::AddApiBoundaryNode => "NNS_FUNCTION_ADD_API_BOUNDARY_NODE",
             NnsFunction::RemoveApiBoundaryNodes => "NNS_FUNCTION_REMOVE_API_BOUNDARY_NODES",
-            NnsFunction::UpdateApiBoundaryNodeDomain => {
-                "NNS_FUNCTION_UPDATE_API_BOUNDARY_NODE_DOMAIN"
-            }
             NnsFunction::UpdateApiBoundaryNodesVersion => {
                 "NNS_FUNCTION_UPDATE_API_BOUNDARY_NODES_VERSION"
             }
@@ -3681,9 +3753,6 @@ impl NnsFunction {
             "NNS_FUNCTION_HARD_RESET_NNS_ROOT_TO_VERSION" => Some(Self::HardResetNnsRootToVersion),
             "NNS_FUNCTION_ADD_API_BOUNDARY_NODE" => Some(Self::AddApiBoundaryNode),
             "NNS_FUNCTION_REMOVE_API_BOUNDARY_NODES" => Some(Self::RemoveApiBoundaryNodes),
-            "NNS_FUNCTION_UPDATE_API_BOUNDARY_NODE_DOMAIN" => {
-                Some(Self::UpdateApiBoundaryNodeDomain)
-            }
             "NNS_FUNCTION_UPDATE_API_BOUNDARY_NODES_VERSION" => {
                 Some(Self::UpdateApiBoundaryNodesVersion)
             }

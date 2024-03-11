@@ -3,16 +3,16 @@ use candid::Encode;
 use ic_config::subnet_config::CyclesAccountManagerConfig;
 use ic_config::Config;
 use ic_error_types::{ErrorCode, RejectCode};
-use ic_ic00_types::{
+use ic_management_canister_types::{
     self as ic00, CanisterChange, CanisterIdRecord, CanisterInstallMode,
     CanisterSettingsArgsBuilder, CanisterStatusResultV2, CanisterStatusType, EmptyBlob,
-    InstallCodeArgs, Method, Payload, UpdateSettingsArgs, IC_00,
+    InstallCodeArgs, LogVisibility, Method, Payload, UpdateSettingsArgs, IC_00,
 };
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_replica_tests as utils;
 use ic_replica_tests::assert_reject;
 use ic_test_utilities::assert_utils::assert_balance_equals;
-use ic_test_utilities::universal_canister::management::SkipPreUpgrade;
+use ic_test_utilities::universal_canister::management::CanisterUpgradeOptions;
 use ic_test_utilities::universal_canister::{call_args, management, wasm, UNIVERSAL_CANISTER_WASM};
 use ic_types::{ingress::WasmResult, CanisterId, ComputeAllocation, Cycles, NumBytes, PrincipalId};
 use maplit::btreeset;
@@ -712,6 +712,7 @@ fn can_get_canister_information() {
                 None,
                 2592000,
                 Some(5_000_000_000_000u128),
+                LogVisibility::default(),
                 0u128,
                 0u128,
                 0u128,
@@ -769,6 +770,7 @@ fn can_get_canister_information() {
                     None,
                     259200,
                     None,
+                    LogVisibility::default(),
                     0u128,
                     0u128,
                     0u128,
@@ -988,7 +990,9 @@ fn test_canister_skip_upgrade() {
         assert_matches!(
             canister.update(wasm().call(
                 management::install_code(canister_id, UNIVERSAL_CANISTER_WASM).with_mode(
-                    management::InstallMode::Upgrade(Some(SkipPreUpgrade(Some(false)))),
+                    management::InstallMode::Upgrade(Some(CanisterUpgradeOptions {
+                        skip_pre_upgrade: Some(false),
+                    })),
                 ),
             )),
             Ok(WasmResult::Reject(_))
@@ -998,7 +1002,9 @@ fn test_canister_skip_upgrade() {
         assert_matches!(
             canister.update(wasm().call(
                 management::install_code(canister_id, UNIVERSAL_CANISTER_WASM).with_mode(
-                    management::InstallMode::Upgrade(Some(SkipPreUpgrade(Some(true),)))
+                    management::InstallMode::Upgrade(Some(CanisterUpgradeOptions {
+                        skip_pre_upgrade: Some(true),
+                    }))
                 ),
             )),
             Ok(WasmResult::Reply(_))
@@ -1009,7 +1015,9 @@ fn test_canister_skip_upgrade() {
         assert_matches!(
             canister.update(wasm().call(
                 management::install_code(canister_id, UNIVERSAL_CANISTER_WASM).with_mode(
-                    management::InstallMode::Upgrade(Some(SkipPreUpgrade(Some(false)))),
+                    management::InstallMode::Upgrade(Some(CanisterUpgradeOptions {
+                        skip_pre_upgrade: Some(false),
+                    })),
                 ),
             )),
             Ok(WasmResult::Reply(_))

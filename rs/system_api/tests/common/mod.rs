@@ -5,9 +5,9 @@ use ic_config::{
     embedders::Config as EmbeddersConfig, flag_status::FlagStatus, subnet_config::SchedulerConfig,
 };
 use ic_cycles_account_manager::{CyclesAccountManager, ResourceSaturation};
-use ic_ic00_types::IC_00;
 use ic_interfaces::execution_environment::{ExecutionMode, SubnetAvailableMemory};
 use ic_logger::replica_logger::no_op_logger;
+use ic_management_canister_types::IC_00;
 use ic_nns_constants::CYCLES_MINTING_CANISTER_ID;
 use ic_registry_routing_table::{CanisterIdRange, RoutingTable};
 use ic_registry_subnet_type::SubnetType;
@@ -17,13 +17,13 @@ use ic_system_api::{
     ExecutionParameters, InstructionLimits, SystemApiImpl,
 };
 use ic_test_utilities::{
-    mock_time,
     state::SystemStateBuilder,
     types::ids::{call_context_test_id, canister_test_id, subnet_test_id, user_test_id},
 };
 use ic_types::{
-    messages::{CallContextId, CallbackId, RejectContext},
+    messages::{CallContextId, CallbackId, RejectContext, RequestMetadata, NO_DEADLINE},
     methods::SystemMethod,
+    time::UNIX_EPOCH,
     ComputeAllocation, Cycles, MemoryAllocation, NumInstructions, PrincipalId, Time,
     MAX_WASM_MEMORY_IN_BYTES,
 };
@@ -80,7 +80,7 @@ pub struct ApiTypeBuilder;
 impl ApiTypeBuilder {
     pub fn build_update_api() -> ApiType {
         ApiType::update(
-            mock_time(),
+            UNIX_EPOCH,
             vec![],
             Cycles::zero(),
             user_test_id(1).get(),
@@ -92,14 +92,14 @@ impl ApiTypeBuilder {
         ApiType::system_task(
             IC_00.get(),
             SystemMethod::CanisterHeartbeat,
-            mock_time(),
+            UNIX_EPOCH,
             CallContextId::from(1),
         )
     }
 
     pub fn build_reply_api(incoming_cycles: Cycles) -> ApiType {
         ApiType::reply_callback(
-            mock_time(),
+            UNIX_EPOCH,
             PrincipalId::new_anonymous(),
             vec![],
             incoming_cycles,
@@ -112,7 +112,7 @@ impl ApiTypeBuilder {
 
     pub fn build_reject_api(reject_context: RejectContext) -> ApiType {
         ApiType::reject_callback(
-            mock_time(),
+            UNIX_EPOCH,
             PrincipalId::new_anonymous(),
             reject_context,
             Cycles::zero(),
@@ -135,6 +135,8 @@ pub fn get_system_api(
         &NetworkTopology::default(),
         SchedulerConfig::application_subnet().dirty_page_overhead,
         execution_parameters().compute_allocation,
+        RequestMetadata::new(0, UNIX_EPOCH),
+        api_type.caller(),
     );
     SystemApiImpl::new(
         api_type,
@@ -163,9 +165,10 @@ pub fn get_system_state() -> SystemState {
         .call_context_manager_mut()
         .unwrap()
         .new_call_context(
-            CallOrigin::CanisterUpdate(canister_test_id(33), CallbackId::from(5)),
+            CallOrigin::CanisterUpdate(canister_test_id(33), CallbackId::from(5), NO_DEADLINE),
             Cycles::new(50),
             Time::from_nanos_since_unix_epoch(0),
+            RequestMetadata::new(0, UNIX_EPOCH),
         );
     system_state
 }

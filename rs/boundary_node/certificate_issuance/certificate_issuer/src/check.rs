@@ -3,10 +3,8 @@ use async_trait::async_trait;
 use candid::Principal;
 use flate2::bufread::GzDecoder;
 use ic_agent::Agent;
-use ic_response_verification::{
-    types::{Request, Response},
-    verify_request_response_pair, MIN_VERIFICATION_VERSION,
-};
+use ic_http_certification::{HttpRequest, HttpResponse};
+use ic_response_verification::{verify_request_response_pair, MIN_VERIFICATION_VERSION};
 use ic_utils::{
     call::SyncCall,
     interfaces::http_request::{HeaderField, HttpRequestCanister},
@@ -173,7 +171,7 @@ impl Check for Checker {
             })?;
 
         // Phase 4 - Ensure canister mentions known domain.
-        let request = Request {
+        let request = HttpRequest {
             method: String::from("GET"),
             url: String::from("/.well-known/ic-domains"),
             headers: vec![],
@@ -199,7 +197,7 @@ impl Check for Checker {
         }?;
 
         // Check response certification
-        let response_for_verification = Response {
+        let response_for_verification = HttpResponse {
             status_code: response.status_code,
             headers: response
                 .headers
@@ -207,6 +205,7 @@ impl Check for Checker {
                 .map(|field| (field.0.to_string(), field.1.to_string()))
                 .collect::<Vec<(String, String)>>(),
             body: response.body.clone(),
+            upgrade: response.upgrade,
         };
         let max_cert_time_offset_ns = 300_000_000_000;
         let current_time_ns = SystemTime::now()

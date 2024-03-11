@@ -10,6 +10,7 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 pub type InstanceId = usize;
 
@@ -34,7 +35,7 @@ pub struct RawTime {
 /// If a canister ID is provided, the call will be sent to the management
 /// canister of the subnet where the canister is on.
 /// If None, the call will be sent to any management canister.
-#[derive(Clone, Serialize, Deserialize, Debug, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, Debug, JsonSchema, PartialEq, Eq, Hash)]
 pub enum RawEffectivePrincipal {
     None,
     SubnetId(
@@ -194,7 +195,7 @@ impl From<Principal> for RawCanisterId {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, Debug, JsonSchema, PartialEq, Eq, Hash)]
 pub struct RawSubnetId {
     #[serde(deserialize_with = "base64::deserialize")]
     #[serde(serialize_with = "base64::serialize")]
@@ -291,7 +292,7 @@ pub enum SubnetKind {
 
 /// This represents which named subnets the user wants to create, and how
 /// many of the general app/system subnets, which are indistinguishable.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize, Default, JsonSchema)]
 pub struct SubnetConfigSet {
     pub nns: bool,
     pub sns: bool,
@@ -316,21 +317,187 @@ impl SubnetConfigSet {
         }
         Err("SubnetConfigSet must contain at least one subnet".to_owned())
     }
+}
 
-    /// Return the configured named subnets in order.
-    pub fn get_named(&self) -> Vec<SubnetKind> {
+impl From<SubnetConfigSet> for ExtendedSubnetConfigSet {
+    fn from(
+        SubnetConfigSet {
+            nns,
+            sns,
+            ii,
+            fiduciary: fid,
+            bitcoin,
+            system,
+            application,
+        }: SubnetConfigSet,
+    ) -> Self {
+        ExtendedSubnetConfigSet {
+            nns: if nns {
+                Some(SubnetSpec::default())
+            } else {
+                None
+            },
+            sns: if sns {
+                Some(SubnetSpec::default())
+            } else {
+                None
+            },
+            ii: if ii {
+                Some(SubnetSpec::default())
+            } else {
+                None
+            },
+            fiduciary: if fid {
+                Some(SubnetSpec::default())
+            } else {
+                None
+            },
+            bitcoin: if bitcoin {
+                Some(SubnetSpec::default())
+            } else {
+                None
+            },
+            system: vec![SubnetSpec::default(); system],
+            application: vec![SubnetSpec::default(); application],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize, Default, JsonSchema)]
+pub struct ExtendedSubnetConfigSet {
+    pub nns: Option<SubnetSpec>,
+    pub sns: Option<SubnetSpec>,
+    pub ii: Option<SubnetSpec>,
+    pub fiduciary: Option<SubnetSpec>,
+    pub bitcoin: Option<SubnetSpec>,
+    pub system: Vec<SubnetSpec>,
+    pub application: Vec<SubnetSpec>,
+}
+
+/// Specifies various configurations for a subnet.
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SubnetSpec {
+    state_config: SubnetStateConfig,
+    instruction_config: SubnetInstructionConfig,
+}
+
+impl SubnetSpec {
+    pub fn with_state_dir(mut self, path: PathBuf, subnet_id: SubnetId) -> SubnetSpec {
+        self.state_config = SubnetStateConfig::FromPath(path, RawSubnetId::from(subnet_id));
+        self
+    }
+
+    pub fn with_benchmarking_instruction_config(mut self) -> SubnetSpec {
+        self.instruction_config = SubnetInstructionConfig::Benchmarking;
+        self
+    }
+
+    pub fn get_state_path(&self) -> Option<PathBuf> {
+        self.state_config.get_path()
+    }
+
+    pub fn get_subnet_id(&self) -> Option<RawSubnetId> {
+        match &self.state_config {
+            SubnetStateConfig::New => None,
+            SubnetStateConfig::FromPath(_, subnet_id) => Some(subnet_id.clone()),
+            SubnetStateConfig::FromBlobStore(_, subnet_id) => Some(subnet_id.clone()),
+        }
+    }
+
+    pub fn get_instruction_config(&self) -> SubnetInstructionConfig {
+        self.instruction_config.clone()
+    }
+
+    pub fn is_supported(&self) -> bool {
+        match &self.state_config {
+            SubnetStateConfig::New => true,
+            SubnetStateConfig::FromPath(..) => true,
+            SubnetStateConfig::FromBlobStore(..) => false,
+        }
+    }
+}
+
+impl Default for SubnetSpec {
+    fn default() -> Self {
+        Self {
+            state_config: SubnetStateConfig::New,
+            instruction_config: SubnetInstructionConfig::Production,
+        }
+    }
+}
+
+/// Specifies instruction limits for canister execution on this subnet.
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub enum SubnetInstructionConfig {
+    /// Use default instruction limits as in production.
+    Production,
+    /// Use very high instruction limits useful for asymptotic canister benchmarking.
+    Benchmarking,
+}
+
+/// Specifies whether the subnet should be created from scratch or loaded
+/// from a path.
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub enum SubnetStateConfig {
+    /// Create new subnet with empty state.
+    New,
+    /// Load existing subnet state from the given path.
+    /// The path must be on a filesystem accessible to the server process.
+    FromPath(PathBuf, RawSubnetId),
+    /// Load existing subnet state from blobstore. Needs to be uploaded first!
+    /// Not implemented!
+    FromBlobStore(BlobId, RawSubnetId),
+}
+
+impl SubnetStateConfig {
+    pub fn get_path(&self) -> Option<PathBuf> {
+        match self {
+            SubnetStateConfig::FromPath(path, _) => Some(path.clone()),
+            SubnetStateConfig::FromBlobStore(_, _) => None,
+            SubnetStateConfig::New => None,
+        }
+    }
+    pub fn get_subnet_id(&self) -> Option<RawSubnetId> {
+        match self {
+            SubnetStateConfig::FromPath(_, id) => Some(id.clone()),
+            SubnetStateConfig::FromBlobStore(_, id) => Some(id.clone()),
+            SubnetStateConfig::New => None,
+        }
+    }
+}
+
+impl ExtendedSubnetConfigSet {
+    // Return the configured named subnets in order.
+    pub fn get_named(&self) -> Vec<(SubnetKind, Option<PathBuf>, SubnetInstructionConfig)> {
         use SubnetKind::*;
         vec![
-            (self.nns, NNS),
-            (self.sns, SNS),
-            (self.ii, II),
-            (self.fiduciary, Fiduciary),
-            (self.bitcoin, Bitcoin),
+            (self.nns.clone(), NNS),
+            (self.sns.clone(), SNS),
+            (self.ii.clone(), II),
+            (self.fiduciary.clone(), Fiduciary),
+            (self.bitcoin.clone(), Bitcoin),
         ]
         .into_iter()
-        .filter(|(flag, _)| *flag)
-        .map(|(_, kind)| kind)
+        .filter(|(mb, _)| mb.is_some())
+        .map(|(mb, kind)| {
+            let spec = mb.unwrap();
+            (kind, spec.get_state_path(), spec.get_instruction_config())
+        })
         .collect()
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.system.is_empty()
+            || !self.application.is_empty()
+            || self.nns.is_some()
+            || self.sns.is_some()
+            || self.ii.is_some()
+            || self.fiduciary.is_some()
+            || self.bitcoin.is_some()
+        {
+            return Ok(());
+        }
+        Err("ExtendedSubnetConfigSet must contain at least one subnet".to_owned())
     }
 }
 
@@ -338,6 +505,8 @@ impl SubnetConfigSet {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SubnetConfig {
     pub subnet_kind: SubnetKind,
+    /// Instruction limits for canister execution on this subnet.
+    pub instruction_config: SubnetInstructionConfig,
     /// Number of nodes in the subnet.
     pub size: u64,
     /// Some mainnet subnets have several disjunct canister ranges.
@@ -355,7 +524,14 @@ pub struct Topology(pub HashMap<SubnetId, SubnetConfig>);
 
 impl Topology {
     pub fn get_app_subnets(&self) -> Vec<SubnetId> {
-        self.find_subnets(SubnetKind::Application)
+        self.find_subnets(SubnetKind::Application, None)
+    }
+
+    pub fn get_benchmarking_app_subnets(&self) -> Vec<SubnetId> {
+        self.find_subnets(
+            SubnetKind::Application,
+            Some(SubnetInstructionConfig::Benchmarking),
+        )
     }
 
     pub fn get_bitcoin(&self) -> Option<SubnetId> {
@@ -379,13 +555,23 @@ impl Topology {
     }
 
     pub fn get_system_subnets(&self) -> Vec<SubnetId> {
-        self.find_subnets(SubnetKind::System)
+        self.find_subnets(SubnetKind::System, None)
     }
 
-    fn find_subnets(&self, kind: SubnetKind) -> Vec<SubnetId> {
+    fn find_subnets(
+        &self,
+        kind: SubnetKind,
+        instruction_config: Option<SubnetInstructionConfig>,
+    ) -> Vec<SubnetId> {
         self.0
             .iter()
-            .filter(|(_, config)| config.subnet_kind == kind)
+            .filter(|(_, config)| {
+                config.subnet_kind == kind
+                    && instruction_config
+                        .as_ref()
+                        .map(|instruction_config| config.instruction_config == *instruction_config)
+                        .unwrap_or(true)
+            })
             .map(|(id, _)| *id)
             .collect()
     }

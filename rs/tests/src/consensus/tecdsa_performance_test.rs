@@ -18,13 +18,15 @@ use crate::orchestrator::utils::rw_message::install_nns_with_customizations_and_
 use crate::orchestrator::utils::subnet_recovery::{
     enable_ecdsa_signing_on_subnet, run_ecdsa_signature_test,
 };
-use crate::tecdsa::tecdsa_signature_test::{make_key, KEY_ID1};
+use crate::tecdsa::{make_key, KEY_ID1};
 use crate::util::{block_on, get_app_subnet_and_node, get_nns_node, MessageCanister};
 
 use candid::{Encode, Principal};
 use futures::future::join_all;
 use ic_config::subnet_config::ECDSA_SIGNATURE_FEE;
-use ic_ic00_types::{DerivationPath, Payload, SignWithECDSAArgs, SignWithECDSAReply};
+use ic_management_canister_types::{
+    DerivationPath, Payload, SignWithECDSAArgs, SignWithECDSAReply,
+};
 use ic_message::ForwardParams;
 use ic_registry_subnet_features::EcdsaConfig;
 use ic_registry_subnet_type::SubnetType;

@@ -52,6 +52,8 @@ impl ArtifactKind for U64Artifact {
 #[derive(Debug, Default)]
 struct PeerPool {
     pool_events: Vec<PoolEvent>,
+    // Pool with events applied.
+    pool: HashSet<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,12 +66,15 @@ impl PeerPool {
     pub fn new() -> Self {
         Self {
             pool_events: Vec::new(),
+            pool: HashSet::new(),
         }
     }
     pub fn insert(&mut self, id: u64) {
+        self.pool.insert(id);
         self.pool_events.push(PoolEvent::Insert(id))
     }
     pub fn remove(&mut self, id: u64) {
+        self.pool.remove(&id);
         self.pool_events.push(PoolEvent::Remove(id))
     }
     pub fn num_inserts(&self, id: u64) -> usize {
@@ -86,14 +91,7 @@ impl PeerPool {
     }
 
     pub fn pool(&self) -> HashSet<u64> {
-        let mut pool = HashSet::new();
-        for event in &self.pool_events {
-            match event {
-                PoolEvent::Insert(id) => pool.insert(*id),
-                PoolEvent::Remove(id) => pool.remove(id),
-            };
-        }
-        pool
+        self.pool.clone()
     }
 }
 
@@ -182,20 +180,16 @@ impl TestConsensus<U64Artifact> {
 
     pub fn push_advert(&self, id: u64) {
         let mut inner = self.inner.lock().unwrap();
-        inner
-            .peer_pool
-            .entry(self.node_id)
-            .and_modify(|p| p.insert(id));
+        let my_pool = inner.peer_pool.get_mut(&self.node_id).unwrap();
+        my_pool.insert(id);
 
         inner.adverts.push_back(id);
     }
 
     pub fn push_purge(&self, id: u64) {
         let mut inner = self.inner.lock().unwrap();
-        inner
-            .peer_pool
-            .entry(self.node_id)
-            .and_modify(|p| p.remove(id));
+        let my_pool = inner.peer_pool.get_mut(&self.node_id).unwrap();
+        my_pool.remove(id);
 
         inner.purge.push_back(id);
     }

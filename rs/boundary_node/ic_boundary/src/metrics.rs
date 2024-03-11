@@ -30,7 +30,6 @@ use prometheus::{
     register_int_gauge_with_registry, Encoder, HistogramOpts, HistogramVec, IntCounterVec,
     IntGauge, IntGaugeVec, Registry, TextEncoder,
 };
-use rayon::prelude::*;
 use tokio::sync::RwLock;
 use tower_http::request_id::RequestId;
 use tracing::info;
@@ -38,8 +37,9 @@ use tracing::info;
 use crate::{
     cache::{Cache, CacheStatus},
     core::Run,
+    geoip,
     retry::RetryResult,
-    routes::{ErrorCause, RequestContext},
+    routes::{ErrorCause, RequestContext, RequestType},
     snapshot::{Node, RegistrySnapshot},
 };
 
@@ -54,6 +54,7 @@ const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
 
 const NODE_ID_LABEL: &str = "node_id";
 const SUBNET_ID_LABEL: &str = "subnet_id";
+const SUBNET_ID_UNKNOWN: &str = "unknown";
 
 pub struct MetricsCache {
     buffer: Vec<u8>,
@@ -75,7 +76,7 @@ fn remove_stale_metrics(
     snapshot: Arc<RegistrySnapshot>,
     mut mfs: Vec<MetricFamily>,
 ) -> Vec<MetricFamily> {
-    mfs.par_iter_mut().for_each(|mf| {
+    mfs.iter_mut().for_each(|mf| {
         // Iterate over the metrics in the metric family
         let metrics = mf
             .take_metric()
@@ -107,10 +108,13 @@ fn remove_stale_metrics(
                     // If there's only subnet_id label - check if this subnet exists
                     // TODO create a hashmap of subnets in snapshot for faster lookup, currently complexity is O(n)
                     // but since we have very few subnets currently (<40) probably it's Ok
-                    (None, Some(subnet_id)) => snapshot
-                        .subnets
-                        .iter()
-                        .any(|x| x.id.to_string() == subnet_id),
+                    (None, Some(subnet_id)) => {
+                        subnet_id == SUBNET_ID_UNKNOWN
+                            || snapshot
+                                .subnets
+                                .iter()
+                                .any(|x| x.id.to_string() == subnet_id)
+                    }
 
                     // Otherwise just pass this metric through
                     _ => true,
@@ -438,6 +442,7 @@ impl MetricParamsPersist {
     }
 }
 
+#[derive(Clone)]
 pub struct WithMetricsCheck<T>(pub T, pub MetricParamsCheck);
 
 #[derive(Clone)]
@@ -484,6 +489,7 @@ impl MetricParamsCheck {
 #[derive(Clone)]
 pub struct HttpMetricParams {
     pub action: String,
+    pub log_failed_requests_only: bool,
     pub counter: IntCounterVec,
     pub durationer: HistogramVec,
     pub request_sizer: HistogramVec,
@@ -491,7 +497,7 @@ pub struct HttpMetricParams {
 }
 
 impl HttpMetricParams {
-    pub fn new(registry: &Registry, action: &str) -> Self {
+    pub fn new(registry: &Registry, action: &str, log_failed_requests_only: bool) -> Self {
         const LABELS_HTTP: &[&str] = &[
             "request_type",
             "status_code",
@@ -504,6 +510,7 @@ impl HttpMetricParams {
 
         Self {
             action: action.to_string(),
+            log_failed_requests_only,
 
             counter: register_int_counter_vec_with_registry!(
                 format!("{action}_total"),
@@ -611,10 +618,10 @@ pub async fn metrics_middleware_status(
 // middleware to log and measure proxied requests
 pub async fn metrics_middleware(
     State(metric_params): State<HttpMetricParams>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     RawQuery(query_string): RawQuery,
     headers: HeaderMap,
     Extension(request_id): Extension<RequestId>,
+    Extension(canister_id): Extension<CanisterId>,
     request: Request<Body>,
     next: Next<Body>,
 ) -> impl IntoResponse {
@@ -624,6 +631,24 @@ pub async fn metrics_middleware(
         .unwrap_or("bad_request_id")
         .to_string();
 
+    let connect_info = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .cloned();
+
+    let request_type = &request
+        .extensions()
+        .get::<RequestType>()
+        .cloned()
+        .unwrap_or_default();
+    let request_type: &'static str = request_type.into();
+
+    let country_code = request
+        .extensions()
+        .get::<geoip::GeoData>()
+        .cloned()
+        .map(|x| x.country_code);
+
     // Perform the request & measure duration
     let start_time = Instant::now();
     let response = next.run(request).await;
@@ -632,14 +657,14 @@ pub async fn metrics_middleware(
     // Extract extensions
     let ctx = response
         .extensions()
-        .get::<RequestContext>()
+        .get::<Arc<RequestContext>>()
         .cloned()
         .unwrap_or_default();
 
+    let canister_id_actual = response.extensions().get::<CanisterId>().cloned();
     let error_cause = response.extensions().get::<ErrorCause>().cloned();
     let retry_result = response.extensions().get::<RetryResult>().cloned();
-    let canister_id = response.extensions().get::<CanisterId>().cloned();
-    let node = response.extensions().get::<Node>().cloned();
+    let node = response.extensions().get::<Arc<Node>>().cloned();
     let cache_status = response
         .extensions()
         .get::<CacheStatus>()
@@ -647,21 +672,17 @@ pub async fn metrics_middleware(
         .unwrap_or_default();
 
     // Prepare fields
-    let request_type = ctx.request_type.to_string();
     let status_code = response.status();
     let sender = ctx.sender.map(|x| x.to_string());
     let node_id = node.as_ref().map(|x| x.id.to_string());
     let subnet_id = node.as_ref().map(|x| x.subnet_id.to_string());
-    let ip_family = String::from({
-        if addr.is_ipv4() {
-            "IPv4"
-        } else {
-            "IPv6"
-        }
-    });
+    let ip_family = connect_info
+        .map(|x| if x.is_ipv4() { "4" } else { "6" })
+        .unwrap_or("0");
 
     let HttpMetricParams {
         action,
+        log_failed_requests_only,
         counter,
         durationer,
         request_sizer,
@@ -671,6 +692,7 @@ pub async fn metrics_middleware(
     // Closure that gets called when the response body is fully read (or an error occurs)
     let record_metrics = move |response_size: u64, body_result: Result<(), String>| {
         let full_duration = start_time.elapsed().as_secs_f64();
+        let failed = error_cause.is_some() || !status_code.is_success();
 
         let (error_cause, error_details) = match &error_cause {
             Some(v) => (Some(v.to_string()), v.details()),
@@ -684,7 +706,13 @@ pub async fn metrics_middleware(
 
         let retry_result = retry_result.clone();
 
-        let retry_label =
+        // Prepare labels
+        // Otherwise "temporary value dropped" error occurs
+        let error_cause_lbl = error_cause.clone().unwrap_or("none".to_string());
+        let subnet_id_lbl = subnet_id.clone().unwrap_or(SUBNET_ID_UNKNOWN.to_string());
+        let cache_status_lbl = &cache_status.to_string();
+        let cache_bypass_reason_lbl = cache_bypass_reason.clone().unwrap_or("none".to_string());
+        let retry_lbl =
             // Check if retry happened and if it succeeded
             if let Some(v) = &retry_result {
                 if v.success {
@@ -696,22 +724,15 @@ pub async fn metrics_middleware(
                 "no"
             };
 
-        // Prepare labels
-        // Otherwise "temporary value dropped" error occurs
-        let error_cause_lbl = error_cause.clone().unwrap_or("none".to_string());
-        let subnet_id_lbl = subnet_id.clone().unwrap_or("unknown".to_string());
-        let cache_status_lbl = &cache_status.to_string();
-        let cache_bypass_reason_lbl = cache_bypass_reason.clone().unwrap_or("none".to_string());
-
         // Average cardinality up to 150k
         let labels = &[
-            request_type.as_str(),            // x3
+            request_type,                     // x3
             status_code.as_str(),             // x27 but usually x8
             subnet_id_lbl.as_str(),           // x37 as of now
             error_cause_lbl.as_str(),         // x15 but usually x6
             cache_status_lbl.as_str(),        // x4
             cache_bypass_reason_lbl.as_str(), // x6 but since it relates only to BYPASS cache status -> total for 2 fields is x9
-            retry_label,                      // x3
+            retry_lbl,                        // x3
         ];
 
         counter.with_label_values(labels).inc();
@@ -736,37 +757,41 @@ pub async fn metrics_middleware(
             .get(USER_AGENT)
             .map(|v| v.to_str().unwrap_or("parsing_error"));
 
-        info!(
-            action,
-            request_id,
-            request_type = ctx.request_type.to_string(),
-            error_cause,
-            error_details,
-            status = status_code.as_u16(),
-            subnet_id,
-            node_id,
-            canister_id = canister_id.map(|x| x.to_string()),
-            canister_id_cbor = ctx.canister_id.map(|x| x.to_string()),
-            sender,
-            method_name = ctx.method_name,
-            proc_duration,
-            full_duration,
-            request_size = ctx.request_size,
-            response_size,
-            retry_count = &retry_result.as_ref().map(|x| x.retries),
-            retry_success = &retry_result.map(|x| x.success.to_string()),
-            body_error = body_result.err(),
-            %cache_status,
-            cache_bypass_reason = cache_bypass_reason.map(|x| x.to_string()),
-            nonce_len = ctx.nonce.clone().map(|x| x.len()),
-            arg_len = ctx.arg.clone().map(|x| x.len()),
-            ip_family,
-            query_string,
-            header_host,
-            header_origin,
-            header_referer,
-            header_user_agent,
-        );
+        if !log_failed_requests_only || failed {
+            info!(
+                action,
+                request_id,
+                request_type,
+                error_cause,
+                error_details,
+                status = status_code.as_u16(),
+                subnet_id,
+                node_id,
+                country_code,
+                canister_id = canister_id.to_string(),
+                canister_id_actual = canister_id_actual.map(|x| x.to_string()),
+                canister_id_cbor = ctx.canister_id.map(|x| x.to_string()),
+                sender,
+                method_name = ctx.method_name,
+                proc_duration,
+                full_duration,
+                request_size = ctx.request_size,
+                response_size,
+                retry_count = &retry_result.as_ref().map(|x| x.retries),
+                retry_success = &retry_result.map(|x| x.success.to_string()),
+                body_error = body_result.err(),
+                %cache_status,
+                cache_bypass_reason = cache_bypass_reason.map(|x| x.to_string()),
+                nonce_len = ctx.nonce.clone().map(|x| x.len()),
+                arg_len = ctx.arg.clone().map(|x| x.len()),
+                ip_family,
+                query_string,
+                header_host,
+                header_origin,
+                header_referer,
+                header_user_agent,
+            );
+        }
     };
 
     let (parts, body) = response.into_parts();

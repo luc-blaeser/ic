@@ -1,8 +1,8 @@
 use assert_matches::assert_matches;
 use ic_base_types::{NumBytes, NumSeconds};
 use ic_error_types::ErrorCode;
-use ic_ic00_types::CanisterStatusType;
 use ic_interfaces::execution_environment::HypervisorError;
+use ic_management_canister_types::CanisterStatusType;
 use ic_replicated_state::canister_state::NextExecution;
 use ic_replicated_state::testing::SystemStateTesting;
 use ic_replicated_state::NumWasmPages;
@@ -445,7 +445,6 @@ fn dts_works_in_response_callback() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -464,7 +463,7 @@ fn dts_works_in_response_callback() {
             "update",
             call_args()
                 .other_side(b.clone())
-                .on_reject(wasm().reject_code().reject_message().reject())
+                .on_reject(wasm().reject_message().reject())
                 .on_reply(
                     wasm()
                         .instruction_counter_is_at_least(1_000_000)
@@ -526,7 +525,6 @@ fn dts_works_in_cleanup_callback() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -546,7 +544,7 @@ fn dts_works_in_cleanup_callback() {
             call_args()
                 .other_side(b)
                 .on_reply(wasm().trap())
-                .on_reject(wasm().reject_code().reject_message().reject())
+                .on_reject(wasm().reject_message().reject())
                 .on_cleanup(wasm().instruction_counter_is_at_least(1_000_000)),
             Cycles::from(1000u128),
         )
@@ -604,7 +602,6 @@ fn dts_out_of_subnet_memory_in_response_callback() {
         .with_subnet_memory_reservation(40 * 1024 * 1024)
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -624,7 +621,7 @@ fn dts_out_of_subnet_memory_in_response_callback() {
             "update",
             call_args()
                 .other_side(b)
-                .on_reject(wasm().reject_code().reject_message().reject())
+                .on_reject(wasm().reject_message().reject())
                 .on_reply(
                     wasm()
                         .stable_grow(1280)
@@ -709,7 +706,6 @@ fn dts_out_of_subnet_memory_in_cleanup_callback() {
         .with_subnet_memory_reservation(40 * 1024 * 1024)
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -730,7 +726,7 @@ fn dts_out_of_subnet_memory_in_cleanup_callback() {
             call_args()
                 .other_side(b)
                 .on_reply(wasm().trap())
-                .on_reject(wasm().reject_code().reject_message().reject())
+                .on_reject(wasm().reject_message().reject())
                 .on_cleanup(
                     wasm()
                         .stable_grow(1280)
@@ -811,7 +807,6 @@ fn dts_abort_works_in_response_callback() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -830,7 +825,7 @@ fn dts_abort_works_in_response_callback() {
             "update",
             call_args()
                 .other_side(b.clone())
-                .on_reject(wasm().reject_code().reject_message().reject())
+                .on_reject(wasm().reject_message().reject())
                 .on_reply(
                     wasm()
                         .instruction_counter_is_at_least(1_000_000)
@@ -907,7 +902,6 @@ fn dts_abort_works_in_cleanup_callback() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -927,7 +921,7 @@ fn dts_abort_works_in_cleanup_callback() {
             call_args()
                 .other_side(b)
                 .on_reply(wasm().trap())
-                .on_reject(wasm().reject_code().reject_message().reject())
+                .on_reject(wasm().reject_message().reject())
                 .on_cleanup(wasm().instruction_counter_is_at_least(1_000_000)),
             Cycles::from(1000u128),
         )
@@ -1009,7 +1003,7 @@ fn successful_response_scenario(test: &mut ExecutionTest) -> (CanisterId, Messag
             "update",
             call_args()
                 .other_side(b.clone())
-                .on_reject(wasm().reject_code().reject_message().reject())
+                .on_reject(wasm().reject_message().reject())
                 .on_reply(
                     wasm()
                         .instruction_counter_is_at_least(1_000_000)
@@ -1147,7 +1141,6 @@ fn dts_and_nondts_cycles_match_after_response() {
     let mut test_b = ExecutionTestBuilder::new()
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -1156,23 +1149,11 @@ fn dts_and_nondts_cycles_match_after_response() {
     let status_a = test_a.ingress_status(&amsg_id);
     let status_b = test_b.ingress_status(&bmsg_id);
     assert_eq!(status_a, status_b);
-    let time_a = match status_a {
-        IngressStatus::Known {
-            receiver: _,
-            user_id: _,
-            time,
-            state: _,
-        } => time,
-        _ => unreachable!(),
+    let IngressStatus::Known { time: time_a, .. } = status_a else {
+        unreachable!();
     };
-    let time_b = match status_b {
-        IngressStatus::Known {
-            receiver: _,
-            user_id: _,
-            time,
-            state: _,
-        } => time,
-        _ => unreachable!(),
+    let IngressStatus::Known { time: time_b, .. } = status_b else {
+        unreachable!();
     };
     assert_eq!(time_a, time_b);
     assert_eq!(start_time, time_a);
@@ -1194,7 +1175,6 @@ fn dts_and_nondts_cycles_match_if_response_fails() {
     let mut test_b = ExecutionTestBuilder::new()
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -1221,7 +1201,6 @@ fn dts_and_nondts_cycles_match_if_cleanup_fails() {
     let mut test_b = ExecutionTestBuilder::new()
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -1257,7 +1236,6 @@ fn dts_response_concurrent_cycles_change_succeeds() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(instruction_limit)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -1375,7 +1353,6 @@ fn dts_response_concurrent_cycles_change_fails() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(instruction_limit)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -1471,7 +1448,7 @@ fn dts_response_concurrent_cycles_change_fails() {
     );
 
     let err = check_ingress_status(test.ingress_status(&ingress_id)).unwrap_err();
-    assert_eq!(err.code(), ErrorCode::CanisterOutOfCycles);
+    assert_eq!(err.code(), ErrorCode::CanisterContractViolation);
 
     assert_eq!(
         err.description(),
@@ -1509,7 +1486,6 @@ fn dts_response_with_cleanup_concurrent_cycles_change_fails() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(instruction_limit)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -1618,7 +1594,7 @@ fn dts_response_with_cleanup_concurrent_cycles_change_fails() {
     }
 
     let err = check_ingress_status(test.ingress_status(&ingress_id)).unwrap_err();
-    assert_eq!(err.code(), ErrorCode::CanisterOutOfCycles);
+    assert_eq!(err.code(), ErrorCode::CanisterContractViolation);
 
     assert_eq!(
         test.canister_state(a_id).system_state.balance(),
@@ -1693,7 +1669,6 @@ fn dts_uninstall_with_aborted_response() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(instruction_limit)
         .with_slice_instruction_limit(10_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -1848,7 +1823,6 @@ fn reserve_instructions_for_cleanup_callback_with_dts() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(instruction_limit)
         .with_slice_instruction_limit(slice_instruction_limit)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -1862,7 +1836,6 @@ fn response_callback_succeeds_with_memory_reservation() {
         .with_subnet_memory_reservation(80 * 1024 * 1024)
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -1882,7 +1855,7 @@ fn response_callback_succeeds_with_memory_reservation() {
             "update",
             call_args()
                 .other_side(b)
-                .on_reject(wasm().reject_code().reject_message().reject())
+                .on_reject(wasm().reject_message().reject())
                 .on_reply(
                     wasm()
                         .stable_grow(1280)
@@ -1986,7 +1959,6 @@ fn cleanup_callback_succeeds_with_memory_reservation() {
         .with_subnet_memory_reservation(80 * 1024 * 1024)
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -2007,7 +1979,7 @@ fn cleanup_callback_succeeds_with_memory_reservation() {
             call_args()
                 .other_side(b)
                 .on_reply(wasm().trap())
-                .on_reject(wasm().reject_code().reject_message().reject())
+                .on_reject(wasm().reject_message().reject())
                 .on_cleanup(
                     wasm()
                         .stable_grow(1280)
@@ -2112,7 +2084,6 @@ fn subnet_available_memory_does_not_change_on_response_abort() {
         .with_subnet_memory_reservation(80 * 1024 * 1024)
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -2132,7 +2103,7 @@ fn subnet_available_memory_does_not_change_on_response_abort() {
             "update",
             call_args()
                 .other_side(b)
-                .on_reject(wasm().reject_code().reject_message().reject())
+                .on_reject(wasm().reject_message().reject())
                 .on_reply(
                     wasm()
                         .stable_grow(1280)
@@ -2189,7 +2160,6 @@ fn subnet_available_memory_does_not_change_on_cleanup_abort() {
         .with_subnet_memory_reservation(80 * 1024 * 1024)
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -2210,7 +2180,7 @@ fn subnet_available_memory_does_not_change_on_cleanup_abort() {
             call_args()
                 .other_side(b)
                 .on_reply(wasm().trap())
-                .on_reject(wasm().reject_code().reject_message().reject())
+                .on_reject(wasm().reject_message().reject())
                 .on_cleanup(
                     wasm()
                         .stable_grow(1280)
@@ -2265,7 +2235,6 @@ fn subnet_available_memory_does_not_change_on_response_validation_failure() {
         .with_subnet_memory_reservation(80 * 1024 * 1024)
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -2285,7 +2254,7 @@ fn subnet_available_memory_does_not_change_on_response_validation_failure() {
             "update",
             call_args()
                 .other_side(b)
-                .on_reject(wasm().reject_code().reject_message().reject())
+                .on_reject(wasm().reject_message().reject())
                 .on_reply(
                     wasm()
                         .stable_grow(1280)
@@ -2338,7 +2307,6 @@ fn subnet_available_memory_does_not_change_on_response_resume_failure() {
         .with_subnet_memory_reservation(80 * 1024 * 1024)
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -2358,7 +2326,7 @@ fn subnet_available_memory_does_not_change_on_response_resume_failure() {
             "update",
             call_args()
                 .other_side(b)
-                .on_reject(wasm().reject_code().reject_message().reject())
+                .on_reject(wasm().reject_message().reject())
                 .on_reply(
                     wasm()
                         .stable_grow(1280)
@@ -2424,7 +2392,6 @@ fn subnet_available_memory_does_not_change_on_cleanup_resume_failure() {
         .with_subnet_memory_reservation(80 * 1024 * 1024)
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -2445,7 +2412,7 @@ fn subnet_available_memory_does_not_change_on_cleanup_resume_failure() {
             call_args()
                 .other_side(b)
                 .on_reply(wasm().trap())
-                .on_reject(wasm().reject_code().reject_message().reject())
+                .on_reject(wasm().reject_message().reject())
                 .on_cleanup(
                     wasm()
                         .stable_grow(1280)
@@ -2559,7 +2526,7 @@ fn cycles_balance_changes_applied_correctly() {
 fn test_cycles_burn() {
     let test = ExecutionTestBuilder::new().build();
 
-    let canister_memory_usage = NumBytes::try_from(1_000_000).unwrap();
+    let canister_memory_usage = NumBytes::from(1_000_000);
     let canister_message_memory_usage = NumBytes::from(0);
 
     let amount = 1_000_000_000;
@@ -2586,7 +2553,7 @@ fn test_cycles_burn() {
 fn cycles_burn_up_to_the_threshold_on_not_enough_cycles() {
     let test = ExecutionTestBuilder::new().build();
 
-    let canister_memory_usage = NumBytes::try_from(1_000_000).unwrap();
+    let canister_memory_usage = NumBytes::from(1_000_000);
     let canister_message_memory_usage = NumBytes::from(0);
 
     let freezing_threshold_cycles = test.cycles_account_manager().freeze_threshold_cycles(

@@ -1,11 +1,10 @@
 use super::*;
-use ic_test_utilities::mock_time;
 use ic_test_utilities::types::{
     arbitrary,
     ids::{canister_test_id, message_test_id, user_test_id},
     messages::{IngressBuilder, RequestBuilder, ResponseBuilder},
 };
-use ic_types::{messages::RequestOrResponse, Time};
+use ic_types::{messages::RequestOrResponse, time::UNIX_EPOCH, Time};
 use proptest::prelude::*;
 
 #[test]
@@ -152,7 +151,7 @@ fn output_queue_with_message_is_not_empty() {
     let mut queue = OutputQueue::new(14);
 
     queue
-        .push_request(RequestBuilder::default().build().into(), mock_time())
+        .push_request(RequestBuilder::default().build().into(), UNIX_EPOCH)
         .expect("could push");
     assert_eq!(queue.num_messages(), 1);
     assert!(queue.has_used_slots());
@@ -175,7 +174,7 @@ fn output_queue_push_request_succeeds() {
 
     assert_eq!(output_queue.queue.available_request_slots(), 1);
     output_queue
-        .push_request(RequestBuilder::default().build().into(), mock_time())
+        .push_request(RequestBuilder::default().build().into(), UNIX_EPOCH)
         .unwrap();
     assert_eq!(output_queue.queue.available_request_slots(), 0);
     assert!(output_queue.check_has_request_slot().is_err());
@@ -208,7 +207,7 @@ fn output_queue_push_to_full_queue_fails() {
     let mut output_queue = OutputQueue::new(capacity);
     for _index in 0..capacity {
         output_queue
-            .push_request(RequestBuilder::default().build().into(), mock_time())
+            .push_request(RequestBuilder::default().build().into(), UNIX_EPOCH)
             .unwrap();
     }
     for _index in 0..capacity {
@@ -219,7 +218,7 @@ fn output_queue_push_to_full_queue_fails() {
     // Now push an extraneous message in
     assert_eq!(
         output_queue
-            .push_request(RequestBuilder::default().build().into(), mock_time(),)
+            .push_request(RequestBuilder::default().build().into(), UNIX_EPOCH,)
             .map_err(|(err, _)| err),
         Err(StateError::QueueFull { capacity })
     );
@@ -591,7 +590,7 @@ fn output_queue_decode_with_deadlines_index_out_of_bounds_fails() {
 fn output_queue_decode_with_none_head_fails() {
     let mut q = OutputQueue::new(super::super::DEFAULT_QUEUE_CAPACITY);
     for _ in 0..2 {
-        q.push_request(RequestBuilder::default().build().into(), mock_time())
+        q.push_request(RequestBuilder::default().build().into(), UNIX_EPOCH)
             .unwrap();
     }
     q.queue.queue.front_mut().unwrap().take();
@@ -718,6 +717,7 @@ fn msg_from_number(num: u64) -> Ingress {
     IngressBuilder::default()
         .source(user_test_id(num))
         .receiver(canister_test_id(num))
+        .effective_canister_id(Some(canister_test_id(num)))
         .method_name(num.to_string())
         .message_id(message_test_id(num))
         .build()
@@ -739,24 +739,6 @@ fn empty_and_len_agree_on_non_empty() {
 }
 
 #[test]
-fn order_is_fifo() {
-    let mut q = IngressQueue::default();
-    let msg1 = msg_from_number(1);
-    let msg2 = msg_from_number(2);
-    q.push(msg1.clone());
-    q.push(msg2.clone());
-
-    assert_eq!(q.size(), 2);
-    assert_eq!(q.pop(), Some(msg1.into()));
-
-    assert_eq!(q.size(), 1);
-    assert_eq!(q.pop(), Some(msg2.into()));
-
-    assert_eq!(q.size(), 0);
-    assert_eq!(q.pop(), None);
-}
-
-#[test]
 fn ingress_filter() {
     let mut queue = IngressQueue::default();
     let msg1 = msg_from_number(1);
@@ -771,4 +753,180 @@ fn ingress_filter() {
     assert_eq!(queue.pop(), Some(msg1.into()));
     assert_eq!(queue.size(), 1);
     assert_eq!(queue.pop(), Some(msg3.into()));
+}
+
+#[test]
+fn ingress_queue_empty() {
+    let mut queue = IngressQueue::default();
+    assert_eq!(queue.peek(), None);
+    assert_eq!(queue.pop(), None);
+    assert_eq!(queue.size(), 0);
+    assert_eq!(queue.ingress_schedule_size(), 0);
+    assert!(queue.is_empty());
+}
+
+#[test]
+fn ingress_queue_round_robin_order() {
+    let mut queue = IngressQueue::default();
+    // First ingress for canister A
+    let mut msg11 = msg_from_number(1);
+    msg11.message_id = message_test_id(11);
+    queue.push(msg11.clone());
+    // First ingress for canister B
+    let mut msg21 = msg_from_number(2);
+    msg21.message_id = message_test_id(21);
+    queue.push(msg21.clone());
+    // Second ingress for canister A
+    let mut msg22 = msg_from_number(2);
+    msg22.message_id = message_test_id(22);
+    queue.push(msg22.clone());
+    // Second ingress for canister B
+    let mut msg12 = msg_from_number(1);
+    msg12.message_id = message_test_id(12);
+    queue.push(msg12.clone());
+
+    // We have 4 ingress messages for 2 canisters in the queue.
+    assert_eq!(queue.size(), 4);
+    assert_eq!(queue.ingress_schedule_size(), 2);
+    assert!(!queue.is_empty());
+
+    // The message on the front of queue is first message for canister A.
+    assert_eq!(queue.peek(), Some(msg11.clone().into()));
+    assert_eq!(queue.pop(), Some(msg11.into()));
+
+    // We have 3 ingress messages for 2 canisters in the queue.
+    assert_eq!(queue.size(), 3);
+    assert_eq!(queue.ingress_schedule_size(), 2);
+    assert!(!queue.is_empty());
+
+    // The message on the front of queue is first message for canister B.
+    assert_eq!(queue.peek(), Some(msg21.clone().into()));
+    assert_eq!(queue.pop(), Some(msg21.into()));
+
+    // We have 2 ingress messages for 2 canisters in the queue.
+    assert_eq!(queue.size(), 2);
+    assert_eq!(queue.ingress_schedule_size(), 2);
+    assert!(!queue.is_empty());
+
+    // The message on the front of queue is second message for canister A.
+    assert_eq!(queue.peek(), Some(msg12.clone().into()));
+    assert_eq!(queue.pop(), Some(msg12.into()));
+
+    // We have 1 ingress message for 1 canister in the queue.
+    assert_eq!(queue.size(), 1);
+    assert_eq!(queue.ingress_schedule_size(), 1);
+    assert!(!queue.is_empty());
+
+    // The message on the front of queue is second message for canister B.
+    assert_eq!(queue.peek(), Some(msg22.clone().into()));
+    assert_eq!(queue.pop(), Some(msg22.into()));
+
+    // The queue is empty.
+    assert_eq!(queue.size(), 0);
+    assert_eq!(queue.ingress_schedule_size(), 0);
+    assert!(queue.is_empty());
+
+    assert_eq!(queue.peek(), None);
+    assert_eq!(queue.pop(), None);
+}
+
+#[test]
+fn ingress_queue_round_robin_order_with_skipping_ingress_input() {
+    let mut queue = IngressQueue::default();
+    // First ingress for canister A
+    let mut msg11 = msg_from_number(1);
+    msg11.message_id = message_test_id(11);
+    queue.push(msg11.clone());
+    // First ingress for canister B
+    let mut msg21 = msg_from_number(2);
+    msg21.message_id = message_test_id(21);
+    queue.push(msg21.clone());
+    // Second ingress for canister A
+    let mut msg22 = msg_from_number(2);
+    msg22.message_id = message_test_id(22);
+    queue.push(msg22.clone());
+    // Second ingress for canister B
+    let mut msg12 = msg_from_number(1);
+    msg12.message_id = message_test_id(12);
+    queue.push(msg12.clone());
+
+    // We have 4 ingress messages for 2 canisters in the queue.
+    assert_eq!(queue.size(), 4);
+    assert_eq!(queue.ingress_schedule_size(), 2);
+    assert!(!queue.is_empty());
+
+    // The message on the front of queue is first message for canister A.
+    assert_eq!(queue.peek(), Some(msg11.clone().into()));
+    assert_eq!(queue.pop(), Some(msg11.into()));
+
+    // We have 3 ingress messages for 2 canisters in the queue.
+    assert_eq!(queue.size(), 3);
+    assert_eq!(queue.ingress_schedule_size(), 2);
+    assert!(!queue.is_empty());
+
+    // The message on the front of queue is first message for canister B.
+    assert_eq!(queue.peek(), Some(msg21.clone().into()));
+    assert_eq!(queue.pop(), Some(msg21.into()));
+
+    // We have 2 ingress messages for 2 canisters in the queue.
+    assert_eq!(queue.size(), 2);
+    assert_eq!(queue.ingress_schedule_size(), 2);
+    assert!(!queue.is_empty());
+
+    // The message on the front of queue is second message for canister A.
+    assert_eq!(queue.peek(), Some(msg12.clone().into()));
+
+    // We are skipping the canister A.
+    queue.skip_ingress_input();
+
+    // We still have 2 ingress messages for 2 canisters in the queue.
+    assert_eq!(queue.size(), 2);
+    assert_eq!(queue.ingress_schedule_size(), 2);
+    assert!(!queue.is_empty());
+
+    // The message on the front of queue is second message for canister B.
+    assert_eq!(queue.peek(), Some(msg22.clone().into()));
+    assert_eq!(queue.pop(), Some(msg22.into()));
+
+    // We have 1 ingress message for 1 canister in the queue.
+    assert_eq!(queue.size(), 1);
+    assert_eq!(queue.ingress_schedule_size(), 1);
+    assert!(!queue.is_empty());
+
+    // The message on the front of queue is second message for canister A.
+    assert_eq!(queue.peek(), Some(msg12.clone().into()));
+    assert_eq!(queue.pop(), Some(msg12.into()));
+
+    // The queue is empty.
+    assert_eq!(queue.size(), 0);
+    assert_eq!(queue.ingress_schedule_size(), 0);
+    assert!(queue.is_empty());
+
+    assert_eq!(queue.peek(), None);
+    assert_eq!(queue.pop(), None);
+}
+
+#[test]
+fn serialize_deserialize_ingress_queue() {
+    let mut queue = IngressQueue::default();
+
+    let number_of_messages_per_canister = 5;
+    let number_of_canisters = 10;
+
+    for i in 0..number_of_messages_per_canister {
+        for j in 0..number_of_canisters {
+            let mut ingress = msg_from_number(j);
+            ingress.message_id = message_test_id(i * number_of_canisters + j);
+            queue.push(ingress);
+        }
+    }
+
+    let pb_vec_ingress: Vec<ic_protobuf::state::ingress::v1::Ingress> = (&queue.clone()).into();
+    let mut queue_deserialized = IngressQueue::try_from(pb_vec_ingress).unwrap();
+
+    while !queue.is_empty() {
+        assert_eq!(queue.pop(), queue_deserialized.pop());
+    }
+
+    assert!(queue_deserialized.is_empty());
 }

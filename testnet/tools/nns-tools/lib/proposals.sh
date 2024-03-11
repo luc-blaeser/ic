@@ -180,13 +180,30 @@ EOF
 
 }
 
-generate_insert_custom_upgrade_paths_proposal_text() {
-    local SNS_GOVERNANCE_CANISTER_ID=$1
-    shift
+generate_versions_from_initial_and_diffs() {
     VERSIONS=()
     for ((c = 1; c <= $#; c++)); do
         VERSIONS+=("${!c}")
     done
+
+    LAST_VERSION=""
+    for VERSION in "${VERSIONS[@]}"; do
+        if [ "$LAST_VERSION" != "" ]; then
+            # Combine the upgrades to emulate the way this will work
+            VERSION=$(echo "[$LAST_VERSION, $VERSION]" | jq -cS '.[0] * .[1]')
+        else
+
+            VERSION=$(echo $VERSION | jq -cS .)
+        fi
+        echo $VERSION | jq -c .
+        LAST_VERSION=$VERSION
+    done
+}
+
+generate_insert_custom_upgrade_paths_proposal_text() {
+    local SNS_GOVERNANCE_CANISTER_ID=$1
+    shift
+    VERSIONS=$(generate_versions_from_initial_and_diffs "${@}")
 
     DESCRIPTION=$([ "$SNS_GOVERNANCE_CANISTER_ID" == "" ] \
         && echo "All SNS upgrade paths (without their own overrides) will be affected by this proposal." \
@@ -199,11 +216,11 @@ generate_insert_custom_upgrade_paths_proposal_text() {
     LAST_VERSION=""
     OUTPUT=$(
         cat <<EOF
-## Proposal to TODO
+## Proposal to Insert Custom Upgrade Path to SNS-W
 ### Proposer: DFINITY Foundation
-### Target SNS Governance Canister: $DISPLAY_GOVERNANCE_ID
+### Target SNS Governance Canister(s): $DISPLAY_GOVERNANCE_ID
 ---
-This proposal will change the upgrade path to use different WASMs, but WASMs that are already available on SNS-W.
+This proposal will change the upgrade path to use different WASMs that are already available on SNS-W.
 
 $DESCRIPTION
 
@@ -233,17 +250,9 @@ EO2
         )
 ## Upgrade Path Changes
 
-$(for VERSION in "${VERSIONS[@]}"; do
-            if [ "$LAST_VERSION" != "" ]; then
-                # Combine the upgrades to emulate the way this will work
-                VERSION=$(echo "[$LAST_VERSION, $VERSION]" | jq -cS '.[0] * .[1]')
-            else
-
-                VERSION=$(echo $VERSION | jq -cS .)
-            fi
+$(for VERSION in ${VERSIONS}; do
             echo $VERSION | jq .
             echo
-            LAST_VERSION=$VERSION
         done)
 
 EOF
@@ -339,34 +348,6 @@ empty_candid_upgrade_args() {
     fi
     # Empty string means do nothing
     echo ""
-}
-
-# Re-configure the CMC to use the mock XRC canister by proposing an upgrade to it (using the mega neuron), and passing the ID of the mock XRC canister via init args.
-point_cycles_minting_canister_to_mock_exchange_rate_canister() {
-    XRC_MOCK_CANISTER="$1"
-    NNS_URL="$2"
-    NEURON_ID="$3"
-    PEM="$4"
-
-    CANISTER_NAME="cycles-minting"
-
-    # If CMC does not have a current version in metadata, we need to supply it.
-    # TODO - remove the ENV variable after CMC is updated
-    CURRENT_VERSION=${CURRENT_VERSION:-$(nns_canister_git_version "$NNS_URL" "$CANISTER_NAME")}
-
-    # Get ungzipped version to make it easy to detect upgrade status
-    CURRENT_VERSION_UNZIPPED=$(get_nns_canister_wasm_gz_for_type "$CANISTER_NAME" "$CURRENT_VERSION")
-
-    SKIP_STOPPING=yes propose_upgrade_nns_canister_wasm_file_pem "$NNS_URL" \
-        "$NEURON_ID" "$PEM" "$CANISTER_NAME" \
-        "$CURRENT_VERSION_UNZIPPED" "$(encode_candid_args_in_file \
-            "(record {
-                exchange_rate_canister = opt variant { Set = principal \"$XRC_MOCK_CANISTER\" } })")"
-
-    if ! wait_for_nns_canister_has_file_contents "$NNS_URL" "$CANISTER_NAME" "$CURRENT_VERSION_UNZIPPED"; then
-        print_red "Could not upgrade cycles-minting canister to its own version with different arguments"
-        exit 1
-    fi
 }
 
 #### Proposal value extractors (based on common format of proposal elements)

@@ -246,7 +246,6 @@ pub(crate) mod test {
     use ic_test_utilities::{
         consensus::{batch::MockBatchPayloadBuilder, fake::Fake},
         ingress_selector::FakeIngressSelector,
-        mock_time,
         self_validating_payload_builder::FakeSelfValidatingPayloadBuilder,
         types::ids::{node_test_id, subnet_test_id},
         types::messages::SignedIngressBuilder,
@@ -259,6 +258,7 @@ pub(crate) mod test {
         crypto::{CryptoHash, Signed},
         messages::SignedIngress,
         signature::ThresholdSignature,
+        time::UNIX_EPOCH,
         xnet::CertifiedStreamSlice,
         CryptoHashOfPartialState, RegistryVersion,
     };
@@ -355,7 +355,7 @@ pub(crate) mod test {
             let context = ValidationContext {
                 certified_height: Height::from(0),
                 registry_version: RegistryVersion::from(1),
-                time: mock_time(),
+                time: UNIX_EPOCH,
             };
             let subnet_record = SubnetRecordBuilder::from(&[node_test_id(0)]).build();
             let subnet_records = SubnetRecords {

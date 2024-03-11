@@ -51,7 +51,6 @@ use ic_icos_sev::ValidateAttestedStream;
 use ic_interfaces_registry::RegistryClient;
 use ic_logger::{error, info, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
-use ic_peer_manager::SubnetTopology;
 use quinn::{
     AsyncUdpSocket, ConnectError, Connecting, Connection, ConnectionError, Endpoint,
     EndpointConfig, RecvStream, SendStream, VarInt,
@@ -63,13 +62,13 @@ use tokio::{
     select,
     task::JoinSet,
 };
-use tokio_util::time::DelayQueue;
+use tokio_util::{sync::CancellationToken, time::DelayQueue};
 
 use crate::{
     connection_handle::ConnectionHandle,
     metrics::{CONNECTION_RESULT_FAILED_LABEL, CONNECTION_RESULT_SUCCESS_LABEL},
     utils::collect_metrics,
-    ConnId,
+    ConnId, Shutdown, SubnetTopology,
 };
 use crate::{metrics::QuicTransportMetrics, request_handler::run_stream_acceptor};
 
@@ -201,7 +200,7 @@ pub(crate) fn start_connection_manager(
     watcher: tokio::sync::watch::Receiver<SubnetTopology>,
     socket: Either<SocketAddr, impl AsyncUdpSocket>,
     router: Router,
-) {
+) -> Shutdown {
     let topology = watcher.borrow().clone();
 
     let metrics = QuicTransportMetrics::new(metrics_registry);
@@ -294,7 +293,6 @@ pub(crate) fn start_connection_manager(
         )
         .expect("Failed to create endpoint"),
     };
-
     let manager = ConnectionManager {
         log: log.clone(),
         rt: rt.clone(),
@@ -314,8 +312,10 @@ pub(crate) fn start_connection_manager(
         active_connections: JoinMap::new(),
         router,
     };
-
-    rt.spawn(manager.run());
+    let shutdown = Shutdown::new(rt.clone());
+    shutdown
+        .spawn_on_with_cancellation(|cancellation: CancellationToken| manager.run(cancellation));
+    shutdown
 }
 
 impl ConnectionManager {
@@ -323,29 +323,26 @@ impl ConnectionManager {
         self.node_id < *dst
     }
 
-    pub async fn run(mut self) {
+    pub async fn run(mut self, cancellation: CancellationToken) {
         loop {
             select! {
+                () = cancellation.cancelled() => {
+                    break;
+                },
                 Some(reconnect) = self.connect_queue.next() => {
                     self.handle_dial(reconnect.into_inner())
-                }
-                topology = self.watcher.changed() => {
-                    match topology {
-                        Ok(_) => {
-                            self.handle_topology_change();
-                        },
-                        Err(_) => {
-                            error!(self.log, "Transport disconnected from peer manager. Shutting down.");
-                            break
-                        }
-                    }
+                },
+                // Ignore the case if the sender is dropped. It is not transport's responsibility to make
+                // sure topology senders are up and running.
+                Ok(()) = self.watcher.changed() => {
+                    self.handle_topology_change();
                 },
                 connecting = self.endpoint.accept() => {
                     if let Some(connecting) = connecting {
                         self.handle_inbound(connecting);
                     } else {
-                        info!(self.log, "Quic endpoint closed. Stopping transport.");
-                        // Endpoint is closed. This indicates a shutdown.
+                        error!(self.log, "Quic endpoint closed. Stopping transport.");
+                        // Endpoint is closed. This indicates NOT graceful shutdown.
                         break;
                     }
                 },
@@ -394,12 +391,18 @@ impl ConnectionManager {
                 .delay_queue_size
                 .set(self.connect_queue.len() as i64);
         }
-        // This point is reached only in two cases - replica gracefully shutting down or
-        // bug which makes the peer manager unavailable.
-        // If the peer manager is unavailable, the replica needs must exist that's why
-        // the endpoint is closed proactively.
-        self.endpoint.close(0u8.into(), b"shutting down");
+        self.reset().await;
+    }
 
+    // TODO: maybe unbind the port so we can start another transport on the same port after shutdown.
+    async fn reset(mut self) {
+        self.peer_map.write().unwrap().clear();
+        self.endpoint
+            .close(VarInt::from_u32(0), b"graceful shutdown of endpoint");
+        self.connect_queue.clear();
+        self.inbound_connecting.shutdown().await;
+        self.outbound_connecting.shutdown().await;
+        self.active_connections.shutdown().await;
         self.endpoint.wait_idle().await;
     }
 
@@ -586,7 +589,7 @@ impl ConnectionManager {
                         .close(VarInt::from_u32(0), b"using newer connection");
                     info!(
                         self.log,
-                        "Replacing old connection to {}  with newer", peer_id
+                        "Replacing old connection to {} with newer", peer_id
                     );
                 } else {
                     self.metrics.peer_map_size.inc();

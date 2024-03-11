@@ -3,8 +3,9 @@ use crate::{
     height_index::{HeightIndex, Indexes, SelectIndex},
     HasTimestamp, IntoInner,
 };
-use ic_interfaces::consensus_pool::{HeightIndexedPool, HeightRange, OnlyError, PoolSection};
-use ic_logger::{warn, ReplicaLogger};
+use ic_interfaces::consensus_pool::{
+    HeightIndexedPool, HeightRange, OnlyError, PoolSection, PurgeableArtifactType,
+};
 use ic_types::{
     artifact::ConsensusMessageId,
     consensus::*,
@@ -16,15 +17,13 @@ use std::collections::BTreeMap;
 pub struct InMemoryPoolSection<T: IntoInner<ConsensusMessage>> {
     indexes: Indexes,
     artifacts: BTreeMap<CryptoHash, T>,
-    log: ReplicaLogger,
 }
 
 impl<T: IntoInner<ConsensusMessage> + HasTimestamp + Clone> InMemoryPoolSection<T> {
-    pub fn new(log: ReplicaLogger) -> InMemoryPoolSection<T> {
+    pub fn new() -> InMemoryPoolSection<T> {
         InMemoryPoolSection {
             artifacts: BTreeMap::new(),
             indexes: Indexes::new(),
-            log,
         }
     }
 
@@ -39,9 +38,17 @@ impl<T: IntoInner<ConsensusMessage> + HasTimestamp + Clone> InMemoryPoolSection<
         self.remove_by_hash(msg_id.hash.digest())
     }
 
-    /// Purge all artifacts or only shares below the given [`Height`].
+    /// Purge artifacts below the given [`Height`].
+    ///
+    /// If `artifact_type` is provided, we will purge only artifacts of the given type. Otherwise we
+    /// will purge *all* artifacts.
+    ///
     /// Return [`ConsensusMessageId`]s of deleted artifacts.
-    fn purge_below(&mut self, height: Height, only_shares: bool) -> Vec<ConsensusMessageId> {
+    fn purge_below(
+        &mut self,
+        height: Height,
+        artifact_type: Option<PurgeableArtifactType>,
+    ) -> Vec<ConsensusMessageId> {
         let mut purged = Vec::new();
 
         macro_rules! purge {
@@ -61,14 +68,22 @@ impl<T: IntoInner<ConsensusMessage> + HasTimestamp + Clone> InMemoryPoolSection<
             };
         }
 
-        purge!(finalization_share, FinalizationShare);
-        purge!(notarization_share, NotarizationShare);
-
-        if !only_shares {
+        if let Some(artifact_type) = artifact_type {
+            match artifact_type {
+                PurgeableArtifactType::NotarizationShare => {
+                    purge!(notarization_share, NotarizationShare);
+                }
+                PurgeableArtifactType::FinalizationShare => {
+                    purge!(finalization_share, FinalizationShare);
+                }
+            }
+        } else {
             purge!(random_beacon, RandomBeacon);
             purge!(random_beacon_share, RandomBeaconShare);
             purge!(finalization, Finalization);
+            purge!(finalization_share, FinalizationShare);
             purge!(notarization, Notarization);
+            purge!(notarization_share, NotarizationShare);
             purge!(block_proposal, BlockProposal);
             purge!(random_tape, RandomTape);
             purge!(random_tape_share, RandomTapeShare);
@@ -190,6 +205,10 @@ where
             Box::new(std::iter::empty())
         }
     }
+
+    fn size(&self) -> usize {
+        self.select_index::<CryptoHashOf<T>>().size()
+    }
 }
 
 impl<T: IntoInner<ConsensusMessage> + HasTimestamp + Clone> PoolSection<T>
@@ -257,17 +276,15 @@ impl<T: IntoInner<ConsensusMessage> + HasTimestamp + Clone> MutablePoolSection<T
             match op {
                 PoolSectionOp::Insert(artifact) => self.insert(artifact),
                 PoolSectionOp::Remove(msg_id) => {
-                    if self.remove(&msg_id).is_none() {
-                        warn!(self.log, "Error removing artifact {:?}", &msg_id)
-                    } else {
+                    if self.remove(&msg_id).is_some() {
                         purged.push(msg_id)
                     }
                 }
                 PoolSectionOp::PurgeBelow(height) => {
-                    purged.append(&mut self.purge_below(height, /*only_shares=*/ false))
+                    purged.append(&mut self.purge_below(height, None))
                 }
-                PoolSectionOp::PurgeSharesBelow(height) => {
-                    purged.append(&mut self.purge_below(height, /*only_shares=*/ true))
+                PoolSectionOp::PurgeTypeBelow(artifact_type, height) => {
+                    purged.append(&mut self.purge_below(height, Some(artifact_type)))
                 }
             }
         }
@@ -309,10 +326,10 @@ pub mod test {
 
     #[test]
     fn test_iterate_with_large_range() {
-        assert!(ic_test_utilities::with_timeout(
+        assert!(ic_test_utilities_time::with_timeout(
             std::time::Duration::new(12, 0),
             || {
-                let mut pool = InMemoryPoolSection::new(ic_logger::replica_logger::no_op_logger());
+                let mut pool = InMemoryPoolSection::new();
                 let min = Height::from(1);
                 let max = Height::from(std::u64::MAX);
                 pool.insert(make_artifact(fake_random_beacon(min)));
@@ -328,7 +345,7 @@ pub mod test {
 
     #[test]
     fn test_purging() {
-        assert!(ic_test_utilities::with_timeout(
+        assert!(ic_test_utilities_time::with_timeout(
             std::time::Duration::new(12, 0),
             || {
                 let beacons = (1..=10)
@@ -336,7 +353,7 @@ pub mod test {
                     .collect::<Vec<_>>();
                 let ids = beacons.iter().map(|b| b.get_id()).collect::<HashSet<_>>();
 
-                let mut pool = InMemoryPoolSection::new(ic_logger::replica_logger::no_op_logger());
+                let mut pool = InMemoryPoolSection::new();
                 beacons
                     .into_iter()
                     .for_each(|b| pool.insert(make_artifact(b)));
@@ -346,7 +363,8 @@ pub mod test {
                 pool.insert(make_artifact(fake_random_beacon(Height::from(30))));
 
                 let mut ops = PoolSectionOps::new();
-                ops.purge_shares_below(Height::from(20));
+                ops.purge_type_below(PurgeableArtifactType::NotarizationShare, Height::from(20));
+                ops.purge_type_below(PurgeableArtifactType::FinalizationShare, Height::from(20));
                 let result = pool.mutate(ops);
                 assert!(result.is_empty());
 

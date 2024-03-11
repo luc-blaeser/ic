@@ -5,8 +5,10 @@ use crate::driver::{
     resource::{allocate_resources, get_resource_request, ResourceGroup},
     test_env::{TestEnv, TestEnvAttribute},
     test_env_api::{HasRegistryLocalStore, HasTopologySnapshot},
-    test_setup::GroupSetup,
+    test_setup::{GroupSetup, InfraProvider},
 };
+use crate::k8s::tnet::TNet;
+use crate::util::block_on;
 use anyhow::Result;
 use ic_prep_lib::prep_state_directory::IcPrepStateDir;
 use ic_prep_lib::{node::NodeSecretKeyStore, subnet_configuration::SubnetRunningState};
@@ -18,11 +20,12 @@ use ic_types::malicious_behaviour::MaliciousBehaviour;
 use ic_types::p2p::build_default_gossip_config;
 use ic_types::{Height, NodeId, PrincipalId};
 use phantom_newtype::AmountOf;
+use registry_canister::mutations::node_management::do_update_node_ipv4_config_directly::IPv4Config;
 use serde::{Deserialize, Serialize};
 use slog::info;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 
@@ -136,8 +139,14 @@ impl InternetComputer {
         self
     }
 
+    /// Add unassigned node with custom settings.
+    pub fn with_unassigned_node(mut self, node: Node) -> Self {
+        self.unassigned_nodes.push(node);
+        self
+    }
+
     /// Add a single unassigned node with the given IPv4 configuration
-    pub fn with_ipv4_enabled_unassigned_node(mut self, ipv4_config: Ipv4Config) -> Self {
+    pub fn with_ipv4_enabled_unassigned_node(mut self, ipv4_config: IPv4Config) -> Self {
         self.unassigned_nodes.push(
             Node::new_with_settings(
                 self.default_vm_resources,
@@ -213,7 +222,15 @@ impl InternetComputer {
         let group_setup = GroupSetup::read_attribute(env);
         let group_name: String = group_setup.infra_group_name;
         let res_request = get_resource_request(self, env, &group_name)?;
-        let res_group = allocate_resources(&farm, &res_request)?;
+
+        if InfraProvider::read_attribute(env) == InfraProvider::K8s {
+            let image_url = res_request.primary_image.url.clone();
+            let tnet = TNet::read_attribute(env).image_url(image_url.as_ref());
+            block_on(tnet.deploy_guestos_image()).expect("failed to deploy guestos image");
+            tnet.write_attribute(env);
+        }
+
+        let res_group = allocate_resources(&farm, &res_request, env)?;
         self.propagate_ip_addrs(&res_group);
         let init_ic = init_ic(
             self,
@@ -316,7 +333,19 @@ impl InternetComputer {
         }
     }
 
-    pub fn get_ipv4_config_of_node(&self, node_id: NodeId) -> Option<Ipv4Config> {
+    pub fn get_query_stats_epoch_length_of_node(&self, node_id: NodeId) -> Option<u64> {
+        self.subnets
+            .iter()
+            .find(|subnet| {
+                subnet
+                    .nodes
+                    .iter()
+                    .any(|node| node.secret_key_store.as_ref().unwrap().node_id == node_id)
+            })
+            .and_then(|subnet| subnet.query_stats_epoch_length)
+    }
+
+    pub fn get_ipv4_config_of_node(&self, node_id: NodeId) -> Option<IPv4Config> {
         let node_filter_map = |n: &Node| {
             if n.secret_key_store.as_ref().unwrap().node_id == node_id {
                 Some(n.ipv4.clone())
@@ -325,7 +354,7 @@ impl InternetComputer {
             }
         };
         // extract ipv4-enabled nodes all subnet nodes
-        let mut ipv4_enabled_nodes: Vec<Option<Ipv4Config>> = self
+        let mut ipv4_enabled_nodes: Vec<Option<IPv4Config>> = self
             .subnets
             .iter()
             .flat_map(|s| s.nodes.iter().filter_map(node_filter_map))
@@ -335,6 +364,29 @@ impl InternetComputer {
         match ipv4_enabled_nodes.len() {
             0 => None,
             1 => ipv4_enabled_nodes.first().unwrap().clone(),
+            _ => panic!("more than one node has id={node_id}"),
+        }
+    }
+
+    pub fn get_domain_of_node(&self, node_id: NodeId) -> Option<String> {
+        let node_filter_map = |n: &Node| {
+            if n.secret_key_store.as_ref().unwrap().node_id == node_id {
+                Some(n.domain.clone())
+            } else {
+                None
+            }
+        };
+        // extract all matching nodes from all subnet nodes
+        let mut nodes: Vec<Option<String>> = self
+            .subnets
+            .iter()
+            .flat_map(|s| s.nodes.iter().filter_map(node_filter_map))
+            .collect();
+        // extract malicious nodes from all unassigned nodes
+        nodes.extend(self.unassigned_nodes.iter().filter_map(node_filter_map));
+        match nodes.len() {
+            0 => None,
+            1 => nodes.first().unwrap().clone(),
             _ => panic!("more than one node has id={node_id}"),
         }
     }
@@ -367,6 +419,7 @@ pub struct Subnet {
     pub ssh_backup_access: Vec<String>,
     pub ecdsa_config: Option<EcdsaConfig>,
     pub running_state: SubnetRunningState,
+    pub query_stats_epoch_length: Option<u64>,
 }
 
 impl Subnet {
@@ -394,6 +447,7 @@ impl Subnet {
             ssh_backup_access: vec![],
             ecdsa_config: None,
             running_state: SubnetRunningState::Active,
+            query_stats_epoch_length: None,
         }
     }
 
@@ -537,24 +591,37 @@ impl Subnet {
         self
     }
 
+    pub fn with_query_stats_epoch_length(mut self, length: u64) -> Self {
+        self.query_stats_epoch_length = Some(length);
+        self
+    }
+
     pub fn halted(mut self) -> Self {
         self.running_state = SubnetRunningState::Halted;
         self
     }
 
     pub fn add_malicious_nodes(
-        mut self,
+        self,
         no_of_nodes: usize,
         malicious_behaviour: MaliciousBehaviour,
     ) -> Self {
-        for _ in 0..no_of_nodes {
-            let node = Node::new().with_malicious_behaviour(malicious_behaviour.clone());
-            self.nodes.push(node);
-        }
-        self
+        (0..no_of_nodes).fold(self, |subnet, _| {
+            let default_vm_resources = subnet.default_vm_resources;
+            let vm_allocation = subnet.vm_allocation.clone();
+            let required_host_features = subnet.required_host_features.clone();
+            subnet.add_node(
+                Node::new_with_settings(
+                    default_vm_resources,
+                    vm_allocation,
+                    required_host_features,
+                )
+                .with_malicious_behaviour(malicious_behaviour.clone()),
+            )
+        })
     }
 
-    pub fn add_node_with_ipv4(self, ipv4_config: Ipv4Config) -> Self {
+    pub fn add_node_with_ipv4(self, ipv4_config: IPv4Config) -> Self {
         let default_vm_resources = self.default_vm_resources;
         let vm_allocation = self.vm_allocation.clone();
         let required_host_features = self.required_host_features.clone();
@@ -600,6 +667,7 @@ impl Default for Subnet {
             ssh_backup_access: vec![],
             ecdsa_config: None,
             running_state: SubnetRunningState::Active,
+            query_stats_epoch_length: None,
         }
     }
 }
@@ -642,7 +710,8 @@ pub struct Node {
     pub secret_key_store: Option<NodeSecretKeyStore>,
     pub ipv6: Option<Ipv6Addr>,
     pub malicious_behaviour: Option<MaliciousBehaviour>,
-    pub ipv4: Option<Ipv4Config>,
+    pub ipv4: Option<IPv4Config>,
+    pub domain: Option<String>,
 }
 
 impl Node {
@@ -674,15 +743,13 @@ impl Node {
         self
     }
 
-    pub fn with_ipv4_config(mut self, ipv4_config: Ipv4Config) -> Self {
+    pub fn with_ipv4_config(mut self, ipv4_config: IPv4Config) -> Self {
         self.ipv4 = Some(ipv4_config);
         self
     }
-}
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Ipv4Config {
-    pub ip_addr: Ipv4Addr,
-    pub gateway_ip_addr: Ipv4Addr,
-    pub prefix_length: u32,
+    pub fn with_domain(mut self, domain: String) -> Self {
+        self.domain = Some(domain);
+        self
+    }
 }

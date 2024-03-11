@@ -1,30 +1,23 @@
 use crate::{
     manifest::{build_file_group_chunks, filter_out_zero_chunks, DiffScript},
+    state_sync::types::{
+        decode_manifest, decode_meta_manifest, state_sync_chunk_type, FileGroupChunks, Manifest,
+        MetaManifest, StateSyncChunk, StateSyncMessage, FILE_CHUNK_ID_OFFSET,
+        FILE_GROUP_CHUNK_ID_OFFSET, MANIFEST_CHUNK_ID_OFFSET, META_MANIFEST_CHUNK,
+    },
     StateManagerMetrics, StateSyncMetrics, StateSyncRefs,
     CRITICAL_ERROR_STATE_SYNC_CORRUPTED_CHUNKS, LABEL_COPY_CHUNKS, LABEL_COPY_FILES, LABEL_FETCH,
+    LABEL_FETCH_MANIFEST_CHUNK, LABEL_FETCH_META_MANIFEST_CHUNK, LABEL_FETCH_STATE_CHUNK,
     LABEL_PREALLOCATE, LABEL_STATE_SYNC_MAKE_CHECKPOINT,
 };
+use ic_interfaces::p2p::state_sync::{AddChunkError, Chunk, ChunkId, Chunkable};
 use ic_logger::{debug, error, fatal, info, trace, warn, ReplicaLogger};
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::page_map::PageAllocatorFileDescriptor;
 use ic_state_layout::utils::do_copy_overwrite;
 use ic_state_layout::{error::LayoutError, CheckpointLayout, ReadOnly, RwPolicy, StateLayout};
 use ic_sys::mmap::ScopedMmap;
-use ic_types::{
-    artifact::StateSyncMessage,
-    chunkable::{
-        ArtifactChunk,
-        ArtifactErrorCode::{self, ChunkVerificationFailed, ChunksMoreNeeded},
-        ChunkId, Chunkable,
-    },
-    malicious_flags::MaliciousFlags,
-    state_sync::{
-        decode_manifest, decode_meta_manifest, state_sync_chunk_type, FileGroupChunks, Manifest,
-        MetaManifest, StateSyncChunk, FILE_CHUNK_ID_OFFSET, FILE_GROUP_CHUNK_ID_OFFSET,
-        MANIFEST_CHUNK_ID_OFFSET, META_MANIFEST_CHUNK,
-    },
-    CryptoHashOfState, Height,
-};
+use ic_types::{malicious_flags::MaliciousFlags, CryptoHashOfState, Height};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -82,7 +75,7 @@ enum DownloadState {
 /// sync priority function.  When priority function returns "Fetch", P2P calls
 /// StateManager to construct an IncompleteState corresponding to the state
 /// artifact advert.
-pub struct IncompleteState {
+pub(crate) struct IncompleteState {
     log: ReplicaLogger,
     root: PathBuf,
     state_layout: StateLayout,
@@ -171,18 +164,29 @@ impl Drop for IncompleteState {
         let cache = Arc::clone(&self.state_sync_refs.cache);
         cache.write().push(self);
 
-        if self.state_sync_refs.remove(&self.height).is_none() {
-            warn!(
-                self.log,
-                "State sync refs does not contain incomplete state @{}.", self.height,
-            );
+        // Remove the active state sync reference
+        let mut active = self.state_sync_refs.active.write();
+        match active.take() {
+            Some((active_height, _hash)) => {
+                if active_height != self.height {
+                    warn!(
+                        self.log,
+                        "the active state sync reference was for a different height @{}, expected @{}",
+                        active_height,
+                        self.height,
+                    );
+                }
+            }
+            None => {
+                warn!(self.log, "the active state sync reference was None",);
+            }
         }
     }
 }
 
 impl IncompleteState {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn try_new(
         log: ReplicaLogger,
         height: Height,
         root_hash: CryptoHashOfState,
@@ -194,16 +198,22 @@ impl IncompleteState {
         state_sync_refs: StateSyncRefs,
         fd_factory: Arc<dyn PageAllocatorFileDescriptor>,
         malicious_flags: MaliciousFlags,
-    ) -> Self {
-        if state_sync_refs.insert(height, root_hash.clone()).is_some() {
-            // Currently, we don't handle two concurrent fetches of the same state
-            // correctly. This case indicates a non-deterministic bug either in StateManager
-            // or P2P. We'd rather detect this early and crash, the replica
-            // should be able to recover after a restart.
-            fatal!(log, "There is already a live state sync @{}.", height);
+    ) -> Option<IncompleteState> {
+        // The state sync manager in the p2p layer is expected not to start a new state sync when there is an ongoing state sync.
+        // Here we check it again as a last resort and return `None` if there is already an active state sync reference.
+        let mut active = state_sync_refs.active.write();
+        if let Some((active_height, _hash)) = active.as_ref() {
+            warn!(
+                &log,
+                "Attempt to start state sync @{} while we are fetching state @{}",
+                height,
+                active_height
+            );
+            return None;
         }
-
-        Self {
+        *active = Some((height, root_hash.clone()));
+        // Create the `IncompleteState` object while holding the write lock on the active state sync reference.
+        Some(Self {
             log,
             root: state_layout
                 .state_sync_scratchpad(height)
@@ -218,10 +228,10 @@ impl IncompleteState {
             fetch_started_at: None,
             own_subnet_type,
             thread_pool,
-            state_sync_refs,
+            state_sync_refs: state_sync_refs.clone(),
             fd_factory,
             malicious_flags,
-        }
+        })
     }
 
     /// Creates all the files listed in the manifest and resizes them to their
@@ -468,7 +478,7 @@ impl IncompleteState {
                                     let src_offset = chunk.offset as i64;
                                     let dst_offset = chunk.offset as i64;
 
-                                    ic_utils::fs::copy_file_range_all(
+                                    ic_sys::fs::copy_file_range_all(
                                         &src,
                                         src_offset,
                                         &dst,
@@ -695,7 +705,7 @@ impl IncompleteState {
                             let src_offset = src_chunk.offset as i64;
                             let dst_offset = dst_chunk.offset as i64;
 
-                            ic_utils::fs::copy_file_range_all(
+                            ic_sys::fs::copy_file_range_all(
                                 &src,
                                 src_offset,
                                 &dst,
@@ -790,6 +800,7 @@ impl IncompleteState {
             // `state_sync_file_group` and `checkpoint_root` are not included in the integrity hash of this artifact.
             // Therefore it is OK to pass a default value here as it is only used when fetching chunks.
             state_sync_file_group: Default::default(),
+            malicious_flags: Default::default(),
         }
     }
 
@@ -1049,7 +1060,7 @@ impl IncompleteState {
                 .sum();
 
             let preallocate_bytes: u64 =
-                (diff_script.zeros_chunks * crate::manifest::DEFAULT_CHUNK_SIZE) as u64;
+                (diff_script.zeros_chunks * crate::state_sync::types::DEFAULT_CHUNK_SIZE) as u64;
 
             let copy_files_bytes: u64 = diff_script
                 .copy_files
@@ -1127,7 +1138,63 @@ impl IncompleteState {
     }
 }
 
-impl Chunkable for IncompleteState {
+#[cfg(feature = "malicious_code")]
+fn maliciously_alter_chunk_data(
+    mut chunk: Chunk,
+    chunk_id: ChunkId,
+    malicious_flags: &mut MaliciousFlags,
+) -> Chunk {
+    let allowance = match malicious_flags
+        .maliciously_alter_state_sync_chunk_receiving_side
+        .as_mut()
+    {
+        Some(allowance) => allowance,
+        None => {
+            return chunk;
+        }
+    };
+
+    let payload = chunk.clone();
+
+    let ix = chunk_id.get();
+    match state_sync_chunk_type(ix) {
+        StateSyncChunk::MetaManifestChunk => {
+            if allowance.meta_manifest_chunk_error_allowance == 0 {
+                return chunk;
+            }
+            allowance.meta_manifest_chunk_error_allowance -= 1;
+            let meta_manifest = match decode_meta_manifest(&payload) {
+                Ok(meta_manifest) => meta_manifest,
+                Err(_) => {
+                    return chunk;
+                }
+            };
+            chunk = crate::state_sync::types::maliciously_alter_meta_manifest(meta_manifest);
+        }
+        StateSyncChunk::ManifestChunk(_) => {
+            if allowance.manifest_chunk_error_allowance == 0 {
+                return chunk;
+            }
+            allowance.manifest_chunk_error_allowance -= 1;
+            chunk = crate::state_sync::types::maliciously_alter_chunk_payload(payload);
+        }
+        _ => {
+            if allowance.state_chunk_error_allowance == 0 {
+                return chunk;
+            }
+            allowance.state_chunk_error_allowance -= 1;
+            chunk = crate::state_sync::types::maliciously_alter_chunk_payload(payload);
+        }
+    }
+    // Sleep for 15 seconds to allow the replica connecting to more peers for state sync.
+    // Otherwise, the first invalid chunk in the very beginning will immediately fail the state sync
+    // if there is only one peer connected.
+    // Note that this is only an issue for tests not the real system.
+    std::thread::sleep(std::time::Duration::from_secs(15));
+    chunk
+}
+
+impl Chunkable<StateSyncMessage> for IncompleteState {
     fn chunks_to_download(&self) -> Box<dyn Iterator<Item = ChunkId>> {
         match self.state {
             DownloadState::Blank => Box::new(std::iter::once(META_MANIFEST_CHUNK)),
@@ -1157,23 +1224,22 @@ impl Chunkable for IncompleteState {
         }
     }
 
-    fn add_chunk(
-        &mut self,
-        artifact_chunk: ArtifactChunk,
-    ) -> Result<StateSyncMessage, ArtifactErrorCode> {
-        let ix = artifact_chunk.chunk_id.get();
-        let payload = &artifact_chunk.chunk;
+    fn add_chunk(&mut self, chunk_id: ChunkId, chunk: Chunk) -> Result<(), AddChunkError> {
+        #[cfg(feature = "malicious_code")]
+        let chunk = maliciously_alter_chunk_data(chunk, chunk_id, &mut self.malicious_flags);
+        let ix = chunk_id.get();
+        let payload = &chunk;
         match &mut self.state {
-            DownloadState::Complete(ref artifact) => {
+            DownloadState::Complete(_) => {
                 debug!(
                     self.log,
-                    "Received chunk {} on completed state {}", artifact_chunk.chunk_id, self.height
+                    "Received chunk {} on completed state {}", chunk_id, self.height
                 );
 
-                Ok(*artifact.clone())
+                Ok(())
             }
             DownloadState::Blank => {
-                if artifact_chunk.chunk_id == META_MANIFEST_CHUNK {
+                if chunk_id == META_MANIFEST_CHUNK {
                     let meta_manifest = decode_meta_manifest(payload).map_err(|err| {
                         warn!(
                             self.log,
@@ -1181,13 +1247,18 @@ impl Chunkable for IncompleteState {
                             self.height,
                             err
                         );
-                        ChunkVerificationFailed
+                        AddChunkError::Invalid
                     })?;
 
                     crate::manifest::validate_meta_manifest(&meta_manifest, &self.root_hash)
                         .map_err(|err| {
                             warn!(self.log, "Received invalid meta-manifest: {}", err);
-                            ChunkVerificationFailed
+                            self.metrics
+                                .state_sync_metrics
+                                .corrupted_chunks
+                                .with_label_values(&[LABEL_FETCH_META_MANIFEST_CHUNK])
+                                .inc();
+                            AddChunkError::Invalid
                         })?;
                     let manifest_chunks_len = meta_manifest.sub_manifest_hashes.len();
                     debug!(
@@ -1214,13 +1285,13 @@ impl Chunkable for IncompleteState {
                         manifest_chunks,
                     };
 
-                    Err(ChunksMoreNeeded)
+                    Ok(())
                 } else {
                     warn!(
                         self.log,
                         "Received non-meta-manifest chunk {} on blank state {}", ix, self.height
                     );
-                    Err(ChunkVerificationFailed)
+                    Err(AddChunkError::Invalid)
                 }
             }
             DownloadState::Prep {
@@ -1231,18 +1302,18 @@ impl Chunkable for IncompleteState {
                 let manifest_chunk_index = match state_sync_chunk_type(ix) {
                     StateSyncChunk::MetaManifestChunk => {
                         // Have already seen the meta-manifest chunk
-                        return Err(ChunksMoreNeeded);
+                        return Ok(());
                     }
                     StateSyncChunk::ManifestChunk(index) => index as usize,
                     _ => {
                         // Have not requested such chunks
-                        return Err(ChunkVerificationFailed);
+                        return Err(AddChunkError::Invalid);
                     }
                 };
                 debug_assert!(ix >= MANIFEST_CHUNK_ID_OFFSET);
 
                 if !manifest_chunks.contains(&ix) {
-                    return Err(ChunksMoreNeeded);
+                    return Ok(());
                 }
 
                 crate::manifest::validate_sub_manifest(
@@ -1252,7 +1323,13 @@ impl Chunkable for IncompleteState {
                 )
                 .map_err(|err| {
                     warn!(self.log, "Received invalid sub-manifest: {}", err);
-                    ChunkVerificationFailed
+                    self.metrics
+                        .state_sync_metrics
+                        .corrupted_chunks
+                        .with_label_values(&[LABEL_FETCH_MANIFEST_CHUNK])
+                        .inc();
+
+                    AddChunkError::Invalid
                 })?;
                 manifest_in_construction.insert(ix, payload.clone());
                 manifest_chunks.remove(&ix);
@@ -1333,7 +1410,7 @@ impl Chunkable for IncompleteState {
                             .cache
                             .write()
                             .register_successful_sync(self.height);
-                        Ok(artifact)
+                        Ok(())
                     } else {
                         let state_sync_file_group = build_file_group_chunks(&manifest);
 
@@ -1369,10 +1446,10 @@ impl Chunkable for IncompleteState {
                             "state sync enters the loading phase with {} chunks to fetch",
                             num_fetch_chunks,
                         );
-                        Err(ChunksMoreNeeded)
+                        Ok(())
                     }
                 } else {
-                    Err(ChunksMoreNeeded)
+                    Ok(())
                 }
             }
             DownloadState::Loading {
@@ -1390,7 +1467,7 @@ impl Chunkable for IncompleteState {
                 );
 
                 if !fetch_chunks.contains(&(ix as usize)) {
-                    return Err(ChunksMoreNeeded);
+                    return Ok(());
                 }
 
                 // Each index in `chunk_table_indices` is mapped to a piece of payload bytes
@@ -1404,7 +1481,7 @@ impl Chunkable for IncompleteState {
                         // If it is a file group chunk, divide it into pieces according to the `FileGroupChunks`.
                         let chunk_table_indices = state_sync_file_group
                             .get(&index)
-                            .ok_or(ChunkVerificationFailed)?
+                            .ok_or(AddChunkError::Invalid)?
                             .clone();
 
                         let mut cur_offset = 0;
@@ -1418,13 +1495,13 @@ impl Chunkable for IncompleteState {
 
                         if cur_offset != payload.len() {
                             warn!(self.log, "Received invalid file group chunk {}", ix);
-                            return Err(ChunkVerificationFailed);
+                            return Err(AddChunkError::Invalid);
                         }
                         (chunk_table_indices, payload_pieces)
                     }
                     _ => {
                         // meta-manifest/manifest chunks are not expected in the `Loading` phase.
-                        return Err(ChunksMoreNeeded);
+                        return Ok(());
                     }
                 };
 
@@ -1446,9 +1523,9 @@ impl Chunkable for IncompleteState {
                         metrics
                             .state_sync_metrics
                             .corrupted_chunks
-                            .with_label_values(&[LABEL_FETCH])
+                            .with_label_values(&[LABEL_FETCH_STATE_CHUNK])
                             .inc();
-                        ChunkVerificationFailed
+                        AddChunkError::Invalid
                     })?;
                 }
 
@@ -1509,7 +1586,7 @@ impl Chunkable for IncompleteState {
                         meta_manifest,
                     );
 
-                    self.state = DownloadState::Complete(Box::new(artifact.clone()));
+                    self.state = DownloadState::Complete(Box::new(artifact));
                     self.state_sync_refs
                         .cache
                         .write()
@@ -1520,12 +1597,17 @@ impl Chunkable for IncompleteState {
                     if let Some(delay) = self.malicious_flags.delay_state_sync(self.started_at) {
                         info!(self.log, "[MALICIOUS]: Delayed state sync by {:?}", delay);
                     }
-
-                    return Ok(artifact);
                 }
 
-                Err(ChunksMoreNeeded)
+                Ok(())
             }
         }
+    }
+
+    fn completed(&self) -> Option<StateSyncMessage> {
+        if let DownloadState::Complete(state) = &self.state {
+            return Some(*state.clone());
+        }
+        None
     }
 }

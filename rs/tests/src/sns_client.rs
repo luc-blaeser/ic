@@ -1,5 +1,4 @@
-use std::str::FromStr;
-use std::time::SystemTime;
+use std::{str::FromStr, time::SystemTime};
 
 use anyhow::{bail, Context};
 use candid::{Decode, Encode, Principal};
@@ -8,7 +7,6 @@ use dfn_candid::candid_one;
 use ic_agent::{Agent, AgentError};
 use ic_base_types::{CanisterId, PrincipalId, SubnetId};
 use ic_canister_client::Sender;
-use ic_crypto_sha2::Sha256;
 use ic_nervous_system_common::E8;
 use ic_nervous_system_common_test_keys::{
     TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_1_OWNER_PRINCIPAL,
@@ -16,50 +14,53 @@ use ic_nervous_system_common_test_keys::{
 use ic_nervous_system_proto::pb::v1::{Duration, Image, Percentage, Tokens};
 use ic_nns_common::pb::v1::NeuronId;
 use ic_nns_constants::SNS_WASM_CANISTER_ID;
-use ic_nns_governance::pb::v1::create_service_nervous_system::governance_parameters::VotingRewardParameters;
-use ic_nns_governance::pb::v1::create_service_nervous_system::{
-    initial_token_distribution::{
-        developer_distribution::NeuronDistribution, DeveloperDistribution, SwapDistribution,
-        TreasuryDistribution,
+use ic_nns_governance::{
+    init::TEST_NEURON_1_ID,
+    pb::v1::{
+        create_service_nervous_system::{
+            governance_parameters::VotingRewardParameters,
+            initial_token_distribution::{
+                developer_distribution::NeuronDistribution, DeveloperDistribution,
+                SwapDistribution, TreasuryDistribution,
+            },
+            swap_parameters::NeuronBasketConstructionParameters,
+            GovernanceParameters, InitialTokenDistribution, LedgerParameters, SwapParameters,
+        },
+        manage_neuron::Command,
+        manage_neuron_response::Command as CommandResp,
+        proposal::Action,
+        CreateServiceNervousSystem, ManageNeuron, ManageNeuronResponse, NnsFunction,
+        OpenSnsTokenSwap, Proposal,
     },
-    swap_parameters::NeuronBasketConstructionParameters,
-    GovernanceParameters, InitialTokenDistribution, LedgerParameters, SwapParameters,
 };
-use ic_nns_governance::pb::v1::proposal::Action;
-use ic_nns_governance::pb::v1::CreateServiceNervousSystem;
-use ic_nns_governance::pb::v1::{
-    manage_neuron::Command, manage_neuron_response::Command as CommandResp, ManageNeuron,
-    ManageNeuronResponse, NnsFunction, OpenSnsTokenSwap, Proposal,
-};
-use ic_nns_test_utils::ids::TEST_NEURON_1_ID;
+use ic_nns_test_utils::sns_wasm::ensure_sns_wasm_gzipped;
 use ic_sns_governance::pb::v1::governance::Mode;
 use ic_sns_init::pb::v1::SnsInitPayload;
 use ic_sns_swap::pb::v1::{GetStateRequest, GetStateResponse, Init, Lifecycle};
 use ic_sns_wasm::pb::v1::{
-    AddWasmRequest, DeployNewSnsRequest, DeployNewSnsResponse, SnsCanisterIds, SnsCanisterType,
-    SnsWasm, UpdateAllowedPrincipalsRequest, UpdateSnsSubnetListRequest,
+    AddWasmRequest, SnsCanisterIds, SnsCanisterType, SnsWasm, UpdateSnsSubnetListRequest,
 };
 use ic_types::Cycles;
 use serde::{Deserialize, Serialize};
 use slog::info;
 
-use crate::canister_agent::HasCanisterAgentCapability;
-use crate::canister_api::{CallMode, ListDeployedSnsesRequest, SnsRequestProvider};
-use crate::driver::test_env::TestEnvAttribute;
-use crate::driver::test_env_api::{HasDependencies, NnsCanisterWasmStrategy};
-use crate::util::deposit_cycles;
 use crate::{
+    canister_agent::HasCanisterAgentCapability,
+    canister_api::{CallMode, ListDeployedSnsesRequest, SnsRequestProvider},
     driver::{
-        test_env::TestEnv,
-        test_env_api::{GetFirstHealthyNodeSnapshot, HasPublicApiUrl, SnsCanisterEnvVars},
+        test_env::{TestEnv, TestEnvAttribute},
+        test_env_api::{
+            GetFirstHealthyNodeSnapshot, HasDependencies, HasPublicApiUrl, NnsCanisterWasmStrategy,
+            SnsCanisterEnvVars,
+        },
     },
     nns::{
         get_governance_canister, submit_external_proposal_with_test_id,
         vote_execute_proposal_assert_executed,
     },
     util::{
-        block_on, create_service_nervous_system_into_params, runtime_from_url, to_principal_id,
-        UniversalCanister,
+        block_on, create_service_nervous_system_into_params, deposit_cycles, runtime_from_url,
+        to_principal_id, UniversalCanister,
     },
 };
 
@@ -81,7 +82,7 @@ impl TestEnvAttribute for SnsClient {
 
 impl SnsClient {
     pub fn get_wallet_canister_principal(&self) -> Principal {
-        Principal::try_from(self.wallet_canister_id).unwrap()
+        Principal::from(self.wallet_canister_id)
     }
 
     fn get_wallet_canister<'a>(&self, agent: &'a Agent) -> UniversalCanister<'a> {
@@ -214,63 +215,6 @@ impl SnsClient {
         sns_client
     }
 
-    /// Installs the SNS using the legacy, non-one-proposal flow
-    pub fn install_sns_legacy_and_check_healthy(
-        env: &TestEnv,
-        canister_wasm_strategy: NnsCanisterWasmStrategy,
-        create_service_nervous_system_proposal: CreateServiceNervousSystem,
-    ) -> Self {
-        add_all_wasms_to_sns_wasm(env, canister_wasm_strategy);
-
-        let log = env.logger();
-        let nns_node = env.get_first_healthy_nns_node_snapshot();
-        let runtime = runtime_from_url(nns_node.get_public_url(), nns_node.effective_canister_id());
-        let app_node = env.get_first_healthy_application_node_snapshot();
-        let subnet_id = app_node.subnet_id().unwrap();
-        let agent = app_node.build_default_agent();
-
-        info!(log, "Creating new canister with cycles");
-        let wallet_canister = block_on(UniversalCanister::new_with_cycles_with_retries(
-            &agent,
-            app_node.effective_canister_id(),
-            900_000_000_000_000_000u64,
-            &log,
-        ));
-        let principal_id = PrincipalId(wallet_canister.canister_id());
-
-        info!(log, "Adding canister principal to SNS deploy whitelist");
-        block_on(add_principal_to_sns_deploy_whitelist(
-            &runtime,
-            principal_id,
-        ));
-
-        info!(log, "Adding subnet {subnet_id} to SNS deploy whitelist");
-        block_on(add_subnet_to_sns_deploy_whitelist(&runtime, subnet_id));
-
-        info!(log, "Sending deploy_new_sns to SNS WASM canister");
-        let init = SnsInitPayload::try_from(create_service_nervous_system_proposal)
-            .expect("invalid init payload")
-            .strip_non_legacy_parameters();
-        let res =
-            block_on(deploy_new_sns_legacy(&wallet_canister, init)).expect("Deploy new SNS failed");
-        info!(log, "Received {res:?}");
-        if let Some(error) = res.error {
-            panic!("DeployNewSnsResponse returned error: {error:?}");
-        }
-        assert_eq!(res.subnet_id.expect("No subnet ID"), subnet_id.get());
-        let sns_canisters = res.canisters.expect("No canister IDs");
-        let wallet_canister_id = to_principal_id(&wallet_canister.canister_id());
-
-        let sns_client = Self {
-            sns_canisters,
-            wallet_canister_id,
-            sns_wasm_canister_id: SNS_WASM_CANISTER_ID.get(),
-        };
-        block_on(sns_client.assert_state(env, Lifecycle::Pending, Mode::PreInitializationSwap));
-        sns_client.write_attribute(env);
-        sns_client
-    }
-
     pub fn get_sns_client_for_static_testnet(env: &TestEnv) -> SnsClient {
         let sns_canisters_str =
             std::env::var("SNS_CANISTERS").expect("variable SNS_CANISTERS not specified");
@@ -306,7 +250,7 @@ impl SnsClient {
 /// These parameters should be the one used "by default" for most tests, to ensure
 /// that the tests are using realistic parameters.
 pub fn openchat_create_service_nervous_system_proposal() -> CreateServiceNervousSystem {
-    let init: SnsInitPayload = SnsInitPayload::with_valid_values_for_testing();
+    let init: SnsInitPayload = SnsInitPayload::with_valid_values_for_testing_post_execution();
     CreateServiceNervousSystem {
         name: init.name,
         description: init.description,
@@ -420,7 +364,7 @@ pub fn add_all_wasms_to_sns_wasm(env: &TestEnv, canister_wasm_strategy: NnsCanis
         (SnsCanisterType::Ledger, "ic-icrc1-ledger"),
         (SnsCanisterType::Swap, "sns-swap-canister"),
         (SnsCanisterType::Archive, "ic-icrc1-archive"),
-        (SnsCanisterType::Index, "ic-icrc1-index"),
+        (SnsCanisterType::Index, "ic-icrc1-index-ng"),
     ];
     info!(logger, "Setting SNS canister environment variables");
     match canister_wasm_strategy {
@@ -461,36 +405,20 @@ async fn add_wasm_to_sns_wasm(
     let governance_canister = get_governance_canister(nns_api);
 
     let wasm = Project::cargo_bin_maybe_from_env(bin_name, &[]);
-    let wasm_hash = Sha256::hash(&wasm.clone().bytes()).to_vec();
+    let sns_wasm = SnsWasm {
+        wasm: wasm.bytes(),
+        canister_type: canister_type.into(),
+    };
+    let sns_wasm = ensure_sns_wasm_gzipped(sns_wasm);
+    let wasm_hash = sns_wasm.sha256_hash();
     let proposal_payload = AddWasmRequest {
-        wasm: Some(SnsWasm {
-            wasm: wasm.bytes(),
-            canister_type: canister_type.into(),
-        }),
-        hash: wasm_hash,
+        wasm: Some(sns_wasm),
+        hash: wasm_hash.to_vec(),
     };
 
     let proposal_id = submit_external_proposal_with_test_id(
         &governance_canister,
         NnsFunction::AddSnsWasm,
-        proposal_payload,
-    )
-    .await;
-
-    vote_execute_proposal_assert_executed(&governance_canister, proposal_id).await;
-}
-
-/// Send and execute a proposal to add the given principal ID to the SNS deploy whitelist
-async fn add_principal_to_sns_deploy_whitelist(nns_api: &'_ Runtime, principal_id: PrincipalId) {
-    let governance_canister = get_governance_canister(nns_api);
-    let proposal_payload = UpdateAllowedPrincipalsRequest {
-        added_principals: vec![principal_id],
-        removed_principals: vec![],
-    };
-
-    let proposal_id = submit_external_proposal_with_test_id(
-        &governance_canister,
-        NnsFunction::UpdateAllowedPrincipals,
         proposal_payload,
     )
     .await;
@@ -595,27 +523,6 @@ async fn deploy_new_sns_via_proposal(
         bail!("not exactly one sns exists: {current_snses:?}")
     }
     Ok(SnsCanisterIds::from(current_snses.instances[0].clone()))
-}
-
-/// Send a "deploy_new_sns" request to the SNS WASM canister by forwarding it
-/// with cycles through the given canister. (This is the legacy flow, not the
-/// one-proposal flow.)
-async fn deploy_new_sns_legacy(
-    canister: &UniversalCanister<'_>,
-    init: SnsInitPayload,
-) -> Result<DeployNewSnsResponse, AgentError> {
-    let sns_deploy = DeployNewSnsRequest {
-        sns_init_payload: Some(init),
-    };
-    canister
-        .forward_with_cycles_to(
-            &SNS_WASM_CANISTER_ID.get().into(),
-            "deploy_new_sns",
-            Encode!(&sns_deploy).unwrap(),
-            Cycles::from(180_000_000_000_000u64),
-        )
-        .await
-        .map(|res| Decode!(res.as_slice(), DeployNewSnsResponse).expect("failed to decode"))
 }
 
 /// Call "get_state" on the SNS swap canister with the given ID by forwarding it

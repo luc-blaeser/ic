@@ -25,6 +25,7 @@ use ic_registry_client_helpers::{
     subnet::SubnetRegistry,
 };
 use ic_replicated_state::ReplicatedState;
+use ic_types::consensus::SummaryPayload;
 use ic_types::crypto::{CombinedThresholdSig, CombinedThresholdSigOf, CryptoHash};
 use ic_types::{
     artifact::{Priority, PriorityFn},
@@ -1513,7 +1514,13 @@ pub fn make_registry_cup_from_cup_contents(
     let block = Block {
         version: replica_version.clone(),
         parent: Id::from(CryptoHash(Vec::new())),
-        payload: Payload::new(crypto_hash, (dkg_summary, ecdsa_summary).into()),
+        payload: Payload::new(
+            crypto_hash,
+            BlockPayload::Summary(SummaryPayload {
+                dkg: dkg_summary,
+                ecdsa: ecdsa_summary,
+            }),
+        ),
         height: cup_height,
         rank: Rank(0),
         context: ValidationContext {
@@ -1539,6 +1546,7 @@ pub fn make_registry_cup_from_cup_contents(
             HashedBlock::new(crypto_hash, block),
             HashedRandomBeacon::new(crypto_hash, random_beacon),
             Id::from(CryptoHash(cup_contents.state_hash)),
+            /* oldest_registry_version_in_use_by_replicated_state */ None,
         ),
         signature: ThresholdSignature {
             signer: high_dkg_id,
@@ -1552,17 +1560,21 @@ fn bootstrap_ecdsa_summary_from_cup_contents(
     subnet_id: SubnetId,
     logger: &ReplicaLogger,
 ) -> Result<ecdsa::Summary, String> {
-    let Some((key_id, dealings)) =
-        inspect_ecdsa_initializations(&cup_contents.ecdsa_initializations)?
-    else {
+    let initial_dealings = inspect_ecdsa_initializations(&cup_contents.ecdsa_initializations)?;
+    if initial_dealings.is_empty() {
         return Ok(None);
     };
 
+    // TODO(kpop): use all dealings
+    let (key_id, dealings) = initial_dealings
+        .first_key_value()
+        .expect("Should not be empty");
+
     make_bootstrap_summary_with_initial_dealings(
         subnet_id,
-        key_id,
+        key_id.clone(),
         Height::new(cup_contents.height),
-        dealings,
+        dealings.clone(),
         logger,
     )
     .map_err(|err| format!("Failed to create ECDSA summary block: {:?}", err))
@@ -1602,7 +1614,9 @@ mod tests {
         dependencies, dependencies_with_subnet_params,
         dependencies_with_subnet_records_with_raw_state_manager, Dependencies,
     };
-    use ic_crypto_test_utils_ni_dkg::dummy_transcript_for_tests_with_params;
+    use ic_crypto_test_utils_ni_dkg::{
+        dummy_initial_dkg_transcript, dummy_transcript_for_tests_with_params,
+    };
     use ic_interfaces::{
         consensus_pool::ConsensusPool,
         p2p::consensus::{MutablePool, UnvalidatedArtifact},
@@ -1610,9 +1624,7 @@ mod tests {
     use ic_interfaces_registry::RegistryVersionedRecord;
     use ic_logger::replica_logger::no_op_logger;
     use ic_metrics::MetricsRegistry;
-    use ic_protobuf::registry::subnet::v1::{
-        CatchUpPackageContents, InitialNiDkgTranscriptRecord, SubnetRecord,
-    };
+    use ic_protobuf::registry::subnet::v1::{CatchUpPackageContents, SubnetRecord};
     use ic_replicated_state::metadata_state::subnet_call_context_manager::{
         SetupInitialDkgContext, SubnetCallContext,
     };
@@ -1620,7 +1632,6 @@ mod tests {
     use ic_test_utilities::{
         consensus::fake::FakeContentSigner,
         crypto::CryptoReturningOk,
-        mock_time,
         state_manager::RefMockStateManager,
         types::ids::{node_test_id, subnet_test_id},
         types::messages::RequestBuilder,
@@ -1962,7 +1973,7 @@ mod tests {
                     &ValidationContext {
                         registry_version: RegistryVersion::from(112),
                         certified_height: Height::from(3),
-                        time: mock_time(),
+                        time: UNIX_EPOCH,
                     },
                     no_op_logger(),
                 )
@@ -3022,7 +3033,7 @@ mod tests {
                             dkg_pool_2.insert(UnvalidatedArtifact {
                                 message,
                                 peer_id: node_test_id(1),
-                                timestamp: ic_test_utilities::mock_time(),
+                                timestamp: ic_types::time::UNIX_EPOCH,
                             });
                         }
                     }
@@ -3228,7 +3239,7 @@ mod tests {
                 let validation_context = ValidationContext {
                     registry_version: registry.get_latest_version(),
                     certified_height: Height::from(0),
-                    time: ic_test_utilities::mock_time(),
+                    time: ic_types::time::UNIX_EPOCH,
                 };
 
                 // STEP 1;
@@ -3363,7 +3374,7 @@ mod tests {
             let context = ValidationContext {
                 registry_version: RegistryVersion::from(5),
                 certified_height: Height::from(0),
-                time: ic_test_utilities::mock_time(),
+                time: ic_types::time::UNIX_EPOCH,
             };
 
             // Advance the blockchain to height `dkg_interval_length - 1`
@@ -3590,7 +3601,8 @@ mod tests {
             );
 
             // Get the latest summary block, which is the genesis block
-            let dkg_block = PoolReader::new(&pool).get_highest_summary_block();
+            let cup = PoolReader::new(&pool).get_highest_catch_up_package();
+            let dkg_block = cup.content.block.as_ref();
             assert_eq!(
                 dkg_block.context.registry_version,
                 RegistryVersion::from(5),
@@ -3601,7 +3613,7 @@ mod tests {
             assert_eq!(dkg_summary.registry_version, RegistryVersion::from(5));
             assert_eq!(dkg_summary.height, Height::from(0));
             assert_eq!(
-                summary.get_oldest_registry_version_in_use(),
+                cup.get_oldest_registry_version_in_use(),
                 RegistryVersion::from(5)
             );
             for tag in TAGS.iter() {
@@ -3640,7 +3652,8 @@ mod tests {
             // Skip till the next DKG summary and make sure the new summary block contains
             // correct data.
             pool.advance_round_normal_operation_n(dkg_interval_length);
-            let dkg_block = PoolReader::new(&pool).get_highest_summary_block();
+            let cup = PoolReader::new(&pool).get_highest_catch_up_package();
+            let dkg_block = cup.content.block.as_ref();
             assert_eq!(
                 dkg_block.context.registry_version,
                 RegistryVersion::from(6),
@@ -3653,7 +3666,7 @@ mod tests {
             assert_eq!(dkg_summary.registry_version, RegistryVersion::from(5));
             assert_eq!(dkg_summary.height, Height::from(5));
             assert_eq!(
-                summary.get_oldest_registry_version_in_use(),
+                cup.get_oldest_registry_version_in_use(),
                 RegistryVersion::from(5)
             );
             for tag in TAGS.iter() {
@@ -3694,7 +3707,8 @@ mod tests {
             // Skip till the next DKG summary and make sure the new summary block contains
             // correct data.
             pool.advance_round_normal_operation_n(dkg_interval_length);
-            let dkg_block = PoolReader::new(&pool).get_highest_summary_block();
+            let cup = PoolReader::new(&pool).get_highest_catch_up_package();
+            let dkg_block = cup.content.block.as_ref();
             assert_eq!(
                 dkg_block.context.registry_version,
                 RegistryVersion::from(10),
@@ -3707,7 +3721,7 @@ mod tests {
             assert_eq!(dkg_summary.registry_version, RegistryVersion::from(6));
             assert_eq!(dkg_summary.height, Height::from(10));
             assert_eq!(
-                summary.get_oldest_registry_version_in_use(),
+                cup.get_oldest_registry_version_in_use(),
                 RegistryVersion::from(5)
             );
             for tag in TAGS.iter() {
@@ -3733,7 +3747,8 @@ mod tests {
 
             // Skip till the next DKG round
             pool.advance_round_normal_operation_n(dkg_interval_length + 1);
-            let dkg_block = PoolReader::new(&pool).get_highest_summary_block();
+            let cup = PoolReader::new(&pool).get_highest_catch_up_package();
+            let dkg_block = cup.content.block.as_ref();
             assert_eq!(
                 dkg_block.context.registry_version,
                 RegistryVersion::from(10),
@@ -3746,7 +3761,7 @@ mod tests {
             assert_eq!(dkg_summary.registry_version, RegistryVersion::from(10));
             assert_eq!(dkg_summary.height, Height::from(15));
             assert_eq!(
-                summary.get_oldest_registry_version_in_use(),
+                cup.get_oldest_registry_version_in_use(),
                 RegistryVersion::from(6)
             );
             for tag in TAGS.iter() {
@@ -3770,7 +3785,8 @@ mod tests {
 
             // Skip till the next DKG round
             pool.advance_round_normal_operation_n(dkg_interval_length + 1);
-            let dkg_block = PoolReader::new(&pool).get_highest_summary_block();
+            let cup = PoolReader::new(&pool).get_highest_catch_up_package();
+            let dkg_block = cup.content.block.as_ref();
             assert_eq!(
                 dkg_block.context.registry_version,
                 RegistryVersion::from(10),
@@ -3783,7 +3799,7 @@ mod tests {
             assert_eq!(dkg_summary.registry_version, RegistryVersion::from(10));
             assert_eq!(dkg_summary.height, Height::from(20));
             assert_eq!(
-                summary.get_oldest_registry_version_in_use(),
+                cup.get_oldest_registry_version_in_use(),
                 RegistryVersion::from(10)
             );
             for tag in TAGS.iter() {
@@ -3862,28 +3878,6 @@ mod tests {
         // Not needed for this test
         fn get_version_timestamp(&self, _: RegistryVersion) -> Option<Time> {
             None
-        }
-    }
-
-    /// Creates a Protobuf `InitialNiDkgTranscriptRecord`. Used in the test
-    /// below.
-    fn dummy_initial_dkg_transcript(
-        committee: Vec<NodeId>,
-        tag: NiDkgTag,
-    ) -> InitialNiDkgTranscriptRecord {
-        let threshold = committee.len() as u32 / 3 + 1;
-        let transcript = dummy_transcript_for_tests_with_params(committee, tag, threshold, 0);
-        InitialNiDkgTranscriptRecord {
-            id: Some(transcript.dkg_id.into()),
-            threshold: transcript.threshold.get().get(),
-            committee: transcript
-                .committee
-                .iter()
-                .map(|(_, c)| c.get().to_vec())
-                .collect(),
-            registry_version: 1,
-            internal_csp_transcript: serde_cbor::to_vec(&transcript.internal_csp_transcript)
-                .unwrap(),
         }
     }
 

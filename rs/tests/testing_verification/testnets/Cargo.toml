@@ -7,7 +7,7 @@ description.workspace = true
 documentation.workspace = true
 
 [dependencies]
-anyhow = "1.0.31"
+anyhow = { workspace = true }
 ic-registry-subnet-type = { path = "../../../registry/subnet_type" }
 tests = { path = "../.." }
 ic-mainnet-nns-recovery = { path = "../../nns/ic_mainnet_nns_recovery" }
@@ -32,10 +32,6 @@ path = "single_app_large_node.rs"
 [[bin]]
 name = "single_large_node"
 path = "single_large_node.rs"
-
-[[bin]]
-name = "small_api_boundary"
-path = "small_api_boundary.rs"
 
 [[bin]]
 name = "small_nns"

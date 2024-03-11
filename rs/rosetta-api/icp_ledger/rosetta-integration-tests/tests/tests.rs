@@ -2,7 +2,7 @@ use candid::{CandidType, Decode, Deserialize, Encode, Nat, Principal};
 use ic_agent::agent::http_transport::reqwest_transport::ReqwestHttpReplicaV2Transport;
 use ic_agent::identity::BasicIdentity;
 use ic_agent::{Agent, Identity};
-use ic_ic00_types::{CanisterInstallMode, CreateCanisterArgs, InstallCodeArgs};
+use ic_management_canister_types::{CanisterInstallMode, CreateCanisterArgs, InstallCodeArgs};
 use ic_starter_tests::{ReplicaBins, ReplicaContext, ReplicaStarterConfig};
 use icp_ledger::AccountIdentifier;
 use icp_rosetta_integration_tests::start_rosetta;
@@ -52,14 +52,6 @@ async fn start_replica() -> ReplicaContext {
 fn get_rosetta_path() -> std::path::PathBuf {
     std::fs::canonicalize(std::env::var_os("ROSETTA_PATH").expect("missing ic-rosetta-api binary"))
         .unwrap()
-}
-
-fn get_rosetta_log_config_path() -> std::path::PathBuf {
-    std::fs::canonicalize(
-        std::env::var_os("ROSETTA_LOG_CONFIG_PATH")
-            .expect("missing ic-rosetta-api log_config.yaml"),
-    )
-    .unwrap()
 }
 
 fn icp_ledger_wasm() -> Vec<u8> {
@@ -181,7 +173,7 @@ async fn test() {
         owner: Principal::anonymous(),
         subaccount: None,
     };
-    let amount = Nat::from(10_000_000);
+    let amount = Nat::from(10_000_000_u64);
     let _ = ledger_agent
         .transfer(TransferArg {
             from_subaccount: None,
@@ -196,13 +188,8 @@ async fn test() {
         .expect("Unable to transfer tokens!");
 
     // start rosetta
-    let (client, _rosetta_context) = start_rosetta(
-        &get_rosetta_path(),
-        &get_rosetta_log_config_path(),
-        replica_url,
-        ledger_id,
-    )
-    .await;
+    let (client, _rosetta_context) =
+        start_rosetta(&get_rosetta_path(), replica_url, ledger_id).await;
     let network = client
         .network_list()
         .await

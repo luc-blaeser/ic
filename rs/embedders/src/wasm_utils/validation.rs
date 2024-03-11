@@ -15,13 +15,16 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
 };
 
-use crate::wasm_utils::instrumentation::{
-    ACCESSED_PAGES_COUNTER_GLOBAL_NAME, DIRTY_PAGES_COUNTER_GLOBAL_NAME,
-};
 use crate::wasmtime_embedder::{
     STABLE_BYTEMAP_MEMORY_NAME, STABLE_MEMORY_NAME, WASM_HEAP_MEMORY_NAME,
 };
-use wasmparser::{ExternalKind, FuncType, Operator, StructuralType, TypeRef, ValType};
+use crate::{
+    wasm_utils::instrumentation::{
+        ACCESSED_PAGES_COUNTER_GLOBAL_NAME, DIRTY_PAGES_COUNTER_GLOBAL_NAME,
+    },
+    MAX_WASM_STACK_SIZE, MIN_GUARD_REGION_SIZE,
+};
+use wasmparser::{CompositeType, ExternalKind, FuncType, Operator, TypeRef, ValType};
 
 /// Symbols that are reserved and cannot be exported by canisters.
 #[doc(hidden)] // pub for usage in tests
@@ -35,7 +38,7 @@ pub const RESERVED_SYMBOLS: [&str; 6] = [
 ];
 
 const WASM_FUNCTION_COMPLEXITY_LIMIT: Complexity = Complexity(1_000_000);
-const WASM_FUNCTION_SIZE_LIMIT: usize = 1_000_000;
+pub const WASM_FUNCTION_SIZE_LIMIT: usize = 1_000_000;
 pub const MAX_CODE_SECTION_SIZE_IN_BYTES: u32 = 10 * 1024 * 1024;
 
 // Represents the expected function signature for any System APIs the Internet
@@ -949,8 +952,8 @@ fn validate_import_section(module: &Module) -> Result<WasmImportsDetails, WasmVa
             let field = entry.name;
             match &entry.ty {
                 TypeRef::Func(index) => {
-                    let func_ty = if let StructuralType::Func(func_ty) =
-                        &module.types[*index as usize].structural_type
+                    let func_ty = if let CompositeType::Func(func_ty) =
+                        &module.types[*index as usize].composite_type
                     {
                         func_ty
                     } else {
@@ -1029,11 +1032,14 @@ fn validate_export_section(
     max_sum_exported_function_name_lengths: usize,
 ) -> Result<(), WasmValidationError> {
     if !module.exports.is_empty() {
-        let num_imported_functions = module
+        let imported_function_types: Vec<_> = module
             .imports
             .iter()
-            .filter(|i| matches!(i.ty, TypeRef::Func(_)))
-            .count();
+            .filter_map(|i| match i.ty {
+                TypeRef::Func(type_index) => Some(&module.types[type_index as usize]),
+                _ => None,
+            })
+            .collect();
 
         let mut seen_funcs: HashSet<&str> = HashSet::new();
         let valid_exported_functions = get_valid_exported_functions();
@@ -1093,23 +1099,18 @@ fn validate_export_section(
                     // module, so we need to subtract the number of imported functions to get the
                     // correct index from the general function space.
                     let fn_index = fn_index as usize;
-                    let import_count = num_imported_functions;
-                    if fn_index < import_count {
-                        return Err(WasmValidationError::InvalidFunctionIndex {
-                            index: fn_index,
-                            import_count,
-                        });
-                    }
-                    let actual_fn_index = fn_index - import_count;
-                    let type_index = module.functions[actual_fn_index] as usize;
-                    let func_ty = if let StructuralType::Func(func_ty) =
-                        &module.types[type_index].structural_type
-                    {
-                        func_ty
+                    let import_count = imported_function_types.len();
+                    let composite_type = if fn_index < import_count {
+                        &imported_function_types[fn_index].composite_type
                     } else {
+                        let actual_fn_index = fn_index - import_count;
+                        let type_index = module.functions[actual_fn_index] as usize;
+                        &module.types[type_index].composite_type
+                    };
+                    let CompositeType::Func(func_ty) = composite_type else {
                         return Err(WasmValidationError::InvalidExportSection(format!(
                             "Function export doesn't have a function type. Type found: {:?}",
-                            &module.types[type_index]
+                            composite_type
                         )));
                     };
                     validate_function_signature(valid_signature, export.name, func_ty)?;
@@ -1533,7 +1534,7 @@ fn validate_code_section(
 }
 
 /// Returns a Wasmtime config that is used for Wasm validation.
-pub fn wasmtime_validation_config(embedder_config: &EmbeddersConfig) -> wasmtime::Config {
+pub fn wasmtime_validation_config() -> wasmtime::Config {
     let mut config = wasmtime::Config::default();
 
     // Keep this in the alphabetical order to simplify comparison with new
@@ -1576,21 +1577,23 @@ pub fn wasmtime_validation_config(embedder_config: &EmbeddersConfig) -> wasmtime
         // with a change in how we create the memories in the implementation
         // of `wasmtime::MemoryCreator`.
         .static_memory_maximum_size(MAX_STABLE_MEMORY_IN_BYTES)
-        .max_wasm_stack(embedder_config.max_wasm_stack_size);
+        .guard_before_linear_memory(true)
+        .static_memory_guard_size(MIN_GUARD_REGION_SIZE as u64)
+        .max_wasm_stack(MAX_WASM_STACK_SIZE);
     config
 }
 
-fn can_compile(
-    wasm: &BinaryEncodedWasm,
-    embedder_config: &EmbeddersConfig,
-) -> Result<(), WasmValidationError> {
-    let mut config = wasmtime_validation_config(embedder_config);
+#[test]
+fn can_create_engine_from_validation_config() {
+    let config = wasmtime_validation_config();
+    wasmtime::Engine::new(&config).expect("Cannot create engine from validation config");
+}
+
+fn can_compile(wasm: &BinaryEncodedWasm) -> Result<(), WasmValidationError> {
+    let mut config = wasmtime_validation_config();
     // Support 64-bit main memory.
     config.wasm_memory64(true);
-
-    let engine = wasmtime::Engine::new(&config).map_err(|_| {
-        WasmValidationError::WasmtimeValidation(String::from("Failed to initialize Wasm engine"))
-    })?;
+    let engine = wasmtime::Engine::new(&config).expect("Failed to create wasmtime::Engine");
     wasmtime::Module::validate(&engine, wasm.as_slice()).map_err(|err| {
         WasmValidationError::WasmtimeValidation(format!(
             "wasmtime::Module::validate() failed with {}",
@@ -1643,7 +1646,7 @@ pub(super) fn validate_wasm_binary<'a>(
     config: &EmbeddersConfig,
 ) -> Result<(WasmValidationDetails, Module<'a>), WasmValidationError> {
     check_code_section_size(wasm)?;
-    can_compile(wasm, config)?;
+    can_compile(wasm)?;
     let module = Module::parse(wasm.as_slice(), false)
         .map_err(|err| WasmValidationError::DecodingError(format!("{}", err)))?;
     let imports_details = validate_import_section(&module)?;

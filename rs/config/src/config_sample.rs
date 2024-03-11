@@ -80,13 +80,17 @@ pub const SAMPLE_CONFIG: &str = r#"
         // Listening port used by transport to establish peer connections.
         listening_port: 3000,
     },
-    // ============================================
-    // Configuration of IPv4 networking
-    // ============================================
-    ipv4_config: {
+    // =========================================================
+    // Configuration of IPv4 networking (provided at first boot)
+    // =========================================================
+    initial_ipv4_config: {
         public_address: "",
         public_gateway: "",
     },
+    // ============================================
+    // Configuration of the domain name
+    // ============================================
+    domain: "",
     // ============================================
     // Configuration of registry client
     // ============================================
@@ -324,6 +328,7 @@ pub const SAMPLE_CONFIG: &str = r#"
          maliciously_disable_ingress_validation: false,
          maliciously_corrupt_ecdsa_dealings: false,
          maliciously_alter_certified_hash: false,
+         maliciously_alter_state_sync_chunk_sending_side: false,
        },
     },
 

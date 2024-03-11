@@ -7,19 +7,19 @@ description.workspace = true
 documentation.workspace = true
 
 [dependencies]
-bincode = "1.2.1"
-crossbeam-channel = "0.5.8"
+crossbeam-channel = { workspace = true }
 ic-config = { path = "../config" }
+ic-crypto-tls-interfaces = { path = "../crypto/tls_interfaces" }
 ic-interfaces = { path = "../interfaces" }
 ic-interfaces-registry = { path = "../interfaces/registry" }
 ic-interfaces-transport = { path = "../interfaces/transport" }
+ic-icos-sev = { path = "../ic_os/sev" }
 ic-types = { path = "../types/types" }
 ic-protobuf = { path = "../protobuf" }
 ic-logger = { path = "../monitoring/logger" }
 ic-metrics = { path = "../monitoring/metrics" }
 ic-registry-client-helpers = { path = "../registry/helpers" }
-ic-registry-subnet-type = { path = "../registry/subnet_type" }
-ic-state-manager = { path = "../state_manager" }
+ic-transport = { path = "../transport" }
 linked-hash-map = "0.5.3"
 lru = { version = "0.7.8", default-features = false }
 parking_lot = "0.12.1"
@@ -39,7 +39,6 @@ ic-https-outcalls-adapter-client = { path = "../https_outcalls/client" }
 ic-cycles-account-manager = { path = "../cycles_account_manager" }
 ic-execution-environment = { path = "../execution_environment" }
 ic-interfaces-mocks = { path = "../interfaces/mocks" }
-ic-icos-sev = { path = "../ic_os/sev" }
 ic-logger = { path = "../monitoring/logger" }
 ic-registry-client = { path = "../registry/client" }
 ic-registry-client-fake = { path = "../registry/fake" }

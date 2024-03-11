@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use axum::http::Request;
 use axum::{routing::any, Router};
 use bytes::Bytes;
 use criterion::{
@@ -11,7 +12,6 @@ use criterion::{
     Throughput,
 };
 use either::Either;
-use http::Request;
 use ic_base_types::NodeId;
 use ic_icos_sev::Sev;
 use ic_logger::{replica_logger::no_op_logger, ReplicaLogger};
@@ -19,8 +19,7 @@ use ic_metrics::MetricsRegistry;
 use ic_p2p_test_utils::{
     create_registry_handle, temp_crypto_component_with_tls_keys, RegistryConsensusHandle,
 };
-use ic_peer_manager::SubnetTopology;
-use ic_quic_transport::{DummyUdpSocket, QuicTransport, Transport};
+use ic_quic_transport::{DummyUdpSocket, QuicTransport, SubnetTopology, Transport};
 use ic_types_test_utils::ids::{node_test_id, SUBNET_1};
 use tokio::{
     runtime::{Handle, Runtime},
@@ -123,7 +122,7 @@ fn bench_transport(criterion: &mut Criterion) {
         ))
         .unwrap();
 
-    let test_transport = transports.get(0).unwrap().0.clone();
+    let test_transport = transports.first().unwrap().0.clone();
     let peers: Vec<NodeId> = transports
         .iter()
         .skip(1)

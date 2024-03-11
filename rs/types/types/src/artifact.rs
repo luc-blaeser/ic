@@ -15,32 +15,29 @@
 //! defined in the chunkable module.
 use crate::{
     canister_http::CanisterHttpResponseShare,
-    chunkable::{Chunk, ChunkId},
     consensus::{
         certification::{CertificationMessage, CertificationMessageHash},
         dkg::DkgMessageId,
         dkg::Message as DkgMessage,
         ecdsa::{EcdsaArtifactId, EcdsaMessage, EcdsaMessageAttribute},
         ConsensusMessage, ConsensusMessageAttribute, ConsensusMessageHash,
-        ConsensusMessageHashable,
+        ConsensusMessageHashable, HasHash, HasHeight,
     },
     crypto::{crypto_hash, CryptoHash},
     filetree_sync::{FileTreeSyncArtifact, FileTreeSyncId},
     messages::{HttpRequestError, MessageId, SignedIngress, SignedRequestBytes},
     p2p::GossipAdvert,
-    CryptoHashOfState, Height, NodeId, Time,
+    Height, NodeId, Time,
 };
 use derive_more::{AsMut, AsRef, From, TryInto};
 #[cfg(test)]
 use ic_exhaustive_derive::ExhaustiveSet;
-use ic_protobuf::p2p::v1 as p2p_pb;
 use ic_protobuf::proxy::{try_from_option_field, ProxyDecodeError};
 use ic_protobuf::types::{v1 as pb, v1::artifact::Kind};
 use serde::{Deserialize, Serialize};
 use std::{
     convert::{TryFrom, TryInto},
     hash::Hash,
-    sync::Arc,
 };
 use strum_macros::{EnumIter, IntoStaticStr};
 
@@ -56,7 +53,6 @@ pub enum Artifact {
     EcdsaMessage(EcdsaMessage),
     CanisterHttpMessage(CanisterHttpResponseShare),
     FileTreeSync(FileTreeSyncArtifact),
-    StateSync(StateSyncMessage),
 }
 
 /// Artifact attribute type.
@@ -164,8 +160,6 @@ pub enum ArtifactTag {
     FileTreeSyncArtifact,
     #[strum(serialize = "ingress")]
     IngressArtifact,
-    #[strum(serialize = "state_sync")]
-    StateSyncArtifact,
 }
 
 impl std::fmt::Display for ArtifactTag {
@@ -181,7 +175,6 @@ impl std::fmt::Display for ArtifactTag {
                 ArtifactTag::EcdsaArtifact => "ECDSA",
                 ArtifactTag::FileTreeSyncArtifact => "FileTreeSync",
                 ArtifactTag::IngressArtifact => "Ingress",
-                ArtifactTag::StateSyncArtifact => "StateSync",
             }
         )
     }
@@ -213,7 +206,6 @@ impl From<&Artifact> for ArtifactTag {
             Artifact::EcdsaMessage(_) => ArtifactTag::EcdsaArtifact,
             Artifact::CanisterHttpMessage(_) => ArtifactTag::CanisterHttpArtifact,
             Artifact::FileTreeSync(_) => ArtifactTag::FileTreeSyncArtifact,
-            Artifact::StateSync(_) => ArtifactTag::StateSyncArtifact,
         }
     }
 }
@@ -378,6 +370,30 @@ pub struct ConsensusMessageId {
     pub height: Height,
 }
 
+impl HasHeight for ConsensusMessageId {
+    fn height(&self) -> Height {
+        self.height
+    }
+}
+
+impl HasHash for ConsensusMessageId {
+    fn hash(&self) -> &CryptoHash {
+        match &self.hash {
+            ConsensusMessageHash::RandomBeacon(hash) => hash.get_ref(),
+            ConsensusMessageHash::Finalization(hash) => hash.get_ref(),
+            ConsensusMessageHash::Notarization(hash) => hash.get_ref(),
+            ConsensusMessageHash::BlockProposal(hash) => hash.get_ref(),
+            ConsensusMessageHash::RandomBeaconShare(hash) => hash.get_ref(),
+            ConsensusMessageHash::NotarizationShare(hash) => hash.get_ref(),
+            ConsensusMessageHash::FinalizationShare(hash) => hash.get_ref(),
+            ConsensusMessageHash::RandomTape(hash) => hash.get_ref(),
+            ConsensusMessageHash::RandomTapeShare(hash) => hash.get_ref(),
+            ConsensusMessageHash::CatchUpPackage(hash) => hash.get_ref(),
+            ConsensusMessageHash::CatchUpPackageShare(hash) => hash.get_ref(),
+        }
+    }
+}
+
 impl From<ConsensusMessageId> for pb::ConsensusMessageId {
     fn from(value: ConsensusMessageId) -> Self {
         Self {
@@ -485,6 +501,21 @@ pub struct CertificationMessageId {
     pub height: Height,
 }
 
+impl HasHeight for CertificationMessageId {
+    fn height(&self) -> Height {
+        self.height
+    }
+}
+
+impl HasHash for CertificationMessageId {
+    fn hash(&self) -> &CryptoHash {
+        match &self.hash {
+            CertificationMessageHash::Certification(hash) => hash.get_ref(),
+            CertificationMessageHash::CertificationShare(hash) => hash.get_ref(),
+        }
+    }
+}
+
 impl From<CertificationMessageId> for pb::CertificationMessageId {
     fn from(value: CertificationMessageId) -> Self {
         Self {
@@ -528,6 +559,19 @@ impl From<&CertificationMessage> for CertificationMessageId {
     }
 }
 
+impl From<&CertificationMessage> for CertificationMessageHash {
+    fn from(msg: &CertificationMessage) -> CertificationMessageHash {
+        match msg {
+            CertificationMessage::Certification(cert) => {
+                CertificationMessageHash::Certification(crypto_hash(cert))
+            }
+            CertificationMessage::CertificationShare(share) => {
+                CertificationMessageHash::CertificationShare(crypto_hash(share))
+            }
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // ECDSA artifacts
 
@@ -537,144 +581,6 @@ pub type EcdsaMessageId = EcdsaArtifactId;
 // CanisterHttp artifacts
 
 pub type CanisterHttpResponseId = CanisterHttpResponseShare;
-
-// ------------------------------------------------------------------------------
-// StateSync artifacts.
-
-/// Identifier of a state sync artifact.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct StateSyncArtifactId {
-    pub height: Height,
-    pub hash: CryptoHashOfState,
-}
-
-/// State sync message.
-//
-// NOTE: StateSyncMessage is never persisted or transferred over the wire
-// (despite the Serialize/Deserialize bounds imposed by P2P interfaces), that's
-// why it's fine to include an absolute path into it.
-//
-// P2P will call get_chunk() on it to get a byte array to send to a peer, and
-// this byte array will be read from the FS.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StateSyncMessage {
-    pub height: Height,
-    pub root_hash: CryptoHashOfState,
-    /// Absolute path to the checkpoint root directory.
-    pub checkpoint_root: std::path::PathBuf,
-    #[serde(serialize_with = "ic_utils::serde_arc::serialize_arc")]
-    #[serde(deserialize_with = "ic_utils::serde_arc::deserialize_arc")]
-    pub meta_manifest: Arc<crate::state_sync::MetaManifest>,
-    /// The manifest containing the summary of the content.
-    pub manifest: crate::state_sync::Manifest,
-    #[serde(serialize_with = "ic_utils::serde_arc::serialize_arc")]
-    #[serde(deserialize_with = "ic_utils::serde_arc::deserialize_arc")]
-    pub state_sync_file_group: Arc<crate::state_sync::FileGroupChunks>,
-}
-
-impl StateSyncMessage {
-    pub fn get_chunk(&self, chunk_id: ChunkId) -> Option<Chunk> {
-        #[cfg(not(target_family = "unix"))]
-        {
-            let _keep_clippy_quiet = chunk_id;
-            panic!("This method should only be used when the target OS family is unix.");
-        }
-
-        #[cfg(target_family = "unix")]
-        {
-            use crate::state_sync::{
-                encode_manifest, encode_meta_manifest, state_sync_chunk_type, StateSyncChunk,
-                DEFAULT_CHUNK_SIZE,
-            };
-            use std::os::unix::fs::FileExt;
-
-            let get_single_chunk = |chunk_index: usize| -> Option<Vec<u8>> {
-                let chunk = self.manifest.chunk_table.get(chunk_index).cloned()?;
-                let path = self
-                    .checkpoint_root
-                    .join(&self.manifest.file_table[chunk.file_index as usize].relative_path);
-                let mut buf = vec![0; chunk.size_bytes as usize];
-                let f = std::fs::File::open(path).ok()?;
-                f.read_exact_at(&mut buf[..], chunk.offset).ok()?;
-                Some(buf)
-            };
-
-            let mut payload: Vec<u8> = Vec::new();
-            match state_sync_chunk_type(chunk_id.get()) {
-                StateSyncChunk::MetaManifestChunk => {
-                    payload = encode_meta_manifest(&self.meta_manifest);
-                }
-                StateSyncChunk::ManifestChunk(index) => {
-                    let index = index as usize;
-                    if index < self.meta_manifest.sub_manifest_hashes.len() {
-                        let encoded_manifest = encode_manifest(&self.manifest);
-                        let start = index * DEFAULT_CHUNK_SIZE as usize;
-                        let end = std::cmp::min(
-                            start + DEFAULT_CHUNK_SIZE as usize,
-                            encoded_manifest.len(),
-                        );
-                        let sub_manifest = encoded_manifest.get(start..end).unwrap_or_else(||
-                            panic!("We cannot get the {}th piece of the encoded manifest. The manifest and/or meta-manifest must be in abnormal state.", index)
-                        );
-                        payload = sub_manifest.to_vec();
-                    } else {
-                        // The chunk request is either malicious or invalid due to the collision between normal file chunks and manifest chunks.
-                        // Neither case could be resolved and a `None` has to be returned in both cases.
-                        return None;
-                    }
-                }
-                StateSyncChunk::FileGroupChunk(index) => {
-                    if let Some(chunk_table_indices) = self.state_sync_file_group.get(&index) {
-                        for chunk_table_index in chunk_table_indices {
-                            payload.extend(get_single_chunk(*chunk_table_index as usize)?);
-                        }
-                    } else {
-                        return None;
-                    }
-                }
-                StateSyncChunk::FileChunk(index) => {
-                    payload = get_single_chunk(index as usize)?;
-                }
-            }
-
-            Some(payload)
-        }
-    }
-}
-
-/// Used to satisfy `ArtifactKind` trait. This is needed as long as the old state sync version exists.
-impl From<()> for StateSyncMessage {
-    fn from(_: ()) -> Self {
-        unreachable!()
-    }
-}
-
-/// Used to satisfy `ArtifactKind` trait. This is needed as long as the old state sync version exists.
-impl From<StateSyncMessage> for () {
-    fn from(_: StateSyncMessage) -> Self {
-        unreachable!()
-    }
-}
-
-// We need a custom Hash instance to skip checkpoint_root in order
-// for integrity_hash to produce the same result on different nodes.
-//
-// Clippy gives a warning about having a derived PartialEq but a
-// hand-rolled Hash instance. In our case this is acceptable because:
-//
-// 1. We only use use Hash for integrity check.
-//
-// 2. Even if we use it for other purposes (e.g. in a HashSet), this
-//    is still safe because identical (height, root_hash) should
-//    lead to identical checkpoint_root.
-#[allow(clippy::derived_hash_with_manual_eq)]
-impl std::hash::Hash for StateSyncMessage {
-    fn hash<Hasher: std::hash::Hasher>(&self, state: &mut Hasher) {
-        self.height.hash(state);
-        self.root_hash.hash(state);
-        self.manifest.hash(state);
-    }
-}
 
 // ------------------------------------------------------------------------------
 // Conversions
@@ -689,7 +595,6 @@ impl From<Artifact> for pb::Artifact {
             Artifact::EcdsaMessage(x) => Kind::Ecdsa(x.into()),
             Artifact::CanisterHttpMessage(x) => Kind::HttpShare(x.into()),
             Artifact::FileTreeSync(x) => Kind::FileTreeSync(x.clone().into()),
-            Artifact::StateSync(_) => unimplemented!(),
         };
         Self { kind: Some(kind) }
     }
@@ -713,7 +618,7 @@ impl TryFrom<pb::Artifact> for Artifact {
             Kind::Dkg(x) => Artifact::DkgMessage(x.try_into()?),
             Kind::Ecdsa(x) => Artifact::EcdsaMessage(x.try_into()?),
             Kind::HttpShare(x) => Artifact::CanisterHttpMessage(x.try_into()?),
-            Kind::FileTreeSync(x) => Artifact::FileTreeSync(x.try_into()?),
+            Kind::FileTreeSync(x) => Artifact::FileTreeSync(x.into()),
         })
     }
 }
@@ -775,23 +680,5 @@ impl TryFrom<pb::CertificationMessageFilter> for CertificationMessageFilter {
         Ok(Self {
             height: Height::from(filter.height),
         })
-    }
-}
-
-impl From<StateSyncArtifactId> for p2p_pb::StateSyncId {
-    fn from(id: StateSyncArtifactId) -> Self {
-        Self {
-            height: id.height.get(),
-            hash: id.hash.get().0,
-        }
-    }
-}
-
-impl From<p2p_pb::StateSyncId> for StateSyncArtifactId {
-    fn from(id: p2p_pb::StateSyncId) -> Self {
-        Self {
-            height: Height::from(id.height),
-            hash: CryptoHashOfState::new(CryptoHash(id.hash)),
-        }
     }
 }

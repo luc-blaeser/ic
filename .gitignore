@@ -109,9 +109,6 @@ prestorecon.o
 **/bin/boundary-node-prober
 **/bin/ic-balance-exporter
 
-# Boundary node control plane binary
-boundary-node-control-plane
-
 # Boundary node prober binary
 boundary-node-prober
 
@@ -149,3 +146,5 @@ user.bazelrc
 .viminfo
 .local
 .config
+
+test_tmpdir/**

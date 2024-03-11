@@ -15,12 +15,12 @@ use ic_crypto_tree_hash::{
     flatmap, HashTreeBuilder, HashTreeBuilderImpl, Label, LabeledTree, WitnessGenerator,
     WitnessGeneratorImpl,
 };
-use ic_ic00_types::{
+use ic_ledger_core::block::BlockType;
+use ic_ledger_core::tokens::CheckedSub;
+use ic_management_canister_types::{
     BoundedVec, CanisterIdRecord, CanisterSettingsArgs, CanisterSettingsArgsBuilder,
     CreateCanisterArgs, Method, IC_00,
 };
-use ic_ledger_core::block::BlockType;
-use ic_ledger_core::tokens::CheckedSub;
 use ic_nervous_system_governance::maturity_modulation::{
     MAX_MATURITY_MODULATION_PERMYRIAD, MIN_MATURITY_MODULATION_PERMYRIAD,
 };
@@ -440,6 +440,7 @@ fn main() {
     over_init(|CandidOne(args)| init(args))
 }
 
+#[candid_method(init)]
 fn init(maybe_args: Option<CyclesCanisterInitPayload>) {
     let args =
         maybe_args.expect("Payload is expected to initialization the cycles minting canister.");
@@ -2869,7 +2870,7 @@ mod tests {
 
     #[test]
     fn test_candid_interface_compatibility() {
-        use candid::utils::{service_compatible, CandidSource};
+        use candid_parser::utils::{service_equal, CandidSource};
         use std::path::PathBuf;
 
         candid::export_service!();
@@ -2878,7 +2879,7 @@ mod tests {
         let old_interface =
             PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("cmc.did");
 
-        service_compatible(
+        service_equal(
             CandidSource::Text(&new_interface),
             CandidSource::File(old_interface.as_path()),
         )

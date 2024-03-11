@@ -20,44 +20,36 @@ use crate::metrics::OngoingStateSyncMetrics;
 use crate::routes::{build_chunk_handler_request, parse_chunk_handler_response};
 
 use ic_async_utils::JoinMap;
-use ic_interfaces::p2p::state_sync::StateSyncClient;
+use ic_base_types::NodeId;
+use ic_interfaces::p2p::state_sync::{ChunkId, Chunkable, StateSyncArtifactId, StateSyncClient};
 use ic_logger::{error, info, ReplicaLogger};
 use ic_quic_transport::Transport;
-use ic_types::{
-    artifact::{StateSyncArtifactId, StateSyncMessage},
-    chunkable::ChunkId,
-    chunkable::{ArtifactErrorCode, Chunkable},
-    NodeId,
-};
 use rand::{
     distributions::{Distribution, WeightedIndex},
     rngs::SmallRng,
     SeedableRng,
 };
-use strum_macros::Display;
+use thiserror::Error;
 use tokio::{
     runtime::Handle,
     select,
     sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 
 // TODO: NET-1461 find appropriate value for the parallelism
 const PARALLEL_CHUNK_DOWNLOADS: usize = 10;
 const ONGOING_STATE_SYNC_CHANNEL_SIZE: usize = 200;
 const CHUNK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
-/// Same reasoning as old state sync mechanism:
-/// Maximum timeout for fetching state sync. 10_000s.
-/// Reasoning: Block rate can be as low as 0.1 and we want to allow state sync
-/// to last for 1000 blocks (two checkpoint intervals) -> 1000b/0.1b/s = 10000s
-const STATE_SYNC_TIMEOUT: Duration = Duration::from_secs(10000);
 
-struct OngoingStateSync {
+struct OngoingStateSync<T: Send> {
     log: ReplicaLogger,
     rt: Handle,
     artifact_id: StateSyncArtifactId,
     metrics: OngoingStateSyncMetrics,
     transport: Arc<dyn Transport>,
+    cancellation: CancellationToken,
     // Peer management
     new_peers_rx: Receiver<NodeId>,
     // Peers that advertised state and the number of outstanding chunk downloads to that peer.
@@ -66,39 +58,43 @@ struct OngoingStateSync {
     allowed_downloads: usize,
     chunks_to_download: Box<dyn Iterator<Item = ChunkId> + Send>,
     // Event tasks
-    downloading_chunks: JoinMap<ChunkId, DownloadResult>,
+    downloading_chunks: JoinMap<ChunkId, DownloadResult<T>>,
     // State sync
-    state_sync: Arc<dyn StateSyncClient>,
-    tracker: Arc<Mutex<Box<dyn Chunkable + Send + Sync>>>,
+    state_sync: Arc<dyn StateSyncClient<Message = T>>,
+    tracker: Arc<Mutex<Box<dyn Chunkable<T> + Send>>>,
     state_sync_finished: bool,
 }
 
 pub(crate) struct OngoingStateSyncHandle {
     pub sender: Sender<NodeId>,
+    pub artifact_id: StateSyncArtifactId,
     pub jh: JoinHandle<()>,
+    pub cancellation: CancellationToken,
 }
 
-pub(crate) struct DownloadResult {
+pub(crate) struct DownloadResult<T> {
     peer_id: NodeId,
-    result: Result<Option<StateSyncMessage>, DownloadChunkError>,
+    result: Result<Option<T>, DownloadChunkError>,
 }
 
-pub(crate) fn start_ongoing_state_sync(
+pub(crate) fn start_ongoing_state_sync<T: Send + 'static>(
     log: ReplicaLogger,
     rt: &Handle,
     metrics: OngoingStateSyncMetrics,
-    tracker: Arc<Mutex<Box<dyn Chunkable + Send + Sync>>>,
+    tracker: Arc<Mutex<Box<dyn Chunkable<T> + Send>>>,
     artifact_id: StateSyncArtifactId,
-    state_sync: Arc<dyn StateSyncClient>,
+    state_sync: Arc<dyn StateSyncClient<Message = T>>,
     transport: Arc<dyn Transport>,
+    cancellation: CancellationToken,
 ) -> OngoingStateSyncHandle {
     let (new_peers_tx, new_peers_rx) = tokio::sync::mpsc::channel(ONGOING_STATE_SYNC_CHANNEL_SIZE);
     let ongoing = OngoingStateSync {
         log,
         rt: rt.clone(),
-        artifact_id,
+        artifact_id: artifact_id.clone(),
         metrics,
         transport,
+        cancellation: cancellation.clone(),
         new_peers_rx,
         active_downloads: HashMap::new(),
         allowed_downloads: 0,
@@ -112,20 +108,19 @@ pub(crate) fn start_ongoing_state_sync(
     let jh = rt.spawn(ongoing.run());
     OngoingStateSyncHandle {
         sender: new_peers_tx,
+        artifact_id,
         jh,
+        cancellation,
     }
 }
 
-impl OngoingStateSync {
+impl<T: 'static + Send> OngoingStateSync<T> {
     pub async fn run(mut self) {
-        let state_sync_timeout = tokio::time::sleep(STATE_SYNC_TIMEOUT);
-        tokio::pin!(state_sync_timeout);
         loop {
             select! {
-                _ = &mut state_sync_timeout => {
-                    info!(self.log, "State sync for height {} timed out.", self.artifact_id.height);
-                    break;
-                }
+                () = self.cancellation.cancelled() => {
+                    break
+                },
                 Some(new_peer) = self.new_peers_rx.recv() => {
                     if let Entry::Vacant(e) = self.active_downloads.entry(new_peer) {
                         info!(self.log, "Adding peer {} to ongoing state sync of height {}.", new_peer, self.artifact_id.height);
@@ -146,7 +141,6 @@ impl OngoingStateSync {
                             // Usually it is discouraged to use await in the event loop.
                             // In this case it is ok because the function only is async if state sync completed.
                             self.handle_downloaded_chunk_result(result).await;
-
                             self.spawn_chunk_downloads();
                         }
                         Err(err) => {
@@ -187,12 +181,14 @@ impl OngoingStateSync {
             }
         }
 
-        self.downloading_chunks.shutdown().await;
+        while let Some(Ok((finished, _))) = self.downloading_chunks.join_next().await {
+            self.handle_downloaded_chunk_result(finished).await;
+        }
     }
 
     async fn handle_downloaded_chunk_result(
         &mut self,
-        DownloadResult { peer_id, result }: DownloadResult,
+        DownloadResult { peer_id, result }: DownloadResult<T>,
     ) {
         self.metrics.record_chunk_download_result(&result);
         match result {
@@ -222,6 +218,7 @@ impl OngoingStateSync {
             }
             Err(DownloadChunkError::Overloaded) => {}
             Err(DownloadChunkError::Timeout) => {}
+            Err(DownloadChunkError::Cancelled) => {}
         }
     }
 
@@ -256,7 +253,6 @@ impl OngoingStateSync {
                     let peer_id = *peers.get(dist.sample(&mut small_rng)).expect("Is present");
 
                     self.active_downloads.entry(peer_id).and_modify(|v| *v += 1);
-
                     self.downloading_chunks.spawn_on(
                         chunk,
                         self.metrics
@@ -267,6 +263,7 @@ impl OngoingStateSync {
                                 self.tracker.clone(),
                                 self.artifact_id.clone(),
                                 chunk,
+                                self.cancellation.child_token(),
                                 self.metrics.clone(),
                             )),
                         &self.rt,
@@ -295,18 +292,25 @@ impl OngoingStateSync {
     async fn download_chunk_task(
         peer_id: NodeId,
         client: Arc<dyn Transport>,
-        tracker: Arc<Mutex<Box<dyn Chunkable + Send + Sync>>>,
+        tracker: Arc<Mutex<Box<dyn Chunkable<T> + Send>>>,
         artifact_id: StateSyncArtifactId,
         chunk_id: ChunkId,
+        download_cancel_token: CancellationToken,
         metrics: OngoingStateSyncMetrics,
-    ) -> DownloadResult {
+    ) -> DownloadResult<T> {
         let _timer = metrics.chunk_download_duration.start_timer();
 
-        let response_result = tokio::time::timeout(
-            CHUNK_DOWNLOAD_TIMEOUT,
-            client.rpc(&peer_id, build_chunk_handler_request(artifact_id, chunk_id)),
-        )
-        .await;
+        let response_result = select! {
+            () = download_cancel_token.cancelled() => {
+                return DownloadResult {
+                    peer_id,
+                    result: Err(DownloadChunkError::Cancelled)
+                }
+            }
+            res = tokio::time::timeout(CHUNK_DOWNLOAD_TIMEOUT,client.rpc(&peer_id, build_chunk_handler_request(artifact_id, chunk_id))) => {
+                res
+            }
+        };
 
         let response = match response_result {
             Ok(Ok(response)) => response,
@@ -327,9 +331,16 @@ impl OngoingStateSync {
             }
         };
 
-        let chunk_add_result = tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let chunk = parse_chunk_handler_response(response, chunk_id, metrics)?;
-            Ok(tracker.lock().unwrap().add_chunk(chunk))
+            let mut tracker_guard = tracker.lock().unwrap();
+            tracker_guard.add_chunk(chunk_id, chunk).map_err(|err| {
+                DownloadChunkError::RequestError {
+                    chunk_id,
+                    err: err.to_string(),
+                }
+            })?;
+            Ok(tracker_guard.completed())
         })
         .await
         .map_err(|err| DownloadChunkError::RequestError {
@@ -338,34 +349,29 @@ impl OngoingStateSync {
         })
         .and_then(std::convert::identity);
 
-        let result = match chunk_add_result {
-            Ok(Ok(msg)) => Ok(Some(msg)),
-            Ok(Err(ArtifactErrorCode::ChunksMoreNeeded)) => Ok(None),
-            Ok(Err(ArtifactErrorCode::ChunkVerificationFailed)) => {
-                Err(DownloadChunkError::RequestError {
-                    chunk_id,
-                    err: String::from("Chunk verification failed."),
-                })
-            }
-            Err(err) => Err(err),
-        };
         DownloadResult { peer_id, result }
     }
 }
 
-#[derive(Debug, Clone, Display)]
-#[strum(serialize_all = "snake_case")]
+#[derive(Debug, Clone, Error)]
 pub(crate) enum DownloadChunkError {
     /// Request was processed but requested content was not available.
     /// This error is permanent.
+    #[error("no_content")]
     NoContent,
+    /// Download was cancelled.
+    #[error("cancelled")]
+    Cancelled,
     /// Request was not processed because peer endpoint is overloaded.
     /// This error is transient.
+    #[error("overloaded")]
     Overloaded,
     /// Request was not processed because of a timeout either on the client side or on the server side.
+    #[error("timeout")]
     Timeout,
     /// An unexpected error occurred during the request. Requests to well-behaving peers
     /// do not return a RequestError.
+    #[error("request_error")]
     RequestError { chunk_id: ChunkId, err: String },
 }
 
@@ -375,15 +381,18 @@ mod tests {
 
     use axum::http::{Response, StatusCode};
     use bytes::{Bytes, BytesMut};
+    use ic_interfaces::p2p::state_sync::AddChunkError;
     use ic_metrics::MetricsRegistry;
     use ic_p2p_test_utils::mocks::{MockChunkable, MockStateSync, MockTransport};
     use ic_test_utilities_logger::with_test_replica_logger;
-    use ic_types::{crypto::CryptoHash, CryptoHashOfState, Height};
+    use ic_types::{crypto::CryptoHash, Height};
     use ic_types_test_utils::ids::{NODE_1, NODE_2};
     use prost::Message;
     use tokio::runtime::Runtime;
 
     use super::*;
+    #[derive(Clone)]
+    struct TestMessage;
 
     fn compress_empty_bytes() -> Bytes {
         let mut raw = BytesMut::new();
@@ -408,7 +417,7 @@ mod tests {
                     .body(compress_empty_bytes())
                     .unwrap())
             });
-            let mut c = MockChunkable::default();
+            let mut c = MockChunkable::<TestMessage>::default();
             c.expect_chunks_to_download()
                 .returning(|| Box::new(std::iter::once(ChunkId::from(1))));
 
@@ -420,10 +429,11 @@ mod tests {
                 Arc::new(Mutex::new(Box::new(c))),
                 StateSyncArtifactId {
                     height: Height::from(1),
-                    hash: CryptoHashOfState::new(CryptoHash(vec![])),
+                    hash: CryptoHash(vec![]),
                 },
                 Arc::new(s),
                 Arc::new(t),
+                CancellationToken::new(),
             );
 
             rt.block_on(async move {
@@ -447,11 +457,11 @@ mod tests {
                     .body(compress_empty_bytes())
                     .unwrap())
             });
-            let mut c = MockChunkable::default();
+            let mut c = MockChunkable::<TestMessage>::default();
             c.expect_chunks_to_download()
                 .returning(|| Box::new(std::iter::once(ChunkId::from(1))));
             c.expect_add_chunk()
-                .return_const(Err(ArtifactErrorCode::ChunkVerificationFailed));
+                .return_const(Err(AddChunkError::Invalid));
 
             let rt = Runtime::new().unwrap();
             let ongoing = start_ongoing_state_sync(
@@ -461,10 +471,11 @@ mod tests {
                 Arc::new(Mutex::new(Box::new(c))),
                 StateSyncArtifactId {
                     height: Height::from(1),
-                    hash: CryptoHashOfState::new(CryptoHash(vec![])),
+                    hash: CryptoHash(vec![]),
                 },
                 Arc::new(s),
                 Arc::new(t),
+                CancellationToken::new(),
             );
 
             rt.block_on(async move {
@@ -493,12 +504,12 @@ mod tests {
                     .body(compress_empty_bytes())
                     .unwrap())
             });
-            let mut c = MockChunkable::default();
+            let mut c = MockChunkable::<TestMessage>::default();
             // Endless iterator
             c.expect_chunks_to_download()
                 .returning(|| Box::new(std::iter::once(ChunkId::from(1))));
-            c.expect_add_chunk()
-                .return_const(Err(ArtifactErrorCode::ChunksMoreNeeded));
+            c.expect_add_chunk().return_const(Ok(()));
+            c.expect_completed().return_const(None);
 
             let rt = Runtime::new().unwrap();
             let ongoing = start_ongoing_state_sync(
@@ -508,10 +519,11 @@ mod tests {
                 Arc::new(Mutex::new(Box::new(c))),
                 StateSyncArtifactId {
                     height: Height::from(1),
-                    hash: CryptoHashOfState::new(CryptoHash(vec![])),
+                    hash: CryptoHash(vec![]),
                 },
                 Arc::new(s),
                 Arc::new(t),
+                CancellationToken::new(),
             );
 
             rt.block_on(async move {

@@ -23,7 +23,7 @@ ic-canister-log = { path = "../../rust_canisters/canister_log" }
 ic-canisters-http-types = { path = "../../rust_canisters/http_types" }
 ic-cdk = { workspace = true }
 ic-cdk-macros = { workspace = true }
-ic-ic00-types = { path = "../../types/ic00_types" }
+ic-management-canister-types = { path = "../../types/management_canister_types" }
 ic-metrics-encoder = "1"
 ic-nervous-system-clients = { path = "../../nervous_system/clients" }
 ic-nervous-system-common = { path = "../../nervous_system/common" }
@@ -36,8 +36,10 @@ prost = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
+candid_parser = { workspace = true }
 ic-sns-root-protobuf-generator = { path = "./protobuf_generator" }
 ic-test-utilities-compare-dirs = { path = "../../test_utilities/compare_dirs" }
+maplit = "1.0.2"
 tempfile = "3.1.0"
 tokio = { workspace = true }
 

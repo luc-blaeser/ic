@@ -4,42 +4,54 @@
 /// body. This has to be canonicalized into a PocketIc Operation before we can
 /// deterministically update the PocketIc state machine.
 ///
-use super::state::{InstanceState, OpOut, PocketIcApiState, PocketIcError, UpdateReply};
-use crate::pocket_ic::GetSubnet;
+use super::state::{ApiState, OpOut, PocketIcError, UpdateReply};
 use crate::pocket_ic::{
-    AddCycles, ExecuteIngressMessage, GetCyclesBalance, GetStableMemory, GetTime, PubKey, Query,
-    SetStableMemory, SetTime, Tick,
+    AddCycles, CallRequest, ExecuteIngressMessage, GetCyclesBalance, GetStableMemory, GetSubnet,
+    GetTime, PubKey, Query, QueryRequest, ReadStateRequest, SetStableMemory, SetTime,
+    StatusRequest, Tick,
 };
-use crate::{pocket_ic::PocketIc, BindOperation, BlobStore, InstanceId, Operation};
-use aide::axum::routing::{delete, get, post, ApiMethodRouter};
-use aide::axum::ApiRouter;
-use axum::body::HttpBody;
-use axum::routing::MethodRouter;
+use crate::{pocket_ic::PocketIc, BlobStore, InstanceId, Operation};
+use aide::{
+    axum::routing::{delete, get, post, ApiMethodRouter},
+    axum::ApiRouter,
+    NoApi,
+};
+
 use axum::{
+    body::{Body, Bytes},
     extract::{self, Path, State},
-    headers,
     http::{self, HeaderMap, HeaderName, StatusCode},
+    response::Response,
     Json,
 };
+use axum_extra::headers;
+use axum_extra::headers::HeaderMapExt;
+use backoff::backoff::Backoff;
+use backoff::{ExponentialBackoff, ExponentialBackoffBuilder};
+use hyper::header;
+use ic_http_endpoints_public::cors_layer;
 use ic_types::CanisterId;
 use pocket_ic::common::rest::{
-    self, ApiResponse, RawAddCycles, RawCanisterCall, RawCanisterId, RawCanisterResult, RawCycles,
-    RawSetStableMemory, RawStableMemory, RawSubnetId, RawTime, RawWasmResult, SubnetConfigSet,
+    self, ApiResponse, ExtendedSubnetConfigSet, RawAddCycles, RawCanisterCall, RawCanisterId,
+    RawCanisterResult, RawCycles, RawSetStableMemory, RawStableMemory, RawSubnetId, RawTime,
+    RawWasmResult,
 };
 use pocket_ic::WasmResult;
 use serde::Serialize;
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::{runtime::Runtime, sync::RwLock, time::Instant};
+use tower::ServiceBuilder;
+use tracing::trace;
+
+type PocketHttpResponse = (BTreeMap<String, Vec<u8>>, Vec<u8>);
 
 /// Name of a header that allows clients to specify for how long their are willing to wait for a
 /// response on a open http request.
 pub static TIMEOUT_HEADER_NAME: HeaderName = HeaderName::from_static("processing-timeout-ms");
 
-pub type ApiState = PocketIcApiState<PocketIc>;
-
 #[derive(Clone)]
 pub struct AppState {
-    pub api_state: ApiState,
+    pub api_state: Arc<ApiState>,
     pub min_alive_until: Arc<RwLock<Instant>>,
     pub runtime: Arc<Runtime>,
     pub blob_store: Arc<dyn BlobStore>,
@@ -51,7 +63,7 @@ where
     AppState: extract::FromRef<S>,
 {
     ApiRouter::new()
-        .directory_route("/query", post(handler_query))
+        .directory_route("/query", post(handler_json_query))
         .directory_route("/get_time", get(handler_get_time))
         .directory_route("/get_cycles", post(handler_get_cycles))
         .directory_route("/get_stable_memory", post(handler_get_stable_memory))
@@ -73,6 +85,18 @@ where
         .directory_route("/add_cycles", post(handler_add_cycles))
         .directory_route("/set_stable_memory", post(handler_set_stable_memory))
         .directory_route("/tick", post(handler_tick))
+}
+
+pub fn instance_api_v2_routes<S>() -> ApiRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+    AppState: extract::FromRef<S>,
+{
+    ApiRouter::new()
+        .directory_route("/status", get(handler_status))
+        .directory_route("/canister/:ecid/call", post(handler_call))
+        .directory_route("/canister/:ecid/query", post(handler_query))
+        .directory_route("/canister/:ecid/read_state", post(handler_read_state))
 }
 
 pub fn instances_routes<S>() -> ApiRouter<S>
@@ -97,46 +121,92 @@ where
         //
         // All the state-changing endpoints
         .nest("/:id/update", instance_update_routes())
+        //
+        // All the api v2 endpoints
+        .nest("/:id/api/v2", instance_api_v2_routes())
+        // Configures an IC instance to make progress automatically,
+        // i.e., periodically update the time of the IC instance
+        // to the real time and execute rounds on the subnets.
+        .api_route("/:id/auto_progress", post(auto_progress))
+        //
+        // Stop automatic progress (see endpoint `auto_progress`)
+        // on an IC instance.
+        .api_route("/:id/stop_progress", post(stop_progress))
+        .layer(ServiceBuilder::new().layer(cors_layer()))
 }
 
 async fn run_operation<T: Serialize>(
-    api_state: &ApiState,
+    api_state: Arc<ApiState>,
     instance_id: InstanceId,
     timeout: Option<Duration>,
-    op: impl Operation<TargetType = PocketIc> + Send + Sync + 'static,
+    op: impl Operation + Send + Sync + 'static,
 ) -> (StatusCode, ApiResponse<T>)
 where
     (StatusCode, ApiResponse<T>): From<OpOut>,
 {
-    match api_state
-        .update_with_timeout(op.on_instance(instance_id), timeout)
-        .await
-    {
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            ApiResponse::Error {
-                message: format!("{:?}", e),
-            },
-        ),
-        Ok(update_reply) => match update_reply {
-            // If the op_id of the ongoing operation is the requested one, we return code 202.
-            UpdateReply::Started { state_label, op_id } => (
-                StatusCode::ACCEPTED,
-                ApiResponse::Started {
-                    state_label: format!("{:?}", state_label),
-                    op_id: format!("{:?}", op_id),
-                },
-            ),
-            // Otherwise, the instance is busy with a different computation, so we return 409.
-            UpdateReply::Busy { state_label, op_id } => (
-                StatusCode::CONFLICT,
-                ApiResponse::Busy {
-                    state_label: format!("{:?}", state_label),
-                    op_id: format!("{:?}", op_id),
-                },
-            ),
-            UpdateReply::Output(op_out) => op_out.into(),
-        },
+    let retry_if_busy = op.retry_if_busy();
+    let op = Arc::new(op);
+    let mut retry_policy: ExponentialBackoff = ExponentialBackoffBuilder::new()
+        .with_initial_interval(Duration::from_millis(10))
+        .with_max_interval(Duration::from_secs(1))
+        .with_multiplier(2.0)
+        .with_max_elapsed_time(Some(Duration::from_secs(60 * 5)))
+        .build();
+    loop {
+        match api_state
+            .update_with_timeout(op.clone(), instance_id, timeout)
+            .await
+        {
+            Err(e) => {
+                break (
+                    StatusCode::BAD_REQUEST,
+                    ApiResponse::Error {
+                        message: format!("{:?}", e),
+                    },
+                )
+            }
+            Ok(update_reply) => {
+                match update_reply {
+                    // If the op_id of the ongoing operation is the requested one, we return code 202.
+                    UpdateReply::Started { state_label, op_id } => {
+                        break (
+                            StatusCode::ACCEPTED,
+                            ApiResponse::Started {
+                                state_label: format!("{:?}", state_label),
+                                op_id: format!("{:?}", op_id),
+                            },
+                        )
+                    }
+                    // Otherwise, the instance is busy with a different computation, so we retry (if appliacable) or return 409.
+                    UpdateReply::Busy { state_label, op_id } => {
+                        if retry_if_busy {
+                            trace!("run_operation::retry_busy instance_id={} state_label={:?} op_id={}", instance_id, state_label, op_id.0);
+                            match retry_policy.next_backoff() {
+                                Some(duration) => tokio::time::sleep(duration).await,
+                                None => {
+                                    break (
+                                        StatusCode::TOO_MANY_REQUESTS,
+                                        ApiResponse::Error {
+                                            message: "Service is overloaded, try again later."
+                                                .to_string(),
+                                        },
+                                    )
+                                }
+                            }
+                        } else {
+                            break (
+                                StatusCode::CONFLICT,
+                                ApiResponse::Busy {
+                                    state_label: format!("{:?}", state_label),
+                                    op_id: format!("{:?}", op_id),
+                                },
+                            );
+                        }
+                    }
+                    UpdateReply::Output(op_out) => break op_out.into(),
+                }
+            }
+        }
     }
 }
 
@@ -298,10 +368,39 @@ impl From<OpOut> for (StatusCode, ApiResponse<Vec<u8>>) {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct ApiV2Error(String);
+
+impl From<OpOut>
+    for (
+        StatusCode,
+        ApiResponse<Result<PocketHttpResponse, ApiV2Error>>,
+    )
+{
+    fn from(value: OpOut) -> Self {
+        match value {
+            OpOut::ApiV2Response((status, headers, bytes)) => (
+                StatusCode::from_u16(status).unwrap(),
+                ApiResponse::Success(Ok((headers, bytes))),
+            ),
+            OpOut::Error(PocketIcError::RequestRoutingError(e)) => (
+                StatusCode::BAD_REQUEST,
+                ApiResponse::Success(Err(ApiV2Error(e))),
+            ),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiResponse::Error {
+                    message: "operation returned invalid type".into(),
+                },
+            ),
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------------------------------------------- //
 // Read handlers
 
-pub async fn handler_query(
+pub async fn handler_json_query(
     State(AppState { api_state, .. }): State<AppState>,
     Path(instance_id): Path<InstanceId>,
     headers: HeaderMap,
@@ -313,7 +412,7 @@ pub async fn handler_query(
             let query_op = Query(canister_call);
             // TODO: how to know what run_operation returns, i.e. to what to parse it? (type safety?)
             // (applies to all handlers)
-            let (code, response) = run_operation(&api_state, instance_id, timeout, query_op).await;
+            let (code, response) = run_operation(api_state, instance_id, timeout, query_op).await;
             (code, Json(response))
         }
         Err(e) => (
@@ -332,7 +431,7 @@ pub async fn handler_get_time(
 ) -> (StatusCode, Json<ApiResponse<RawTime>>) {
     let timeout = timeout_or_default(headers);
     let time_op = GetTime {};
-    let (code, response) = run_operation(&api_state, instance_id, timeout, time_op).await;
+    let (code, response) = run_operation(api_state, instance_id, timeout, time_op).await;
     (code, Json(response))
 }
 
@@ -346,7 +445,7 @@ pub async fn handler_get_cycles(
     match CanisterId::try_from(raw_canister_id.canister_id) {
         Ok(canister_id) => {
             let get_op = GetCyclesBalance { canister_id };
-            let (code, response) = run_operation(&api_state, instance_id, timeout, get_op).await;
+            let (code, response) = run_operation(api_state, instance_id, timeout, get_op).await;
             (code, Json(response))
         }
         Err(e) => (
@@ -368,7 +467,7 @@ pub async fn handler_get_stable_memory(
     match CanisterId::try_from(raw_canister_id.canister_id) {
         Ok(canister_id) => {
             let get_op = GetStableMemory { canister_id };
-            let (code, response) = run_operation(&api_state, instance_id, timeout, get_op).await;
+            let (code, response) = run_operation(api_state, instance_id, timeout, get_op).await;
             (code, Json(response))
         }
         Err(e) => (
@@ -390,7 +489,7 @@ pub async fn handler_get_subnet(
     match CanisterId::try_from(raw_canister_id.canister_id) {
         Ok(canister_id) => {
             let op = GetSubnet { canister_id };
-            let (code, res) = run_operation(&api_state, instance_id, timeout, op).await;
+            let (code, res) = run_operation(api_state, instance_id, timeout, op).await;
             (code, Json(res))
         }
         Err(e) => (
@@ -413,8 +512,89 @@ pub async fn handler_pub_key(
         &subnet_id,
     )));
     let op = PubKey { subnet_id };
-    let (code, res) = run_operation(&api_state, instance_id, timeout, op).await;
+    let (code, res) = run_operation(api_state, instance_id, timeout, op).await;
     (code, Json(res))
+}
+
+pub async fn handler_status(
+    State(AppState {
+        api_state, runtime, ..
+    }): State<AppState>,
+    NoApi(Path(instance_id)): NoApi<Path<InstanceId>>,
+    bytes: Bytes,
+) -> (StatusCode, NoApi<Response<Body>>) {
+    let op = StatusRequest { bytes, runtime };
+    handler_api_v2(api_state, instance_id, op).await
+}
+
+pub async fn handler_call(
+    State(AppState {
+        api_state, runtime, ..
+    }): State<AppState>,
+    NoApi(Path((instance_id, effective_canister_id))): NoApi<Path<(InstanceId, CanisterId)>>,
+    bytes: Bytes,
+) -> (StatusCode, NoApi<Response<Body>>) {
+    let op = CallRequest {
+        effective_canister_id,
+        bytes,
+        runtime,
+    };
+    handler_api_v2(api_state, instance_id, op).await
+}
+
+pub async fn handler_query(
+    State(AppState {
+        api_state, runtime, ..
+    }): State<AppState>,
+    NoApi(Path((instance_id, effective_canister_id))): NoApi<Path<(InstanceId, CanisterId)>>,
+    bytes: Bytes,
+) -> (StatusCode, NoApi<Response<Body>>) {
+    let op = QueryRequest {
+        effective_canister_id,
+        bytes,
+        runtime,
+    };
+    handler_api_v2(api_state, instance_id, op).await
+}
+
+pub async fn handler_read_state(
+    State(AppState {
+        api_state, runtime, ..
+    }): State<AppState>,
+    NoApi(Path((instance_id, effective_canister_id))): NoApi<Path<(InstanceId, CanisterId)>>,
+    bytes: Bytes,
+) -> (StatusCode, NoApi<Response<Body>>) {
+    let op = ReadStateRequest {
+        effective_canister_id,
+        bytes,
+        runtime,
+    };
+    handler_api_v2(api_state, instance_id, op).await
+}
+
+async fn handler_api_v2<T: Operation + Send + Sync + 'static>(
+    api_state: Arc<ApiState>,
+    instance_id: InstanceId,
+    op: T,
+) -> (StatusCode, NoApi<Response<Body>>) {
+    let (code, res): (
+        StatusCode,
+        ApiResponse<Result<PocketHttpResponse, ApiV2Error>>,
+    ) = run_operation(api_state, instance_id, None, op).await;
+    let response = match res {
+        ApiResponse::Success(Ok((headers, bytes))) => {
+            let mut resp = Response::builder().status(code);
+            for (name, value) in headers {
+                resp = resp.header(name, value);
+            }
+            resp.body(Body::from(bytes)).unwrap()
+        }
+        ApiResponse::Success(Err(ApiV2Error(e))) => make_plaintext_response(code, e),
+        ApiResponse::Busy { .. } | ApiResponse::Started { .. } | ApiResponse::Error { .. } => {
+            make_plaintext_response(code, format!("{:?}", res))
+        }
+    };
+    (code, NoApi(response))
 }
 
 // ----------------------------------------------------------------------------------------------------------------- //
@@ -430,8 +610,7 @@ pub async fn handler_execute_ingress_message(
     match crate::pocket_ic::CanisterCall::try_from(raw_canister_call) {
         Ok(canister_call) => {
             let ingress_op = ExecuteIngressMessage(canister_call);
-            let (code, response) =
-                run_operation(&api_state, instance_id, timeout, ingress_op).await;
+            let (code, response) = run_operation(api_state, instance_id, timeout, ingress_op).await;
             (code, Json(response))
         }
         Err(e) => (
@@ -453,7 +632,7 @@ pub async fn handler_set_time(
     let op = SetTime {
         time: ic_types::Time::from_nanos_since_unix_epoch(time.nanos_since_epoch),
     };
-    let (code, response) = run_operation(&api_state, instance_id, timeout, op).await;
+    let (code, response) = run_operation(api_state, instance_id, timeout, op).await;
     (code, Json(response))
 }
 
@@ -466,7 +645,7 @@ pub async fn handler_add_cycles(
     let timeout = timeout_or_default(headers);
     match AddCycles::try_from(raw_add_cycles) {
         Ok(add_op) => {
-            let (code, response) = run_operation(&api_state, instance_id, timeout, add_op).await;
+            let (code, response) = run_operation(api_state, instance_id, timeout, add_op).await;
             (code, Json(response))
         }
         Err(e) => (
@@ -492,7 +671,7 @@ pub async fn handler_set_stable_memory(
     let timeout = timeout_or_default(headers);
     match SetStableMemory::from_store(raw, blob_store).await {
         Ok(set_op) => {
-            let (code, response) = run_operation(&api_state, instance_id, timeout, set_op).await;
+            let (code, response) = run_operation(api_state, instance_id, timeout, set_op).await;
             (code, Json(response))
         }
         Err(e) => (
@@ -511,7 +690,7 @@ pub async fn handler_tick(
 ) -> (StatusCode, Json<ApiResponse<()>>) {
     let timeout = timeout_or_default(headers);
     let op = Tick;
-    let (code, res) = run_operation(&api_state, instance_id, timeout, op).await;
+    let (code, res) = run_operation(api_state, instance_id, timeout, op).await;
     (code, Json(res))
 }
 
@@ -520,6 +699,22 @@ pub async fn handler_tick(
 
 pub async fn status() -> StatusCode {
     StatusCode::OK
+}
+
+fn contains_unimplemented(config: ExtendedSubnetConfigSet) -> bool {
+    Iterator::any(
+        &mut vec![config.sns, config.ii, config.fiduciary, config.bitcoin]
+            .into_iter()
+            .flatten()
+            .chain(config.system)
+            .chain(config.application),
+        |spec: pocket_ic::common::rest::SubnetSpec| {
+            spec.get_subnet_id().is_some() || !spec.is_supported()
+        },
+    ) || config
+        .nns
+        .map(|spec| !spec.is_supported())
+        .unwrap_or_default()
 }
 
 /// Create a new empty IC instance from a given subnet configuration.
@@ -531,16 +726,26 @@ pub async fn create_instance(
         runtime,
         blob_store: _,
     }): State<AppState>,
-    extract::Json(subnet_configs): extract::Json<SubnetConfigSet>,
+    extract::Json(subnet_configs): extract::Json<ExtendedSubnetConfigSet>,
 ) -> (StatusCode, Json<rest::CreateInstanceResponse>) {
     if subnet_configs.validate().is_err() {
         return (
             StatusCode::BAD_REQUEST,
             Json(rest::CreateInstanceResponse::Error {
-                message: "Bad config".to_owned(), // TODO: return actual error
+                message: "Bad config".to_owned(),
             }),
         );
     }
+    // TODO: Remove this once the SubnetStateConfig variants are implemented
+    if contains_unimplemented(subnet_configs.clone()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(rest::CreateInstanceResponse::Error {
+                message: "SubnetStateConfig::FromPath is currently only implemented for NNS. SubnetStateConfig::FromBlobStore is not yet implemented".to_owned(),
+            }),
+        );
+    }
+
     let pocket_ic = tokio::task::spawn_blocking(move || PocketIc::new(runtime, subnet_configs))
         .await
         .expect("Failed to launch PocketIC");
@@ -559,17 +764,7 @@ pub async fn create_instance(
 pub async fn list_instances(
     State(AppState { api_state, .. }): State<AppState>,
 ) -> Json<Vec<String>> {
-    let instances = api_state.list_instances().await;
-    let instances: Vec<String> = instances
-        .iter()
-        .map(|instance_state| match instance_state {
-            InstanceState::Busy { state_label, op_id } => {
-                format!("Busy({:?}, {:?})", state_label, op_id)
-            }
-            InstanceState::Available(_) => "Available".to_string(),
-            InstanceState::Deleted => "Deleted".to_string(),
-        })
-        .collect();
+    let instances = api_state.list_instance_states().await;
     Json(instances)
 }
 
@@ -581,29 +776,36 @@ pub async fn delete_instance(
     StatusCode::OK
 }
 
-pub trait RouterExt<S, B>
-where
-    B: HttpBody + Send + 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    fn directory_route(self, path: &str, method_router: ApiMethodRouter<S, B>) -> Self;
+pub async fn auto_progress(
+    State(AppState { api_state, .. }): State<AppState>,
+    Path(id): Path<InstanceId>,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    api_state.auto_progress(id).await;
+    (StatusCode::OK, Json(ApiResponse::Success(())))
 }
 
-impl<S, B> RouterExt<S, B> for ApiRouter<S, B>
+pub async fn stop_progress(
+    State(AppState { api_state, .. }): State<AppState>,
+    Path(id): Path<InstanceId>,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    api_state.stop_progress(id).await;
+    (StatusCode::OK, Json(ApiResponse::Success(())))
+}
+
+pub trait RouterExt<S>
 where
-    B: HttpBody + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    fn directory_route(self, path: &str, method_router: ApiMethodRouter<S, B>) -> Self {
-        // Temporary hack because ApiMethodRouter does not implement clone.
-        // TODO: Fix when this is merged:
-        // https://github.com/tamasfe/aide/issues/89#ref-pullrequest-2016439982
-        let cp1 = MethodRouter::from(method_router);
-        let cp2 = cp1.clone();
-        let method_router1 = ApiMethodRouter::from(cp1);
-        let method_router2 = ApiMethodRouter::from(cp2);
-        self.api_route(path, method_router1)
-            .route(&format!("{path}/"), method_router2)
+    fn directory_route(self, path: &str, method_router: ApiMethodRouter<S>) -> Self;
+}
+
+impl<S> RouterExt<S> for ApiRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    fn directory_route(self, path: &str, method_router: ApiMethodRouter<S>) -> Self {
+        self.api_route(path, method_router.clone())
+            .route(&format!("{path}/"), method_router)
     }
 }
 
@@ -645,7 +847,20 @@ impl headers::Header for ProcessingTimeout {
 }
 
 pub fn timeout_or_default(header_map: HeaderMap) -> Option<Duration> {
-    use headers::HeaderMapExt;
-
     header_map.typed_get::<ProcessingTimeout>().map(|x| x.0)
+}
+
+// ----------------------------------------------------------------------------------------------------------------- //
+// HTTP handler helpers
+
+const CONTENT_TYPE_TEXT: &str = "text/plain";
+
+fn make_plaintext_response(status: StatusCode, message: String) -> Response<Body> {
+    let mut resp = Response::new(Body::from(message));
+    *resp.status_mut() = status;
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static(CONTENT_TYPE_TEXT),
+    );
+    resp
 }

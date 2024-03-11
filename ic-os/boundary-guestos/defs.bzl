@@ -39,7 +39,6 @@ def image_deps(mode, sev = False):
             "//publish/binaries:boundary-node-prober": "/opt/ic/bin/boundary-node-prober:0755",
             "//publish/binaries:certificate-issuer": "/opt/ic/bin/certificate-issuer:0755",
             "//publish/binaries:certificate-syncer": "/opt/ic/bin/certificate-syncer:0755",
-            "//publish/binaries:denylist-updater": "/opt/ic/bin/denylist-updater:0755",
             "//publish/binaries:ic-balance-exporter": "/opt/ic/bin/ic-balance-exporter:0755",
             "//publish/binaries:icx-proxy": "/opt/ic/bin/icx-proxy:0755",
             "//publish/binaries:systemd-journal-gatewayd-shim": "/opt/ic/bin/systemd-journal-gatewayd-shim:0755",
@@ -63,21 +62,6 @@ def image_deps(mode, sev = False):
     }
 
     deps.update(extra_deps[mode])
-
-    extra_rootfs_deps = {
-        "dev": {
-            "//typescript/service-worker:favicon.png": "/var/www/html/favicon.png:0644",
-            "//typescript/service-worker:index.html": "/var/www/html/index.html:0644",
-            "//typescript/service-worker:install-script.js": "/var/www/html/install-script.js:0644",
-            "//typescript/service-worker:install-script.js.map": "/var/www/html/install-script.js.map:0644",
-            "//typescript/service-worker:style.css": "/var/www/html/style.css:0644",
-            "//typescript/service-worker:sw.js": "/var/www/html/sw.js:0644",
-            "//typescript/service-worker:sw.js.map": "/var/www/html/sw.js.map:0644",
-            "//typescript/service-worker:web_bg.wasm": "/var/www/html/web_bg.wasm:0644",
-        },
-    }
-
-    deps["rootfs"].update(extra_rootfs_deps.get(mode, {}))
 
     if sev:
         sev_rootfs_deps = {

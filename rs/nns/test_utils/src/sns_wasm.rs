@@ -1,9 +1,6 @@
 use crate::{
     common::modify_wasm_bytes,
-    ids::TEST_NEURON_1_ID,
-    state_test_helpers::{
-        query, try_call_with_cycles_via_universal_canister, update, update_with_sender,
-    },
+    state_test_helpers::{query, update, update_with_sender},
 };
 use candid::{Decode, Encode};
 use canister_test::Project;
@@ -12,11 +9,14 @@ use ic_base_types::CanisterId;
 use ic_nervous_system_common_test_keys::TEST_NEURON_1_OWNER_PRINCIPAL;
 use ic_nns_common::{pb::v1::NeuronId, types::ProposalId};
 use ic_nns_constants::GOVERNANCE_CANISTER_ID;
-use ic_nns_governance::pb::v1::{
-    manage_neuron::{Command, NeuronIdOrSubaccount},
-    manage_neuron_response::Command as CommandResponse,
-    proposal, ExecuteNnsFunction, ManageNeuron, ManageNeuronResponse, NnsFunction, Proposal,
-    ProposalInfo, ProposalStatus,
+use ic_nns_governance::{
+    init::TEST_NEURON_1_ID,
+    pb::v1::{
+        manage_neuron::{Command, NeuronIdOrSubaccount},
+        manage_neuron_response::Command as CommandResponse,
+        proposal, ExecuteNnsFunction, ManageNeuron, ManageNeuronResponse, NnsFunction, Proposal,
+        ProposalInfo, ProposalStatus,
+    },
 };
 use ic_sns_init::pb::v1::SnsInitPayload;
 use ic_sns_wasm::pb::v1::{
@@ -30,6 +30,7 @@ use ic_state_machine_tests::StateMachine;
 use maplit::{btreemap, hashmap};
 use std::{
     collections::{BTreeMap, HashMap},
+    io::Write,
     time::{Duration, Instant},
 };
 
@@ -245,35 +246,18 @@ pub fn deploy_new_sns(
     caller: CanisterId,
     sns_wasm_canister_id: CanisterId,
     sns_init_payload: SnsInitPayload,
-    cycles: u128,
 ) -> DeployNewSnsResponse {
-    if caller == GOVERNANCE_CANISTER_ID {
-        update_with_sender(
-            env,
-            sns_wasm_canister_id,
-            "deploy_new_sns",
-            candid_one,
-            DeployNewSnsRequest {
-                sns_init_payload: Some(sns_init_payload),
-            },
-            caller.get(),
-        )
-        .unwrap()
-    } else {
-        let response = try_call_with_cycles_via_universal_canister(
-            env,
-            caller,
-            sns_wasm_canister_id,
-            "deploy_new_sns",
-            Encode!(&DeployNewSnsRequest {
-                sns_init_payload: Some(sns_init_payload)
-            })
-            .unwrap(),
-            cycles,
-        )
-        .unwrap();
-        Decode!(&response, DeployNewSnsResponse).unwrap()
-    }
+    update_with_sender(
+        env,
+        sns_wasm_canister_id,
+        "deploy_new_sns",
+        candid_one,
+        DeployNewSnsRequest {
+            sns_init_payload: Some(sns_init_payload),
+        },
+        caller.get(),
+    )
+    .unwrap()
 }
 
 /// Make list_deployed_snses request to a canister in the StateMachine
@@ -382,7 +366,7 @@ pub fn add_modified_wasms_to_sns_wasms(
     let archive_wasm = create_modified_wasm(&build_archive_sns_wasm(), Some(modifier));
     add_wasm_via_proposal(machine, archive_wasm.clone());
 
-    let index_wasm = create_modified_wasm(&build_index_sns_wasm(), Some(modifier));
+    let index_wasm = create_modified_wasm(&build_index_ng_sns_wasm(), Some(modifier));
     add_wasm_via_proposal(machine, index_wasm.clone());
 
     btreemap! {
@@ -433,9 +417,9 @@ pub fn add_real_wasms_to_sns_wasms_and_return_immediately(
     let archive_proposal_id =
         add_wasm_via_proposal_and_return_immediately(machine, archive_wasm.clone());
 
-    let index_wasm = build_index_sns_wasm();
+    let index_ng_wasm = build_index_ng_sns_wasm();
     let index_proposal_id =
-        add_wasm_via_proposal_and_return_immediately(machine, index_wasm.clone());
+        add_wasm_via_proposal_and_return_immediately(machine, index_ng_wasm.clone());
 
     hashmap! {
         SnsCanisterType::Root => (root_proposal_id, root_wasm),
@@ -443,7 +427,16 @@ pub fn add_real_wasms_to_sns_wasms_and_return_immediately(
         SnsCanisterType::Ledger => (ledger_proposal_id, ledger_wasm),
         SnsCanisterType::Swap => (swap_proposal_id, swap_wasm),
         SnsCanisterType::Archive => (archive_proposal_id, archive_wasm),
-        SnsCanisterType::Index => (index_proposal_id, index_wasm),
+        SnsCanisterType::Index => (index_proposal_id, index_ng_wasm),
+    }
+}
+
+/// Builds the mainnet SnsWasm for the root canister.
+pub fn build_mainnet_root_sns_wasm() -> SnsWasm {
+    let root_wasm = Project::cargo_bin_maybe_from_env("mainnet-sns-root-canister", &[]);
+    SnsWasm {
+        wasm: root_wasm.bytes(),
+        canister_type: SnsCanisterType::Root.into(),
     }
 }
 
@@ -456,6 +449,15 @@ pub fn build_root_sns_wasm() -> SnsWasm {
     }
 }
 
+/// Builds the mainnet SnsWasm for the governance canister.
+pub fn build_mainnet_governance_sns_wasm() -> SnsWasm {
+    let governance_wasm = Project::cargo_bin_maybe_from_env("mainnet-sns-governance-canister", &[]);
+    SnsWasm {
+        wasm: governance_wasm.bytes(),
+        canister_type: SnsCanisterType::Governance.into(),
+    }
+}
+
 /// Builds the SnsWasm for the governance canister.
 pub fn build_governance_sns_wasm() -> SnsWasm {
     let governance_wasm = Project::cargo_bin_maybe_from_env("sns-governance-canister", &[]);
@@ -465,12 +467,12 @@ pub fn build_governance_sns_wasm() -> SnsWasm {
     }
 }
 
-/// Builds the SnsWasm for the ledger canister.
-pub fn build_ledger_sns_wasm() -> SnsWasm {
-    let ledger_wasm = Project::cargo_bin_maybe_from_env("ic-icrc1-ledger", &[]);
+/// Builds the mainnet SnsWasm for the Swap Canister
+pub fn build_mainnet_swap_sns_wasm() -> SnsWasm {
+    let swap_wasm = Project::cargo_bin_maybe_from_env("mainnet-sns-swap-canister", &[]);
     SnsWasm {
-        wasm: ledger_wasm.bytes(),
-        canister_type: SnsCanisterType::Ledger.into(),
+        wasm: swap_wasm.bytes(),
+        canister_type: SnsCanisterType::Swap.into(),
     }
 }
 
@@ -483,6 +485,33 @@ pub fn build_swap_sns_wasm() -> SnsWasm {
     }
 }
 
+/// Builds the mainnet SnsWasm for the ledger canister.
+pub fn build_mainnet_ledger_sns_wasm() -> SnsWasm {
+    let ledger_wasm = Project::cargo_bin_maybe_from_env("mainnet-ic-icrc1-ledger", &[]);
+    SnsWasm {
+        wasm: ledger_wasm.bytes(),
+        canister_type: SnsCanisterType::Ledger.into(),
+    }
+}
+
+/// Builds the SnsWasm for the ledger canister.
+pub fn build_ledger_sns_wasm() -> SnsWasm {
+    let ledger_wasm = Project::cargo_bin_maybe_from_env("ic-icrc1-ledger", &[]);
+    SnsWasm {
+        wasm: ledger_wasm.bytes(),
+        canister_type: SnsCanisterType::Ledger.into(),
+    }
+}
+
+/// Builds the mainnet SnsWasm for the Ledger Archive Canister
+pub fn build_mainnet_archive_sns_wasm() -> SnsWasm {
+    let archive_wasm = Project::cargo_bin_maybe_from_env("mainnet-ic-icrc1-archive", &[]);
+    SnsWasm {
+        wasm: archive_wasm.bytes(),
+        canister_type: SnsCanisterType::Archive.into(),
+    }
+}
+
 /// Builds the SnsWasm for the Ledger Archive Canister
 pub fn build_archive_sns_wasm() -> SnsWasm {
     let archive_wasm = Project::cargo_bin_maybe_from_env("ic-icrc1-archive", &[]);
@@ -492,9 +521,18 @@ pub fn build_archive_sns_wasm() -> SnsWasm {
     }
 }
 
-/// Builds the SnsWasm for the index canister.
-pub fn build_index_sns_wasm() -> SnsWasm {
-    let index_wasm = Project::cargo_bin_maybe_from_env("ic-icrc1-index", &[]);
+/// Builds the SnsWasm for the index-ng canister.
+pub fn build_index_ng_sns_wasm() -> SnsWasm {
+    let index_wasm = Project::cargo_bin_maybe_from_env("ic-icrc1-index-ng", &[]);
+    SnsWasm {
+        wasm: index_wasm.bytes(),
+        canister_type: SnsCanisterType::Index.into(),
+    }
+}
+
+/// Builds the mainnet SnsWasm for the index canister.
+pub fn build_mainnet_index_ng_sns_wasm() -> SnsWasm {
+    let index_wasm = Project::cargo_bin_maybe_from_env("mainnet-ic-icrc1-index-ng", &[]);
     SnsWasm {
         wasm: index_wasm.bytes(),
         canister_type: SnsCanisterType::Index.into(),
@@ -517,6 +555,20 @@ pub fn create_modified_wasm(original_wasm: &SnsWasm, modify_with: Option<&str>) 
 
     assert_ne!(new_wasm_hash, original_hash);
     sns_wasm_to_add
+}
+
+pub fn ensure_sns_wasm_gzipped(sns_wasm: SnsWasm) -> SnsWasm {
+    let bytes = &sns_wasm.wasm;
+    if (bytes.len() > 4) && (bytes[0] == 0x1F) && (bytes[1] == 0x8B) {
+        return sns_wasm;
+    }
+
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes).unwrap();
+    let mut sns_wasm = sns_wasm;
+    sns_wasm.wasm = encoder.finish().unwrap();
+
+    sns_wasm
 }
 
 /// Translates a WasmMap to a Version

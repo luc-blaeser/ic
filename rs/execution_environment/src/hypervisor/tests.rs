@@ -1,11 +1,14 @@
 use assert_matches::assert_matches;
 use candid::{Decode, Encode};
 use ic_base_types::{NumSeconds, PrincipalId};
+use ic_config::subnet_config::SchedulerConfig;
 use ic_cycles_account_manager::ResourceSaturation;
 use ic_embedders::wasm_utils::instrumentation::instruction_to_cost_new;
 use ic_error_types::{ErrorCode, RejectCode};
-use ic_ic00_types::{CanisterChange, CanisterHttpResponsePayload, UpgradeOptions};
 use ic_interfaces::execution_environment::{HypervisorError, SubnetAvailableMemory};
+use ic_management_canister_types::{
+    CanisterChange, CanisterHttpResponsePayload, CanisterUpgradeOptions,
+};
 use ic_nns_constants::CYCLES_MINTING_CANISTER_ID;
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::canister_state::{NextExecution, WASM_PAGE_SIZE_IN_BYTES};
@@ -548,7 +551,9 @@ fn ic0_stable_read_traps_if_out_of_bounds() {
 
 #[test]
 fn ic0_stable_read_handles_overflows() {
-    let mut test = ExecutionTestBuilder::new().build();
+    let mut test = ExecutionTestBuilder::new()
+        .with_deterministic_time_slicing_disabled()
+        .build();
     let wat = r#"
         (module
             (import "ic0" "stable_grow" (func $stable_grow (param i32) (result i32)))
@@ -1065,20 +1070,37 @@ fn ic0_canister_version_returns_correct_value() {
         WasmResult::Reply(expected_ctr.to_le_bytes().to_vec())
     );
 
-    test.set_controller(canister_id, canister_id.into())
-        .unwrap();
+    // This internally transitioning to stopping and then stopped,
+    // i.e. it adds 2 to canister version.
+    test.stop_canister(canister_id);
+    test.process_stopping_canisters();
+    test.ingress(canister_id, "update", ctr.clone())
+        .expect_err("The update should fail on the stopped canister.");
+    test.start_canister(canister_id)
+        .expect("The start canister should not fail.");
     let result = test.ingress(canister_id, "update", ctr.clone()).unwrap();
-    // Plus 8 for the previous ingress messages.
-    let expected_ctr: u64 = 10 + 8;
+    // Plus 8 for the previous (successful) ingress messages.
+    let expected_ctr: u64 = 12 + 8;
     assert_eq!(
         result,
         WasmResult::Reply(expected_ctr.to_le_bytes().to_vec())
     );
 
-    test.uninstall_code(canister_id).unwrap_err();
-    let result = test.ingress(canister_id, "update", ctr).unwrap();
+    test.set_controller(canister_id, canister_id.into())
+        .unwrap();
+    let result = test.ingress(canister_id, "update", ctr.clone()).unwrap();
     // Plus 9 for the previous ingress messages.
-    let expected_ctr: u64 = 10 + 9;
+    let expected_ctr: u64 = 13 + 9;
+    assert_eq!(
+        result,
+        WasmResult::Reply(expected_ctr.to_le_bytes().to_vec())
+    );
+
+    test.uninstall_code(canister_id)
+        .expect_err("Uninstall code should fail as the controller has changed.");
+    let result = test.ingress(canister_id, "update", ctr).unwrap();
+    // Plus 10 for the previous ingress messages.
+    let expected_ctr: u64 = 13 + 10;
     assert_eq!(
         result,
         WasmResult::Reply(expected_ctr.to_le_bytes().to_vec())
@@ -1601,7 +1623,7 @@ fn ic0_msg_caller_size_works_in_heartbeat() {
         .unwrap();
     assert_eq!(
         WasmResult::Reply(
-            (ic_ic00_types::IC_00.get().to_vec().len() as u32)
+            (ic_management_canister_types::IC_00.get().to_vec().len() as u32)
                 .to_le_bytes()
                 .to_vec()
         ),
@@ -1616,7 +1638,10 @@ fn ic0_msg_caller_copy_works_in_heartbeat() {
     let set_heartbeat = wasm()
         .set_heartbeat(
             wasm()
-                .msg_caller_copy(0, ic_ic00_types::IC_00.get().to_vec().len() as u32)
+                .msg_caller_copy(
+                    0,
+                    ic_management_canister_types::IC_00.get().to_vec().len() as u32,
+                )
                 .set_global_data_from_stack()
                 .build(),
         )
@@ -1633,7 +1658,7 @@ fn ic0_msg_caller_copy_works_in_heartbeat() {
         )
         .unwrap();
     assert_eq!(
-        WasmResult::Reply(ic_ic00_types::IC_00.get().to_vec()),
+        WasmResult::Reply(ic_management_canister_types::IC_00.get().to_vec()),
         result
     );
 }
@@ -1664,7 +1689,7 @@ fn ic0_msg_caller_size_works_in_global_timer() {
         .unwrap();
     assert_eq!(
         WasmResult::Reply(
-            (ic_ic00_types::IC_00.get().to_vec().len() as u32)
+            (ic_management_canister_types::IC_00.get().to_vec().len() as u32)
                 .to_le_bytes()
                 .to_vec()
         ),
@@ -1679,7 +1704,10 @@ fn ic0_msg_caller_copy_works_in_global_timer() {
     let set_timer = wasm()
         .set_global_timer_method(
             wasm()
-                .msg_caller_copy(0, ic_ic00_types::IC_00.get().to_vec().len() as u32)
+                .msg_caller_copy(
+                    0,
+                    ic_management_canister_types::IC_00.get().to_vec().len() as u32,
+                )
                 .set_global_data_from_stack()
                 .build(),
         )
@@ -1696,7 +1724,7 @@ fn ic0_msg_caller_copy_works_in_global_timer() {
         )
         .unwrap();
     assert_eq!(
-        WasmResult::Reply(ic_ic00_types::IC_00.get().to_vec()),
+        WasmResult::Reply(ic_management_canister_types::IC_00.get().to_vec()),
         result
     );
 }
@@ -4071,7 +4099,7 @@ fn cycles_are_refunded_if_callee_traps() {
             "update",
             call_args()
                 .other_side(b.clone())
-                .on_reject(wasm().reject_code().reject_message().reject()),
+                .on_reject(wasm().reject_message().reject()),
             a_to_b_transferred,
         )
         .build();
@@ -4220,7 +4248,7 @@ fn cycles_are_refunded_if_callee_is_uninstalled_before_execution() {
             "update",
             call_args()
                 .other_side(b.clone())
-                .on_reject(wasm().reject_code().reject_message().reject()),
+                .on_reject(wasm().reject_message().reject()),
             Cycles::from(a_to_b_transferred),
         )
         .build();
@@ -4298,7 +4326,7 @@ fn cycles_are_refunded_if_callee_is_uninstalled_after_execution() {
             "update",
             call_args()
                 .other_side(b.clone())
-                .on_reject(wasm().reject_code().reject_message().reject()),
+                .on_reject(wasm().reject_message().reject()),
             a_to_b_transferred,
         )
         .build();
@@ -4404,7 +4432,7 @@ fn cycles_are_refunded_if_callee_is_reinstalled() {
             "update",
             call_args()
                 .other_side(b.clone())
-                .on_reject(wasm().reject_code().reject_message().reject()),
+                .on_reject(wasm().reject_message().reject()),
             a_to_b_transferred,
         )
         .build();
@@ -4514,7 +4542,7 @@ fn cycles_are_refunded_if_callee_is_uninstalled_during_a_self_call() {
             "update",
             call_args()
                 .other_side(b_1.clone())
-                .on_reject(wasm().reject_code().reject_message().reject()),
+                .on_reject(wasm().reject_message().reject()),
             b_transferred_1,
         )
         .build();
@@ -4528,7 +4556,7 @@ fn cycles_are_refunded_if_callee_is_uninstalled_during_a_self_call() {
             "update",
             call_args()
                 .other_side(b_0.clone())
-                .on_reject(wasm().reject_code().reject_message().reject()),
+                .on_reject(wasm().reject_message().reject()),
             a_to_b_transferred,
         )
         .build();
@@ -4769,7 +4797,6 @@ fn dts_pause_resume_works_in_update_call() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
     let canister_id = test.universal_canister().unwrap();
@@ -4803,7 +4830,6 @@ fn dts_abort_works_in_update_call() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
     let canister_id = test.universal_canister().unwrap();
@@ -4890,7 +4916,6 @@ fn dts_concurrent_subnet_available_change() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
     let canister_id = test.universal_canister().unwrap();
@@ -4924,7 +4949,6 @@ fn system_state_apply_change_fails() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(100_000_000)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -4943,7 +4967,7 @@ fn system_state_apply_change_fails() {
             b_id,
             call_args()
                 .other_side(b)
-                .on_reject(wasm().reject_code().reject_message().reject()),
+                .on_reject(wasm().reject_message().reject()),
         )
         .build();
 
@@ -5951,13 +5975,11 @@ fn call_perform_checks_freezing_threshold_in_update() {
         .build();
     let err = test.ingress(canister_id, "update", body).unwrap_err();
     assert!(
-        err.description().contains(
-            "Canister cannot grow message memory by 2097168 bytes due to insufficient cycles"
-        ),
+        err.description().contains("call_perform failed"),
         "Unexpected error: {}",
         err.description()
     );
-    assert_eq!(err.code(), ErrorCode::InsufficientCyclesInMessageMemoryGrow);
+    assert_eq!(err.code(), ErrorCode::CanisterCalledTrap);
 }
 
 #[test]
@@ -6307,7 +6329,7 @@ fn upgrade_with_skip_pre_upgrade_preserves_stable_memory() {
     test.upgrade_canister_v2(
         canister_id,
         wat::parse_str(wat.clone()).unwrap(),
-        UpgradeOptions {
+        CanisterUpgradeOptions {
             skip_pre_upgrade: Some(true),
             keep_main_memory: None,
         },
@@ -6319,7 +6341,7 @@ fn upgrade_with_skip_pre_upgrade_preserves_stable_memory() {
         .upgrade_canister_v2(
             canister_id,
             wat::parse_str(wat).unwrap(),
-            UpgradeOptions {
+            CanisterUpgradeOptions {
                 skip_pre_upgrade: Some(false),
                 keep_main_memory: None,
             },
@@ -6540,4 +6562,217 @@ fn stable_memory_grow_does_not_reserve_cycles_on_out_of_memory() {
         .system_state
         .reserved_balance();
     assert_eq!(reserved_cycles_before, reserved_cycles_after);
+}
+
+fn generate_wat_to_touch_pages(pages_to_touch: usize) -> String {
+    format!(
+        r#"
+    (module
+        (import "ic0" "msg_reply" (func $msg_reply))
+        (import "ic0" "msg_reply_data_append" (func $msg_reply_data_append (param i32 i32)))
+        (func (export "canister_update test")
+          (local $j i32)
+          (loop $my_loop
+            ;; add one OS page to $j
+            local.get $j
+            i32.const 4096
+            i32.add
+            local.set $j
+            ;; store 1 to heap[$j]
+            (i32.store (local.get $j) (i32.const 1))
+            ;; loop if $j is less than number of OS pages that we want to touch
+            local.get $j
+            i32.const {bytes_to_touch}
+            i32.lt_s
+            br_if $my_loop
+          )
+          (call $msg_reply_data_append
+                          (i32.const 0)
+                          (i32.const 8))
+          (call $msg_reply)
+        )
+        (memory $memory 128)
+      )"#,
+        bytes_to_touch = pages_to_touch * 4096
+    )
+}
+
+#[test]
+fn yield_triggers_dts_slice_with_many_dirty_pages() {
+    let pages_to_touch = 100;
+    let wat = generate_wat_to_touch_pages(pages_to_touch);
+
+    const CYCLES: Cycles = Cycles::new(20_000_000_000_000);
+
+    let mut test = ExecutionTestBuilder::new()
+        .with_manual_execution()
+        .with_max_dirty_pages_optimization_embedder_config(pages_to_touch - 1)
+        .build();
+
+    let wasm = wat::parse_str(wat).unwrap();
+    let canister_id = test.canister_from_cycles_and_binary(CYCLES, wasm).unwrap();
+
+    let _result = test.ingress_raw(canister_id, "test", vec![]);
+
+    // The test touches `pages_to_touch`, but the embedder is configured to yield when `pages_to_touch - 1` pages are dirty.
+    // Therefore, we should have two slices here.
+    test.execute_slice(canister_id);
+    assert_eq!(
+        test.canister_state(canister_id).next_execution(),
+        NextExecution::ContinueLong
+    );
+    test.execute_slice(canister_id);
+    assert_eq!(
+        test.canister_state(canister_id).next_execution(),
+        NextExecution::None
+    );
+}
+
+#[test]
+fn yield_does_not_trigger_dts_slice_without_enough_dirty_pages() {
+    let pages_to_touch = 100;
+    let wat = generate_wat_to_touch_pages(pages_to_touch);
+
+    const CYCLES: Cycles = Cycles::new(20_000_000_000_000);
+
+    let mut test = ExecutionTestBuilder::new()
+        .with_manual_execution()
+        .with_max_dirty_pages_optimization_embedder_config(pages_to_touch + 1)
+        .build();
+
+    let wasm = wat::parse_str(wat).unwrap();
+    let canister_id = test.canister_from_cycles_and_binary(CYCLES, wasm).unwrap();
+
+    let _result = test.ingress_raw(canister_id, "test", vec![]);
+
+    // The test touches `pages_to_touch`, but the embedder is configured to yield when `pages_to_touch + 1` pages are dirty.
+    // Therefore, we should have only 1 slice here.
+    test.execute_slice(canister_id);
+    assert_eq!(
+        test.canister_state(canister_id).next_execution(),
+        NextExecution::None
+    );
+}
+
+#[test]
+fn yield_abort_does_not_modify_state() {
+    let pages_to_touch = 100;
+    let wat = generate_wat_to_touch_pages(pages_to_touch);
+
+    const CYCLES: Cycles = Cycles::new(20_000_000_000_000);
+
+    let mut test = ExecutionTestBuilder::new()
+        .with_manual_execution()
+        .with_max_dirty_pages_optimization_embedder_config(pages_to_touch - 1)
+        .build();
+
+    let wasm = wat::parse_str(wat).unwrap();
+    let canister_id = test.canister_from_cycles_and_binary(CYCLES, wasm).unwrap();
+
+    let _result = test.ingress_raw(canister_id, "test", vec![]);
+
+    // The test touches `pages_to_touch`, but the embedder is configured to yield when `pages_to_touch - 1` pages are dirty.
+    // Therefore, we should have 2 slices here.
+    test.execute_slice(canister_id);
+    assert_eq!(
+        test.canister_state(canister_id).next_execution(),
+        NextExecution::ContinueLong
+    );
+    // Abort before executing the last slice.
+    test.abort_all_paused_executions();
+
+    // Test that the abort means the canister's state is not modified.
+    let mut dirty_pages = test
+        .execution_state(canister_id)
+        .wasm_memory
+        .page_map
+        .delta_pages_iter()
+        .count();
+
+    assert_eq!(dirty_pages, 0);
+
+    // Start execution from scratch, let the slices execute fully and check dirty pages again.
+    test.execute_slice(canister_id);
+    assert_eq!(
+        test.canister_state(canister_id).next_execution(),
+        NextExecution::ContinueLong
+    );
+    test.execute_slice(canister_id);
+    assert_eq!(
+        test.canister_state(canister_id).next_execution(),
+        NextExecution::None
+    );
+    dirty_pages += test
+        .execution_state(canister_id)
+        .wasm_memory
+        .page_map
+        .delta_pages_iter()
+        .count();
+    // This time the dirty pages should be equal to `pages_to_touch`.
+    assert_eq!(dirty_pages, pages_to_touch);
+}
+
+#[test]
+fn yield_for_dirty_page_copy_does_not_trigger_on_system_subnets() {
+    let pages_to_touch = 100;
+    let wat = generate_wat_to_touch_pages(pages_to_touch);
+
+    const CYCLES: Cycles = Cycles::new(20_000_000_000_000);
+
+    let mut test = ExecutionTestBuilder::new()
+        .with_subnet_type(SubnetType::System)
+        .with_slice_instruction_limit(
+            SchedulerConfig::system_subnet()
+                .max_instructions_per_slice
+                .get(),
+        )
+        .with_instruction_limit(
+            SchedulerConfig::system_subnet()
+                .max_instructions_per_message
+                .get(),
+        )
+        .with_manual_execution()
+        .with_max_dirty_pages_optimization_embedder_config(pages_to_touch - 1)
+        .build();
+
+    let wasm = wat::parse_str(wat).unwrap();
+    let canister_id = test.canister_from_cycles_and_binary(CYCLES, wasm).unwrap();
+
+    let _result = test.ingress_raw(canister_id, "test", vec![]);
+
+    // The test touches `pages_to_touch`, but the embedder is configured to yield when `pages_to_touch - 1` pages are dirty.
+    // This should not happen for system subnets.
+    test.execute_slice(canister_id);
+    assert_eq!(
+        test.canister_state(canister_id).next_execution(),
+        NextExecution::None
+    );
+}
+
+#[test]
+fn yield_for_dirty_page_copy_does_not_trigger_on_system_subnets_without_dts() {
+    let pages_to_touch = 100;
+    let wat = generate_wat_to_touch_pages(pages_to_touch);
+
+    const CYCLES: Cycles = Cycles::new(20_000_000_000_000);
+
+    let mut test = ExecutionTestBuilder::new()
+        .with_deterministic_time_slicing_disabled()
+        .with_subnet_type(SubnetType::System)
+        .with_manual_execution()
+        .with_max_dirty_pages_optimization_embedder_config(pages_to_touch - 1)
+        .build();
+
+    let wasm = wat::parse_str(wat).unwrap();
+    let canister_id = test.canister_from_cycles_and_binary(CYCLES, wasm).unwrap();
+
+    let _result = test.ingress_raw(canister_id, "test", vec![]);
+
+    // The test touches `pages_to_touch`, but the embedder is configured to yield when `pages_to_touch - 1` pages are dirty.
+    // This should not happen for system subnets.
+    test.execute_slice(canister_id);
+    assert_eq!(
+        test.canister_state(canister_id).next_execution(),
+        NextExecution::None
+    );
 }

@@ -2,7 +2,7 @@ use crate::{sandbox_safe_system_state::SandboxSafeSystemState, valid_subslice};
 use ic_interfaces::execution_environment::{HypervisorError, HypervisorResult};
 use ic_logger::ReplicaLogger;
 use ic_types::{
-    messages::{CallContextId, Request},
+    messages::{CallContextId, Request, NO_DEADLINE},
     methods::{Callback, WasmClosure},
     CanisterId, Cycles, NumBytes, PrincipalId,
 };
@@ -202,17 +202,21 @@ pub(crate) fn into_request(
         sandbox_safe_system_state.prepayment_for_response_execution();
     let prepayment_for_response_transmission =
         sandbox_safe_system_state.prepayment_for_response_transmission();
+    // To eventually be populated by an `ic0.call_with_best_effort_response()` call.
+    // For now, no calls have deadlines.
+    let deadline = NO_DEADLINE;
 
     let callback_id = sandbox_safe_system_state.register_callback(Callback::new(
         call_context_id,
-        Some(sender),
-        Some(destination_canister),
+        sender,
+        destination_canister,
         cycles,
-        Some(prepayment_for_response_execution),
-        Some(prepayment_for_response_transmission),
+        prepayment_for_response_execution,
+        prepayment_for_response_transmission,
         on_reply,
         on_reject,
         on_cleanup,
+        deadline,
     ))?;
 
     let req = Request {
@@ -222,7 +226,8 @@ pub(crate) fn into_request(
         method_payload,
         sender_reply_callback: callback_id,
         payment: cycles,
-        metadata: None,
+        metadata: Some(sandbox_safe_system_state.request_metadata.clone()),
+        deadline,
     };
     // We cannot call `Request::payload_size_bytes()` before constructing the
     // request, so ensure our separate calculation matches the actual size.

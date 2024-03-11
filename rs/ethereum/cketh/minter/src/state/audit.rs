@@ -7,7 +7,7 @@ use crate::storage::{record_event, with_event_iter};
 // public because it's used in tests since process_event
 // requires canister infrastructure to retrieve time
 pub fn apply_state_transition(state: &mut State, payload: &EventType) {
-    match &payload {
+    match payload {
         EventType::Init(init_arg) => {
             panic!("state re-initialization is not allowed: {init_arg:?}");
         }
@@ -17,7 +17,10 @@ pub fn apply_state_transition(state: &mut State, payload: &EventType) {
                 .expect("applying upgrade event should succeed");
         }
         EventType::AcceptedDeposit(eth_event) => {
-            state.record_event_to_mint(eth_event);
+            state.record_event_to_mint(&eth_event.clone().into());
+        }
+        EventType::AcceptedErc20Deposit(eth_event) => {
+            state.record_event_to_mint(&eth_event.clone().into());
         }
         EventType::InvalidDeposit {
             event_source,
@@ -81,6 +84,9 @@ pub fn apply_state_transition(state: &mut State, payload: &EventType) {
         }
         EventType::SkippedBlock(block_number) => {
             state.record_skipped_block(*block_number);
+        }
+        EventType::AddedCkErc20Token(ckerc20_token) => {
+            state.record_add_ckerc20_token(ckerc20_token.clone());
         }
     }
 }

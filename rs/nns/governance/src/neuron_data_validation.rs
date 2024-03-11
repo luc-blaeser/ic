@@ -1,7 +1,7 @@
 use crate::{
     neuron_store::NeuronStore,
     pb::v1::{Neuron, Topic},
-    storage::{with_stable_neuron_indexes, with_stable_neuron_store, Signed32},
+    storage::{with_stable_neuron_indexes, with_stable_neuron_store},
 };
 
 use candid::{CandidType, Deserialize};
@@ -89,24 +89,31 @@ pub struct IssuesSummary {
 
 /// A validator for secondary neuron data, such as indexes. It can be called in heartbeat to perform
 /// a small chunk of the validation, while keeping track of its progress.
-pub struct NeuronDataValidator {
-    state: State,
+pub(crate) enum NeuronDataValidator {
+    // Validation has not started.
+    NotStarted,
+    // No validation is in progress. Storing the validation issues found the last time.
+    Validated(Issues),
+    // Validation in progress. Also storing the validation issues found the previous time if it exists.
+    Validating {
+        in_progress: ValidationInProgress,
+        current_issues: Issues,
+        previous_issues: Option<Issues>,
+    },
 }
 
 impl NeuronDataValidator {
     pub fn new() -> Self {
-        Self {
-            state: State::NotStarted,
-        }
+        Self::NotStarted
     }
 
     /// Validates the indexes in a way that does not incur too much computation (to fit into one
     /// heartbeat). Returns whether some computation intensive work has been done (so that the
     /// heartbeat method have a chance to early return after calling this method).
     pub fn maybe_validate(&mut self, now: u64, neuron_store: &NeuronStore) -> bool {
-        let (should_start, issues) = match &mut self.state {
-            State::NotStarted => (true, None),
-            State::Validated(issues) => {
+        let (should_start, issues) = match self {
+            Self::NotStarted => (true, None),
+            Self::Validated(issues) => {
                 let validation_age_seconds = now.saturating_sub(issues.last_updated_time_seconds);
                 if validation_age_seconds > MAX_VALIDATION_AGE_SECONDS {
                     (true, Some(std::mem::take(issues)))
@@ -114,45 +121,45 @@ impl NeuronDataValidator {
                     (false, None)
                 }
             }
-            State::Validating { .. } => (false, None),
+            Self::Validating { .. } => (false, None),
         };
 
         if should_start {
-            self.state = State::Validating {
+            *self = Self::Validating {
                 in_progress: ValidationInProgress::new(now),
                 current_issues: Issues::new(now),
                 previous_issues: issues,
             };
         }
 
-        let (validation_in_progress, current_issues) = match &mut self.state {
-            State::NotStarted => return false,
-            State::Validating {
+        let (validation_in_progress, current_issues) = match self {
+            Self::NotStarted => return false,
+            Self::Validating {
                 in_progress,
                 current_issues,
                 previous_issues: _,
             } => (in_progress, current_issues),
-            State::Validated(_) => return false,
+            Self::Validated(_) => return false,
         };
 
         let new_issues = validation_in_progress.validate_next_chunk(neuron_store);
         current_issues.update(now, new_issues);
 
         if validation_in_progress.is_done() {
-            self.state = State::Validated(std::mem::take(current_issues));
+            *self = Self::Validated(std::mem::take(current_issues));
         }
 
         true
     }
 
     pub fn summary(&self) -> NeuronDataValidationSummary {
-        match &self.state {
-            State::NotStarted => NeuronDataValidationSummary {
+        match &self {
+            Self::NotStarted => NeuronDataValidationSummary {
                 current_issues_summary: None,
                 previous_issues_summary: None,
                 current_validation_started_time_seconds: None,
             },
-            State::Validating {
+            Self::Validating {
                 in_progress,
                 current_issues,
                 previous_issues,
@@ -161,7 +168,7 @@ impl NeuronDataValidator {
                 previous_issues_summary: previous_issues.as_ref().map(|issues| issues.summary()),
                 current_validation_started_time_seconds: Some(in_progress.started_time_seconds),
             },
-            State::Validated(issues) => NeuronDataValidationSummary {
+            Self::Validated(issues) => NeuronDataValidationSummary {
                 current_issues_summary: Some(issues.summary()),
                 previous_issues_summary: None,
                 current_validation_started_time_seconds: None,
@@ -176,22 +183,8 @@ impl Default for NeuronDataValidator {
     }
 }
 
-/// Validation state.
-enum State {
-    // Validation has not started.
-    NotStarted,
-    // No validation is in progress. Storing the validation issues found the last time.
-    Validated(Issues),
-    // Validation in progress. Also storing the validation issues found the previous time if it exists.
-    Validating {
-        in_progress: ValidationInProgress,
-        current_issues: Issues,
-        previous_issues: Option<Issues>,
-    },
-}
-
 /// Information related to a validation in progress.
-struct ValidationInProgress {
+pub(crate) struct ValidationInProgress {
     /// The timestamp when it started.
     started_time_seconds: u64,
 
@@ -253,7 +246,7 @@ impl ValidationInProgress {
 /// Validation issues stored on the heap while the validation is running. This is not meant to be
 /// exposed through a query method (but IssuesSummary does).
 #[derive(Debug, Default, PartialEq)]
-struct Issues {
+pub(crate) struct Issues {
     last_updated_time_seconds: u64,
     issue_groups_map: HashMap<Discriminant<ValidationIssue>, IssueGroup>,
 }
@@ -519,7 +512,7 @@ impl CardinalityAndRangeValidator for PrincipalIndexValidator {
                 let pair_exists_in_index = with_stable_neuron_indexes(|indexes| {
                     indexes
                         .principal()
-                        .contains_entry(&neuron_id.id, *principal_id)
+                        .contains_entry(&neuron_id, *principal_id)
                 });
                 !pair_exists_in_index
             })
@@ -575,11 +568,9 @@ impl CardinalityAndRangeValidator for FollowingIndexValidator {
             .into_iter()
             .filter(|(topic, followee)| {
                 let pair_exists_in_index = with_stable_neuron_indexes(|indexes| {
-                    indexes.following().contains_entry(
-                        Signed32::from(*topic as i32),
-                        &followee.id,
-                        &neuron_id.id,
-                    )
+                    indexes
+                        .following()
+                        .contains_entry(*topic, followee, &neuron_id)
                 });
                 !pair_exists_in_index
             })
@@ -680,7 +671,7 @@ impl ValidationTask for StableNeuronStoreValidator {
         self.next_neuron_id = neuron_id_for_next_batch;
         invalid_neuron_ids
             .into_iter()
-            .map(|neuron_id| ValidationIssue::ActiveNeuronInStableStorage(neuron_id))
+            .map(ValidationIssue::ActiveNeuronInStableStorage)
             .collect()
     }
 }
@@ -695,7 +686,10 @@ mod tests {
     use maplit::{btreemap, hashmap};
 
     use crate::{
-        pb::v1::{neuron::DissolveState, neuron::Followees, KnownNeuronData, Neuron},
+        pb::v1::{
+            neuron::{DissolveState, Followees},
+            KnownNeuronData, Neuron,
+        },
         storage::{with_stable_neuron_indexes_mut, with_stable_neuron_store_mut},
     };
 
@@ -1017,10 +1011,13 @@ mod tests {
         // Make the neuron active while it's still in stable storage, to cause the issue with stable neuron store validation.
         with_stable_neuron_store_mut(|stable_neuron_store| {
             stable_neuron_store
-                .update(Neuron {
-                    cached_neuron_stake_e8s: 1,
-                    ..neuron
-                })
+                .update(
+                    &neuron,
+                    Neuron {
+                        cached_neuron_stake_e8s: 1,
+                        ..neuron.clone()
+                    },
+                )
                 .unwrap()
         });
 

@@ -2,28 +2,32 @@
 
 use crate::{
     common::{cbor_response, make_plaintext_response, remove_effective_principal_id},
-    metrics::LABEL_UNKNOWN,
-    types::ApiReqType,
+    receive_request_body,
     validator_executor::ValidatorExecutor,
-    EndpointService, HttpHandlerMetrics, ReplicaHealthStatus,
+    ReplicaHealthStatus,
 };
-use bytes::Bytes;
+
+use axum::body::Body;
 use crossbeam::atomic::AtomicCell;
 use futures_util::FutureExt;
 use http::Request;
-use hyper::{Body, Response, StatusCode};
-use ic_config::http_handler::Config;
+use hyper::{Response, StatusCode};
+use ic_crypto_interfaces_sig_verification::IngressSigVerifier;
+use ic_error_types::{ErrorCode, RejectCode};
 use ic_interfaces::{
     crypto::BasicSigner,
     execution_environment::{QueryExecutionError, QueryExecutionService},
 };
 use ic_interfaces_registry::RegistryClient;
-use ic_logger::{error, ReplicaLogger};
+use ic_logger::{error, replica_logger::no_op_logger, ReplicaLogger};
+use ic_metrics::MetricsRegistry;
 use ic_types::{
+    ingress::WasmResult,
+    malicious_flags::MaliciousFlags,
     messages::{
-        Blob, CertificateDelegation, HasCanisterId, HttpQueryContent, HttpRequest,
-        HttpRequestEnvelope, HttpSignedQueryResponse, NodeSignature, QueryResponseHash,
-        SignedRequestBytes, UserQuery,
+        Blob, CertificateDelegation, HasCanisterId, HttpQueryContent, HttpQueryResponse,
+        HttpQueryResponseReply, HttpRequest, HttpRequestEnvelope, HttpSignedQueryResponse,
+        NodeSignature, QueryResponseHash, SignedRequestBytes, UserQuery,
     },
     CanisterId, NodeId,
 };
@@ -32,12 +36,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
-use tower::{limit::GlobalConcurrencyLimitLayer, util::BoxCloneService, Service, ServiceBuilder};
+use tower::Service;
 
 #[derive(Clone)]
-pub(crate) struct QueryService {
+pub struct QueryService {
     log: ReplicaLogger,
-    metrics: HttpHandlerMetrics,
     node_id: NodeId,
     signer: Arc<dyn BasicSigner<QueryResponseHash> + Send + Sync>,
     health_status: Arc<AtomicCell<ReplicaHealthStatus>>,
@@ -47,41 +50,82 @@ pub(crate) struct QueryService {
     query_execution_service: QueryExecutionService,
 }
 
-impl QueryService {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_service(
-        config: Config,
-        log: ReplicaLogger,
-        metrics: HttpHandlerMetrics,
-        signer: Arc<dyn BasicSigner<QueryResponseHash> + Send + Sync>,
+pub struct QueryServiceBuilder {
+    log: Option<ReplicaLogger>,
+    node_id: NodeId,
+    signer: Arc<dyn BasicSigner<QueryResponseHash> + Send + Sync>,
+    health_status: Option<Arc<AtomicCell<ReplicaHealthStatus>>>,
+    malicious_flags: Option<MaliciousFlags>,
+    delegation_from_nns: Arc<RwLock<Option<CertificateDelegation>>>,
+    ingress_verifier: Arc<dyn IngressSigVerifier + Send + Sync>,
+    registry_client: Arc<dyn RegistryClient>,
+    query_execution_service: QueryExecutionService,
+}
+
+impl QueryServiceBuilder {
+    pub fn builder(
         node_id: NodeId,
-        health_status: Arc<AtomicCell<ReplicaHealthStatus>>,
-        delegation_from_nns: Arc<RwLock<Option<CertificateDelegation>>>,
-        validator_executor: ValidatorExecutor<UserQuery>,
+        signer: Arc<dyn BasicSigner<QueryResponseHash> + Send + Sync>,
         registry_client: Arc<dyn RegistryClient>,
+        ingress_verifier: Arc<dyn IngressSigVerifier + Send + Sync>,
+        delegation_from_nns: Arc<RwLock<Option<CertificateDelegation>>>,
         query_execution_service: QueryExecutionService,
-    ) -> EndpointService {
-        BoxCloneService::new(
-            ServiceBuilder::new()
-                .layer(GlobalConcurrencyLimitLayer::new(
-                    config.max_query_concurrent_requests,
-                ))
-                .service(Self {
-                    log,
-                    metrics,
-                    node_id,
-                    signer,
-                    health_status,
-                    delegation_from_nns,
-                    validator_executor,
-                    registry_client,
-                    query_execution_service,
-                }),
-        )
+    ) -> Self {
+        Self {
+            log: None,
+            node_id,
+            signer,
+            health_status: None,
+            malicious_flags: None,
+            delegation_from_nns,
+            ingress_verifier,
+            registry_client,
+            query_execution_service,
+        }
+    }
+
+    pub fn with_logger(mut self, log: ReplicaLogger) -> Self {
+        self.log = Some(log);
+        self
+    }
+
+    pub(crate) fn with_malicious_flags(mut self, malicious_flags: MaliciousFlags) -> Self {
+        self.malicious_flags = Some(malicious_flags);
+        self
+    }
+
+    pub fn with_health_status(
+        mut self,
+        health_status: Arc<AtomicCell<ReplicaHealthStatus>>,
+    ) -> Self {
+        self.health_status = Some(health_status);
+        self
+    }
+
+    pub fn build(self) -> QueryService {
+        let log = self.log.unwrap_or(no_op_logger());
+        let _default_metrics_registry = MetricsRegistry::default();
+        QueryService {
+            log: log.clone(),
+            node_id: self.node_id,
+            signer: self.signer,
+            health_status: self
+                .health_status
+                .unwrap_or_else(|| Arc::new(AtomicCell::new(ReplicaHealthStatus::Healthy))),
+            delegation_from_nns: self.delegation_from_nns,
+            validator_executor: ValidatorExecutor::new(
+                self.registry_client.clone(),
+                self.ingress_verifier,
+                &self.malicious_flags.unwrap_or_default(),
+                log,
+            ),
+            registry_client: self.registry_client,
+            query_execution_service: self.query_execution_service,
+        }
     }
 }
 
-impl Service<Request<Bytes>> for QueryService {
+impl Service<Request<Body>> for QueryService {
     type Response = Response<Body>;
     type Error = Infallible;
     #[allow(clippy::type_complexity)]
@@ -91,11 +135,7 @@ impl Service<Request<Bytes>> for QueryService {
         self.query_execution_service.poll_ready(cx)
     }
 
-    fn call(&mut self, request: Request<Bytes>) -> Self::Future {
-        self.metrics
-            .request_body_size_bytes
-            .with_label_values(&[ApiReqType::Query.into(), LABEL_UNKNOWN])
-            .observe(request.body().len() as f64);
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
         if self.health_status.load() != ReplicaHealthStatus::Healthy {
             let res = make_plaintext_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -109,31 +149,6 @@ impl Service<Request<Bytes>> for QueryService {
         let delegation_from_nns = self.delegation_from_nns.read().unwrap().clone();
 
         let (mut parts, body) = request.into_parts();
-        let request = match <HttpRequestEnvelope<HttpQueryContent>>::try_from(
-            &SignedRequestBytes::from(body.to_vec()),
-        ) {
-            Ok(request) => request,
-            Err(e) => {
-                let res = make_plaintext_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("Could not parse body as read request: {}", e),
-                );
-                return Box::pin(async move { Ok(res) });
-            }
-        };
-
-        // Convert the message to a strongly-typed struct, making structural validations
-        // on the way.
-        let request = match HttpRequest::<UserQuery>::try_from(request) {
-            Ok(request) => request,
-            Err(e) => {
-                let res = make_plaintext_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("Malformed request: {:?}", e),
-                );
-                return Box::pin(async move { Ok(res) });
-            }
-        };
 
         let effective_principal_id = match remove_effective_principal_id(&mut parts) {
             Ok(principal_id) => principal_id,
@@ -153,17 +168,6 @@ impl Service<Request<Bytes>> for QueryService {
         // in the url and the replica processes the request based on the `canister_id`.
         // If this is not enforced, a blocked canisters can still be accessed by specifying
         // a non-blocked `effective_canister_id` and a blocked `canister_id`.
-        let canister_id = request.content().canister_id();
-        if canister_id != CanisterId::ic_00() && canister_id != effective_canister_id {
-            let res = make_plaintext_response(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "Specified CanisterId {} does not match effective canister id in URL {}",
-                    canister_id, effective_canister_id
-                ),
-            );
-            return Box::pin(async move { Ok(res) });
-        }
 
         // In case the inner service has state that's driven to readiness and
         // not tracked by clones (such as `Buffer`), pass the version we have
@@ -194,33 +198,65 @@ impl Service<Request<Bytes>> for QueryService {
         let signer_clone = self.signer.clone();
 
         let validator_executor = self.validator_executor.clone();
-        let response_body_size_bytes_metric = self.metrics.response_body_size_bytes.clone();
         let node_id = self.node_id;
         let logger = self.log.clone();
 
         async move {
-            let get_authorized_canisters_fut =
-                validator_executor.validate_request(request.clone(), registry_version);
-
-            match get_authorized_canisters_fut.await {
-                Ok(targets) => {
-                    if !targets.contains(&request.content().receiver) {
-                        let res = make_plaintext_response(StatusCode::FORBIDDEN, "".to_string());
-                        return Ok(res);
-                    }
-                }
-                Err(http_err) => {
-                    let res = make_plaintext_response(http_err.status, http_err.message);
+            let body = match receive_request_body(body).await {
+                Ok(bytes) => bytes,
+                Err(e) => return Ok(e),
+            };
+            let request = match <HttpRequestEnvelope<HttpQueryContent>>::try_from(
+                &SignedRequestBytes::from(body.to_vec()),
+            ) {
+                Ok(request) => request,
+                Err(e) => {
+                    let res = make_plaintext_response(
+                        StatusCode::BAD_REQUEST,
+                        format!("Could not parse body as read request: {}", e),
+                    );
                     return Ok(res);
                 }
             };
+
+            // Convert the message to a strongly-typed struct, making structural validations
+            // on the way.
+            let request = match HttpRequest::<UserQuery>::try_from(request) {
+                Ok(request) => request,
+                Err(e) => {
+                    let res = make_plaintext_response(
+                        StatusCode::BAD_REQUEST,
+                        format!("Malformed request: {:?}", e),
+                    );
+                    return Ok(res);
+                }
+            };
+            let canister_id = request.content().canister_id();
+            if canister_id != CanisterId::ic_00() && canister_id != effective_canister_id {
+                let res = make_plaintext_response(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Specified CanisterId {} does not match effective canister id in URL {}",
+                        canister_id, effective_canister_id
+                    ),
+                );
+                return Ok(res);
+            }
+            if let Err(http_err) = validator_executor
+                .validate_request(request.clone(), registry_version)
+                .await
+            {
+                let res = make_plaintext_response(http_err.status, http_err.message);
+                return Ok(res);
+            };
+
             let user_query = request.take_content();
 
             let query_execution_response = old_query_execution_service
                 .call((user_query.clone(), delegation_from_nns))
                 .await?;
 
-            let (query_response, timestamp) = match query_execution_response {
+            let (response, timestamp) = match query_execution_response {
                 Err(QueryExecutionError::CertifiedStateUnavailable) => {
                     return Ok(make_plaintext_response(
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -228,6 +264,25 @@ impl Service<Request<Bytes>> for QueryService {
                     ))
                 }
                 Ok((response, time)) => (response, time),
+            };
+
+            let query_response = match response {
+                Ok(res) => match res {
+                    WasmResult::Reply(vec) => HttpQueryResponse::Replied {
+                        reply: HttpQueryResponseReply { arg: Blob(vec) },
+                    },
+                    WasmResult::Reject(message) => HttpQueryResponse::Rejected {
+                        error_code: ErrorCode::CanisterRejectedMessage.to_string(),
+                        reject_code: RejectCode::CanisterReject as u64,
+                        reject_message: message,
+                    },
+                },
+
+                Err(user_error) => HttpQueryResponse::Rejected {
+                    error_code: user_error.code().to_string(),
+                    reject_code: user_error.reject_code() as u64,
+                    reject_message: user_error.to_string(),
+                },
             };
 
             let response_hash = QueryResponseHash::new(&query_response, &user_query, timestamp);
@@ -256,10 +311,7 @@ impl Service<Request<Bytes>> for QueryService {
                         node_signature,
                     };
 
-                    let (resp, body_size) = cbor_response(&signed_query_response);
-                    response_body_size_bytes_metric
-                        .with_label_values(&[ApiReqType::Query.into()])
-                        .observe(body_size as f64);
+                    let (resp, _body_size) = cbor_response(&signed_query_response);
                     resp
                 }
                 Err(signing_error) => {

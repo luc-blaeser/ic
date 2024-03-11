@@ -18,7 +18,6 @@ use ic_nns_common::{
     types::UpdateIcpXdrConversionRatePayload,
 };
 use ic_nns_constants::LEDGER_CANISTER_ID;
-use ic_nns_governance::pb::v1::NeuronType;
 use ic_nns_governance::{
     governance::{
         governance_minting_account, neuron_subaccount, Environment, Governance, HeapGrowthPotential,
@@ -31,7 +30,7 @@ use ic_nns_governance::{
         neuron,
         neuron::DissolveState,
         proposal, ExecuteNnsFunction, Governance as GovernanceProto, GovernanceError, ManageNeuron,
-        ManageNeuronResponse, Motion, NetworkEconomics, Neuron, NnsFunction, Proposal,
+        ManageNeuronResponse, Motion, NetworkEconomics, Neuron, NeuronType, NnsFunction, Proposal,
         ProposalData, Topic, Vote,
     },
 };
@@ -630,17 +629,19 @@ impl ProposalNeuronBehavior {
                 })
             }
         };
-        let pid = tokio_test::block_on(nns.governance.make_proposal(
-            &NeuronId { id: self.proposer },
-            &principal(self.proposer),
-            &Proposal {
-                title: Some("A Reasonable Title".to_string()),
-                summary,
-                action: Some(action),
-                ..Default::default()
-            },
-        ))
-        .unwrap();
+        let pid = nns
+            .governance
+            .make_proposal(
+                &NeuronId { id: self.proposer },
+                &principal(self.proposer),
+                &Proposal {
+                    title: Some("A Reasonable Title".to_string()),
+                    summary,
+                    action: Some(action),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         // Vote
         for (voter, vote) in &self.votes {
             nns.register_vote_assert_success(
@@ -809,17 +810,18 @@ impl NNS {
         action: proposal::Action,
     ) -> ProposalId {
         // Submit proposal
-        tokio_test::block_on(self.governance.make_proposal(
-            &NeuronId { id: prop.proposer },
-            &principal(prop.proposer),
-            &Proposal {
-                title: Some("A Reasonable Title".to_string()),
-                summary,
-                action: Some(action),
-                ..Default::default()
-            },
-        ))
-        .unwrap()
+        self.governance
+            .make_proposal(
+                &NeuronId { id: prop.proposer },
+                &principal(prop.proposer),
+                &Proposal {
+                    title: Some("A Reasonable Title".to_string()),
+                    summary,
+                    action: Some(action),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
     }
 
     pub fn propose_and_vote(

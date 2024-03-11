@@ -10,10 +10,10 @@ use crate::{
     CanisterId, CountBytes, PrincipalId, SubnetId, Time, UserId,
 };
 use ic_error_types::{ErrorCode, UserError};
-use ic_ic00_types::{
-    CanisterIdRecord, CanisterInfoRequest, ClearChunkStoreArgs, InstallChunkedCodeArgs,
-    InstallCodeArgsV2, Method, Payload, StoredChunksArgs, UpdateSettingsArgs, UploadChunkArgs,
-    IC_00,
+use ic_management_canister_types::{
+    CanisterIdRecord, CanisterInfoRequest, ClearChunkStoreArgs, FetchCanisterLogsRequest,
+    InstallChunkedCodeArgs, InstallCodeArgsV2, Method, Payload, StoredChunksArgs,
+    UpdateSettingsArgs, UploadChunkArgs, IC_00,
 };
 use ic_protobuf::{
     log::ingress_message_log_entry::v1::IngressMessageLogEntry,
@@ -511,7 +511,16 @@ pub fn extract_effective_canister_id(
             Ok(record) => Ok(Some(record.get_canister_id())),
             Err(err) => Err(ParseIngressError::InvalidSubnetPayload(err.to_string())),
         },
-        Ok(Method::DeleteChunks) => Err(ParseIngressError::UnknownSubnetMethod),
+        Ok(Method::FetchCanisterLogs) => match FetchCanisterLogsRequest::decode(ingress.arg()) {
+            Ok(record) => Ok(Some(record.get_canister_id())),
+            Err(err) => Err(ParseIngressError::InvalidSubnetPayload(err.to_string())),
+        },
+        Ok(Method::DeleteChunks)
+        | Ok(Method::TakeCanisterSnapshot)
+        | Ok(Method::LoadCanisterSnapshot)
+        | Ok(Method::ListCanisterSnapshots)
+        | Ok(Method::DeleteCanisterSnapshot) => Err(ParseIngressError::UnknownSubnetMethod),
+
         Ok(Method::CreateCanister)
         | Ok(Method::SetupInitialDKG)
         | Ok(Method::DepositCycles)
@@ -534,6 +543,11 @@ pub fn extract_effective_canister_id(
     }
 }
 
+/// Checks whether the given canister ID refers to the subnet (directly or as `IC_00`).
+pub fn is_subnet_id(canister_id: CanisterId, own_subnet_id: SubnetId) -> bool {
+    canister_id == IC_00 || canister_id.get_ref() == own_subnet_id.get_ref()
+}
+
 #[cfg(test)]
 mod test {
     use crate::messages::ingress_messages::{
@@ -541,7 +555,7 @@ mod test {
     };
     use crate::{CanisterId, SubnetId, UserId};
     use ic_base_types::PrincipalId;
-    use ic_ic00_types::IC_00;
+    use ic_management_canister_types::IC_00;
     use std::convert::From;
 
     #[test]
@@ -583,9 +597,4 @@ mod test {
             );
         }
     }
-}
-
-/// Checks whether the given canister ID refers to the subnet (directly or as `IC_00`).
-pub fn is_subnet_id(canister_id: CanisterId, own_subnet_id: SubnetId) -> bool {
-    canister_id == IC_00 || canister_id.get_ref() == own_subnet_id.get_ref()
 }

@@ -16,6 +16,8 @@ use proptest::prelude::*;
 use proptest::sample::select;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
+use rosetta_core::objects::Currency;
+use rosetta_core::objects::ObjectMap;
 use serde_bytes::ByteBuf;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -26,7 +28,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const E8: u64 = 100_000_000;
 pub const DEFAULT_TRANSFER_FEE: u64 = 10_000;
-pub const IDENTITY_PEM:&str = "-----BEGIN PRIVATE KEY-----\nMFMCAQEwBQYDK2VwBCIEILhMGpmYuJ0JEhDwocj6pxxOmIpGAXZd40AjkNhuae6q\noSMDIQBeXC6ae2dkJ8QC50bBjlyLqsFQFsMsIThWB21H6t6JRA==\n-----END PRIVATE KEY-----";
 
 pub fn minter_identity() -> BasicIdentity {
     let rng = ring::rand::SystemRandom::new();
@@ -74,47 +75,58 @@ fn operation_strategy<Tokens: TokensType>(
     amount_strategy: impl Strategy<Value = Tokens>,
 ) -> impl Strategy<Value = Operation<Tokens>> {
     amount_strategy.prop_flat_map(|amount| {
+        // Clone amount due to move
+        let mint_amount = amount.clone();
+        let mint_strategy = account_strategy().prop_map(move |to| Operation::Mint {
+            to,
+            amount: mint_amount.clone(),
+        });
+        let burn_amount = amount.clone();
+        let burn_strategy = account_strategy().prop_map(move |from| Operation::Burn {
+            from,
+            spender: None,
+            amount: burn_amount.clone(),
+        });
+        let transfer_amount = amount.clone();
+        let transfer_strategy = (
+            account_strategy(),
+            account_strategy(),
+            prop::option::of(Just(token_amount(DEFAULT_TRANSFER_FEE))),
+        )
+            .prop_map(move |(to, from, fee)| Operation::Transfer {
+                from,
+                to,
+                spender: None,
+                amount: transfer_amount.clone(),
+                fee,
+            });
+        let approve_amount = amount.clone();
+        let approve_strategy = (
+            account_strategy(),
+            account_strategy(),
+            prop::option::of(Just(token_amount(DEFAULT_TRANSFER_FEE))),
+            prop::option::of(Just({
+                (SystemTime::now()
+                    + Duration::from_secs(rand::thread_rng().gen_range(0..=u32::MAX as u64)))
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+            })),
+        )
+            .prop_map(move |(spender, from, fee, expires_at)| Operation::Approve {
+                from,
+                spender,
+                amount: approve_amount.clone(),
+                expected_allowance: Some(amount.clone()),
+                expires_at,
+                fee,
+            });
+
         prop_oneof![
-            account_strategy().prop_map(move |to| Operation::Mint { to, amount }),
-            account_strategy().prop_map(move |from| {
-                Operation::Burn {
-                    from,
-                    spender: None,
-                    amount,
-                }
-            }),
-            (
-                account_strategy(),
-                account_strategy(),
-                prop::option::of(Just(token_amount(DEFAULT_TRANSFER_FEE)))
-            )
-                .prop_map(move |(to, from, fee)| Operation::Transfer {
-                    from,
-                    to,
-                    spender: None,
-                    amount,
-                    fee
-                }),
-            (
-                account_strategy(),
-                account_strategy(),
-                prop::option::of(Just(token_amount(DEFAULT_TRANSFER_FEE))),
-                prop::option::of(Just({
-                    (SystemTime::now()
-                        + Duration::from_secs(rand::thread_rng().gen_range(0..=u32::MAX as u64)))
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as u64
-                }))
-            )
-                .prop_map(move |(spender, from, fee, expires_at)| Operation::Approve {
-                    from,
-                    spender,
-                    amount,
-                    expected_allowance: Some(amount),
-                    expires_at,
-                    fee
-                }),
+            mint_strategy,
+            burn_strategy,
+            transfer_strategy,
+            approve_strategy,
         ]
     })
 }
@@ -165,7 +177,7 @@ pub fn blocks_strategy<Tokens: TokensType>(
     let transaction_strategy = transaction_strategy(amount_strategy);
     let fee_collector_strategy = prop::option::of(account_strategy());
     let fee_collector_block_index_strategy = prop::option::of(prop::num::u64::ANY);
-    let fee_strategy = prop::option::of(arb_small_amount());
+    let effective_fee_strategy = arb_small_amount::<Tokens>();
     let timestamp_strategy = Just({
         let end = SystemTime::now();
         // Ledger takes transactions that were created in the last 24 hours (5 minute window to submit valid transactions)
@@ -178,29 +190,26 @@ pub fn blocks_strategy<Tokens: TokensType>(
     });
     (
         transaction_strategy,
-        fee_strategy,
+        effective_fee_strategy,
         timestamp_strategy,
         fee_collector_strategy,
         fee_collector_block_index_strategy,
     )
         .prop_map(
-            |(transaction, fee, timestamp, fee_collector, fee_collector_block_index)| {
-                let transaction_fee = match transaction.operation {
-                    Operation::Transfer { fee, .. } => fee,
-                    Operation::Approve { fee, .. } => fee,
+            |(transaction, arb_fee, timestamp, fee_collector, fee_collector_block_index)| {
+                let effective_fee = match transaction.operation {
+                    Operation::Transfer { ref fee, .. } => fee.clone().is_none().then_some(arb_fee),
+                    Operation::Approve { ref fee, .. } => fee.clone().is_none().then_some(arb_fee),
                     Operation::Burn { .. } => None,
                     Operation::Mint { .. } => None,
                 };
-                let effective_fee = transaction_fee
-                    .is_none()
-                    .then(|| fee.unwrap_or(token_amount(DEFAULT_TRANSFER_FEE)));
-                assert!(effective_fee.is_some() || transaction_fee.is_some());
+
                 Block {
                     parent_hash: Some(Block::<Tokens>::block_hash(
                         &Block {
                             parent_hash: None,
                             transaction: transaction.clone(),
-                            effective_fee,
+                            effective_fee: effective_fee.clone(),
                             timestamp,
                             fee_collector,
                             fee_collector_block_index,
@@ -326,21 +335,24 @@ impl ArgWithCaller {
         };
         fee.as_ref().map(|fee| fee.0.to_u64().unwrap())
     }
-    pub fn to_transaction(&self, minter: Account) -> Transaction<Tokens> {
+    pub fn to_transaction<T>(&self, minter: Account) -> Transaction<T>
+    where
+        T: TokensType,
+    {
         let from = self.from();
         let (operation, created_at_time, memo) = match self.arg.clone() {
             LedgerEndpointArg::ApproveArg(approve_arg) => {
-                let operation = Operation::<Tokens>::Approve {
-                    amount: Tokens::try_from(approve_arg.amount.clone()).unwrap(),
+                let operation = Operation::<T>::Approve {
+                    amount: T::try_from(approve_arg.amount.clone()).unwrap(),
                     expires_at: approve_arg.expires_at,
                     fee: approve_arg
                         .fee
                         .clone()
-                        .map(|f| Tokens::try_from(f.clone()).unwrap()),
+                        .map(|f| T::try_from(f.clone()).unwrap()),
                     expected_allowance: approve_arg
                         .expected_allowance
                         .clone()
-                        .map(|a| Tokens::try_from(a.clone()).unwrap()),
+                        .map(|a| T::try_from(a.clone()).unwrap()),
                     spender: approve_arg.spender,
                     from,
                 };
@@ -351,32 +363,29 @@ impl ArgWithCaller {
                 let mint_operation = from == minter;
                 let operation = if mint_operation {
                     Operation::Mint {
-                        amount: Tokens::try_from(transfer_arg.amount.clone()).unwrap(),
+                        amount: T::try_from(transfer_arg.amount.clone()).unwrap(),
                         to: transfer_arg.to,
                     }
                 } else if burn_operation {
                     Operation::Burn {
-                        amount: Tokens::try_from(transfer_arg.amount.clone()).unwrap(),
+                        amount: T::try_from(transfer_arg.amount.clone()).unwrap(),
                         from,
                         spender: None,
                     }
                 } else {
                     Operation::Transfer {
-                        amount: Tokens::try_from(transfer_arg.amount.clone()).unwrap(),
+                        amount: T::try_from(transfer_arg.amount.clone()).unwrap(),
                         to: transfer_arg.to,
                         from,
                         spender: None,
-                        fee: transfer_arg
-                            .fee
-                            .clone()
-                            .map(|f| Tokens::try_from(f).unwrap()),
+                        fee: transfer_arg.fee.clone().map(|f| T::try_from(f).unwrap()),
                     }
                 };
 
                 (operation, transfer_arg.created_at_time, transfer_arg.memo)
             }
         };
-        Transaction::<Tokens> {
+        Transaction::<T> {
             operation,
             created_at_time,
             memo,
@@ -545,7 +554,7 @@ fn basic_identity_and_account_strategy() -> impl Strategy<Value = SigningAccount
 ///       e.g. exponential distribution
 /// TODO: allow to pass the account distribution
 pub fn valid_transactions_strategy(
-    minter_identity: BasicIdentity,
+    minter_identity: Arc<BasicIdentity>,
     default_fee: u64,
     length: usize,
     now: SystemTime,
@@ -877,7 +886,7 @@ pub fn valid_transactions_strategy(
 
     generate_strategy(
         TransactionsAndBalances::default(),
-        Arc::new(minter_identity),
+        minter_identity.clone(),
         default_fee,
         length,
         now,
@@ -903,27 +912,6 @@ pub fn metadata_strategy() -> impl Strategy<Value = Vec<(String, MetadataValue)>
             ),
         ]
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{minter_identity, valid_transactions_strategy};
-    use proptest::{
-        strategy::{Strategy, ValueTree},
-        test_runner::TestRunner,
-    };
-    use std::time::SystemTime;
-
-    #[test]
-    fn test_valid_transactions_strategy_generates_transaction() {
-        let size = 10;
-        let strategy =
-            valid_transactions_strategy(minter_identity(), 10_000, size, SystemTime::now());
-        let tree = strategy
-            .new_tree(&mut TestRunner::default())
-            .expect("Unable to run valid_transactions_strategy");
-        assert_eq!(tree.current().len(), size)
-    }
 }
 
 pub fn arb_account() -> impl Strategy<Value = Account> {
@@ -1070,4 +1058,59 @@ where
                 fee_collector_block_index: fee_col_block,
             },
         )
+}
+
+pub fn currency_strategy() -> impl Strategy<Value = Currency> {
+    (decimals_strategy(), symbol_strategy()).prop_map(|(decimals, symbol)| Currency {
+        symbol,
+        decimals: decimals.into(),
+        metadata: None,
+    })
+}
+
+pub fn valid_construction_payloads_request_metadata() -> impl Strategy<Value = ObjectMap> {
+    let memo_strategy = arb_memo();
+    let now = SystemTime::now();
+    let now_u64 = now.duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+    let ingress_start_strategy = prop::option::of(Just(now_u64));
+    let created_at_time = valid_created_at_time_strategy(now);
+
+    (memo_strategy, ingress_start_strategy, created_at_time).prop_map(
+        |(memo, ingress_start, created_at_time)| {
+            let mut map = ObjectMap::new();
+            map.insert(
+                "memo".to_string(),
+                memo.map(|m| m.0.as_slice().to_vec()).into(),
+            );
+            map.insert("ingress_start".to_string(), ingress_start.into());
+            map.insert("created_at_time".to_string(), created_at_time.into());
+            map
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{minter_identity, valid_transactions_strategy};
+    use proptest::{
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
+    use std::sync::Arc;
+    use std::time::SystemTime;
+
+    #[test]
+    fn test_valid_transactions_strategy_generates_transaction() {
+        let size = 10;
+        let strategy = valid_transactions_strategy(
+            Arc::new(minter_identity()),
+            10_000,
+            size,
+            SystemTime::now(),
+        );
+        let tree = strategy
+            .new_tree(&mut TestRunner::default())
+            .expect("Unable to run valid_transactions_strategy");
+        assert_eq!(tree.current().len(), size)
+    }
 }

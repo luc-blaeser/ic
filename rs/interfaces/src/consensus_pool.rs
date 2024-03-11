@@ -13,11 +13,13 @@ use ic_types::{
         Finalization, FinalizationShare, HasHeight, HashedBlock, Notarization, NotarizationShare,
         RandomBeacon, RandomBeaconShare, RandomTape, RandomTapeShare,
     },
+    crypto::CryptoHashOf,
     time::Time,
     Height,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// The height, at which we consider a replica to be behind
 pub const HEIGHT_CONSIDERED_BEHIND: Height = Height::new(20);
@@ -39,15 +41,35 @@ pub type ChangeSet = Vec<ChangeAction>;
 
 /// Change actions applicable to the consensus pool.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ChangeAction {
+    /// Add the given artifact to the validated section of the pool.
     AddToValidated(ValidatedConsensusArtifact),
+    /// Remove the given artifact from the validated section of the pool.
+    RemoveFromValidated(ConsensusMessage),
+    /// Remove the given artifact from the unvalidated section of the pool and add it to
+    /// the validated section of the pool.
     MoveToValidated(ConsensusMessage),
+    /// Remove the given artifact from the unvalidated section of the pool.
     RemoveFromUnvalidated(ConsensusMessage),
+    /// Remove an invalid artifact from the unvalidated section of the pool.
     HandleInvalid(ConsensusMessage, String),
+    /// Purge all the artifacts _strictly_ below the provided height from the validated
+    /// section of the pool.
     PurgeValidatedBelow(Height),
+    /// Purge all the artifacts _strictly_ below the provided height from the unvalidated
+    /// section of the pool.
     PurgeUnvalidatedBelow(Height),
-    PurgeValidatedSharesBelow(Height),
+    /// Purge all the artifacts of the given type _strictly_ below the provided height
+    /// from the validated section of the pool.
+    PurgeValidatedOfTypeBelow(PurgeableArtifactType, Height),
+}
+
+/// A type of consensus artifact which can be selectively deleted from the consensus pool.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PurgeableArtifactType {
+    NotarizationShare,
+    FinalizationShare,
 }
 
 impl From<ChangeAction> for ChangeSet {
@@ -91,6 +113,9 @@ impl ContentEq for ChangeAction {
             (ChangeAction::AddToValidated(x), ChangeAction::AddToValidated(y)) => {
                 x.msg.content_eq(&y.msg)
             }
+            (ChangeAction::RemoveFromValidated(x), ChangeAction::RemoveFromValidated(y)) => {
+                x.content_eq(y)
+            }
             (ChangeAction::MoveToValidated(x), ChangeAction::MoveToValidated(y)) => x.content_eq(y),
             (ChangeAction::RemoveFromUnvalidated(x), ChangeAction::RemoveFromUnvalidated(y)) => {
                 x.content_eq(y)
@@ -107,9 +132,9 @@ impl ContentEq for ChangeAction {
             }
             (ChangeAction::PurgeValidatedBelow(x), ChangeAction::PurgeValidatedBelow(y)) => x == y,
             (
-                ChangeAction::PurgeValidatedSharesBelow(x),
-                ChangeAction::PurgeValidatedSharesBelow(y),
-            ) => x == y,
+                ChangeAction::PurgeValidatedOfTypeBelow(type_1, x),
+                ChangeAction::PurgeValidatedOfTypeBelow(type_2, y),
+            ) => x == y && type_1 == type_2,
             // Default to false when comparing actions of different type
             _ => false,
         }
@@ -141,7 +166,7 @@ impl TryFrom<pb::ValidatedConsensusArtifact> for ValidatedConsensusArtifact {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeightRange {
     pub min: Height,
     pub max: Height,
@@ -242,6 +267,9 @@ pub trait PoolSection<T> {
 /// - The unvalidated section contains artifacts that have been received but
 ///   haven't yet been validated. This section is in-memory only and thus
 ///   volatile.
+///
+/// It also stores monotonic timestamps ("instants") for block proposals
+/// and notarizations.
 pub trait ConsensusPool {
     /// Return a reference to the validated PoolSection.
     fn validated(&self) -> &dyn PoolSection<ValidatedConsensusArtifact>;
@@ -254,6 +282,13 @@ pub trait ConsensusPool {
 
     /// Return a reference to the consensus block cache (ConsensusBlockCache).
     fn as_block_cache(&self) -> &dyn ConsensusBlockCache;
+
+    /// Return the block chain between the given start/end.
+    fn build_block_chain(&self, start: &Block, end: &Block) -> Arc<dyn ConsensusBlockChain>;
+
+    /// Return the first instant at which a block with the given hash was inserted
+    /// into the validated pool. Returns None if no timestamp was found.
+    fn block_instant(&self, hash: &CryptoHashOf<Block>) -> Option<Instant>;
 }
 
 /// HeightIndexedPool provides a set of interfaces for the Consensus component
@@ -263,15 +298,13 @@ pub trait HeightIndexedPool<T> {
     /// Returns the height range of artifacts of type T currently in the pool.
     fn height_range(&self) -> Option<HeightRange>;
 
-    /// Returns the max height across all artifacts of type T currently in the
-    /// pool.
+    /// Returns the max height across all artifacts of type T currently in the pool.
     fn max_height(&self) -> Option<Height>;
 
     /// Return an iterator over all of the artifacts of type T.
     fn get_all(&self) -> Box<dyn Iterator<Item = T>>;
 
-    /// Return an iterator over the artifacts of type T at height
-    /// 'h'.
+    /// Return an iterator over the artifacts of type T at height 'h'.
     fn get_by_height(&self, h: Height) -> Box<dyn Iterator<Item = T>>;
 
     /// Return an iterator over the artifacts of type T
@@ -291,6 +324,9 @@ pub trait HeightIndexedPool<T> {
     /// Return an iterator over instances of artifact of type T at the highest
     /// height currently in the pool.
     fn get_highest_iter(&self) -> Box<dyn Iterator<Item = T>>;
+
+    /// Return the number of artifacts of type T in the pool.
+    fn size(&self) -> usize;
 }
 // end::interface[]
 
@@ -324,14 +360,7 @@ pub trait ConsensusPoolCache: Send + Sync {
     /// between the one returned from this function and the current
     /// `RegistryVersion`.
     fn get_oldest_registry_version_in_use(&self) -> RegistryVersion {
-        self.catch_up_package()
-            .content
-            .block
-            .get_value()
-            .payload
-            .as_ref()
-            .as_summary()
-            .get_oldest_registry_version_in_use()
+        self.catch_up_package().get_oldest_registry_version_in_use()
     }
 
     /// The target height that the StateManager should start at given

@@ -20,6 +20,7 @@ use ic_registry_client_helpers::{
 };
 use ic_registry_subnet_type::SubnetType;
 use ic_types::RegistryVersion;
+use tokio::sync::watch;
 use tracing::info;
 use x509_parser::{certificate::X509Certificate, prelude::FromDer};
 
@@ -32,7 +33,7 @@ use crate::{
 // Some magical prefix that the public key should have
 const DER_PREFIX: &[u8; 37] = b"\x30\x81\x82\x30\x1d\x06\x0d\x2b\x06\x01\x04\x01\x82\xdc\x7c\x05\x03\x01\x02\x01\x06\x0c\x2b\x06\x01\x04\x01\x82\xdc\x7c\x05\x03\x02\x01\x03\x61\x00";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Node {
     pub id: Principal,
     pub subnet_id: Principal,
@@ -43,24 +44,33 @@ pub struct Node {
     pub replica_version: String,
 }
 
+// Lightweight Eq, just compare principals
+// If one ever needs a deep comparison - this needs to be removed and #[derive(Eq)] used
+impl PartialEq for Node {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+impl Eq for Node {}
+
 impl fmt::Display for Node {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "[{:?}]:{:?}", self.addr, self.port)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CanisterRange {
     pub start: Principal,
     pub end: Principal,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Subnet {
     pub id: Principal,
     pub subnet_type: SubnetType,
     pub ranges: Vec<CanisterRange>,
-    pub nodes: Vec<Node>,
+    pub nodes: Vec<Arc<Node>>,
     pub replica_version: String,
 }
 
@@ -84,15 +94,14 @@ impl SnapshotPersister {
         }
     }
 
-    pub async fn persist(&self, s: RegistrySnapshot) -> Result<(), Error> {
+    pub fn persist(&self, s: RegistrySnapshot) -> Result<(), Error> {
         self.generator.generate(s)?;
-        self.reloader.reload().await
+        self.reloader.reload()
     }
 }
 
-#[async_trait]
 pub trait Snapshot: Send + Sync {
-    async fn snapshot(&mut self) -> Result<SnapshotResult, Error>;
+    fn snapshot(&mut self) -> Result<SnapshotResult, Error>;
 }
 
 #[derive(Debug, Clone)]
@@ -103,11 +112,12 @@ pub struct RegistrySnapshot {
     pub nns_public_key: Vec<u8>,
     pub subnets: Vec<Subnet>,
     // Hash map for a faster lookup by DNS resolver
-    pub nodes: HashMap<String, Node>,
+    pub nodes: HashMap<String, Arc<Node>>,
 }
 
 pub struct Snapshotter {
     published_registry_snapshot: Arc<ArcSwapOption<RegistrySnapshot>>,
+    channel_notify: watch::Sender<Option<Arc<RegistrySnapshot>>>,
     registry_client: Arc<dyn RegistryClient>,
     registry_version_available: Option<RegistryVersion>,
     registry_version_published: Option<RegistryVersion>,
@@ -137,11 +147,13 @@ pub enum SnapshotResult {
 impl Snapshotter {
     pub fn new(
         published_registry_snapshot: Arc<ArcSwapOption<RegistrySnapshot>>,
+        channel_notify: watch::Sender<Option<Arc<RegistrySnapshot>>>,
         registry_client: Arc<dyn RegistryClient>,
         min_version_age: Duration,
     ) -> Self {
         Self {
             published_registry_snapshot,
+            channel_notify,
             registry_client,
             registry_version_published: None,
             registry_version_available: None,
@@ -230,7 +242,7 @@ impl Snapshotter {
                 // If this fails then the libraries are in despair, better to die here
                 let subnet_type = SubnetType::try_from(subnet.subnet_type()).unwrap();
 
-                let nodes = node_ids
+                let mut nodes = node_ids
                     .into_iter()
                     .map(|node_id| {
                         let transport_info = self
@@ -252,7 +264,7 @@ impl Snapshotter {
                         X509Certificate::from_der(cert.certificate_der.as_slice())
                             .context("Unable to parse TLS certificate")?;
 
-                        let node_route = Node {
+                        let node = Node {
                             id: node_id.as_ref().0,
                             subnet_id: subnet_id.as_ref().0,
                             subnet_type,
@@ -262,19 +274,22 @@ impl Snapshotter {
                             tls_certificate: cert.certificate_der,
                             replica_version: replica_version.to_string(),
                         };
+                        let node = Arc::new(node);
 
-                        nodes_map.insert(node_route.id.to_string(), node_route.clone());
-                        let out: Result<Node, Error> = Ok(node_route);
-                        out
+                        nodes_map.insert(node.id.to_string(), node.clone());
+
+                        Ok::<Arc<Node>, Error>(node)
                     })
-                    .collect::<Result<Vec<Node>, Error>>()
+                    .collect::<Result<Vec<Arc<Node>>, Error>>()
                     .context("unable to get nodes")?;
+
+                nodes.sort_by_key(|x| x.id);
 
                 let ranges = ranges_by_subnet
                     .remove(&subnet_id.as_ref().0)
                     .context("unable to find ranges")?;
 
-                let subnet_route = Subnet {
+                let subnet = Subnet {
                     id: subnet_id.as_ref().0,
                     subnet_type,
                     ranges,
@@ -282,8 +297,7 @@ impl Snapshotter {
                     replica_version: replica_version.to_string(),
                 };
 
-                let out: Result<Subnet, Error> = Ok(subnet_route);
-                out
+                Ok::<Subnet, Error>(subnet)
             })
             .collect::<Result<Vec<Subnet>, Error>>()
             .context("unable to get subnets")?;
@@ -302,9 +316,8 @@ impl Snapshotter {
     }
 }
 
-#[async_trait]
 impl Snapshot for Snapshotter {
-    async fn snapshot(&mut self) -> Result<SnapshotResult, Error> {
+    fn snapshot(&mut self) -> Result<SnapshotResult, Error> {
         // Fetch latest available registry version
         let version = self.registry_client.get_latest_version();
 
@@ -353,14 +366,15 @@ impl Snapshot for Snapshotter {
         };
 
         // Publish the new snapshot
+        let snapshot_arc = Arc::new(snapshot.clone());
         self.published_registry_snapshot
-            .store(Some(Arc::new(snapshot.clone())));
-
+            .store(Some(snapshot_arc.clone()));
         self.registry_version_published = Some(version);
+        self.channel_notify.send_replace(Some(snapshot_arc));
 
         // Persist the firewall rules if configured
         if let Some(v) = &self.persister {
-            v.persist(snapshot).await?;
+            v.persist(snapshot)?;
         }
 
         Ok(SnapshotResult::Published(result))
@@ -370,7 +384,7 @@ impl Snapshot for Snapshotter {
 #[async_trait]
 impl<T: Snapshot> Run for WithMetricsSnapshot<T> {
     async fn run(&mut self) -> Result<(), Error> {
-        let r = self.0.snapshot().await?;
+        let r = self.0.snapshot()?;
 
         match r {
             SnapshotResult::Published(v) => {

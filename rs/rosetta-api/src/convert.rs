@@ -4,7 +4,6 @@ use crate::convert::state::State;
 use crate::errors::ApiError;
 use crate::models::amount::{from_amount, ledgeramount_from_amount};
 use crate::models::operation::OperationType;
-use crate::models::RosettaSupportedKeyPair;
 use crate::models::{self, AccountIdentifier, BlockIdentifier, Operation};
 use crate::request::request_result::RequestResult;
 use crate::request::transaction_operation_results::TransactionOperationResults;
@@ -19,8 +18,6 @@ use crate::request_types::{
 use crate::transaction_id::TransactionIdentifier;
 use crate::{convert, errors};
 use dfn_protobuf::ProtoBuf;
-use ic_canister_client_sender::Ed25519KeyPair as EdKeypair;
-use ic_canister_client_sender::Secp256k1KeyPair;
 use ic_crypto_tree_hash::Path;
 use ic_ledger_canister_blocks_synchronizer::blocks::HashedBlock;
 use ic_ledger_core::block::BlockType;
@@ -29,6 +26,7 @@ use ic_types::messages::{HttpCanisterUpdate, HttpReadState};
 use ic_types::{CanisterId, PrincipalId};
 use icp_ledger::{Block, BlockIndex, Operation as LedgerOperation, SendArgs, Subaccount, Tokens};
 use on_wire::{FromWire, IntoWire};
+use rosetta_core::convert::principal_id_from_public_key;
 use serde_json::map::Map;
 use serde_json::{from_value, Number, Value};
 use std::convert::{TryFrom, TryInto};
@@ -41,7 +39,7 @@ pub fn block_to_transaction(
     token_name: &str,
 ) -> Result<models::Transaction, ApiError> {
     let block = Block::decode(hb.block.clone())
-        .map_err(|err| ApiError::internal_error(format!("Cannot decode block: {}", err)))?;
+        .map_err(|err| ApiError::internal_error(format!("Cannot decode block: {:?}", err)))?;
     let transaction = block.transaction;
     let transaction_identifier = TransactionIdentifier::from(&transaction);
     let operation = transaction.operation;
@@ -94,12 +92,12 @@ pub fn operations_to_requests(
             .map_err(|e| op_error(o, e))?;
 
         let validate_neuron_management_op = || {
-            if o.amount.is_some() && o._type.parse::<OperationType>()? != OperationType::Disburse {
+            if o.amount.is_some() && o.type_.parse::<OperationType>()? != OperationType::Disburse {
                 Err(op_error(
                     o,
                     format!(
                         "neuron management {:?} operation cannot have an amount",
-                        o._type
+                        o.type_
                     ),
                 ))
             } else if o.coin_change.is_some() {
@@ -107,7 +105,7 @@ pub fn operations_to_requests(
                     o,
                     format!(
                         "neuron management {:?} operation cannot have a coin change",
-                        o._type
+                        o.type_
                     ),
                 ))
             } else {
@@ -115,7 +113,7 @@ pub fn operations_to_requests(
             }
         };
 
-        match o._type.parse::<OperationType>()? {
+        match o.type_.parse::<OperationType>()? {
             OperationType::Transaction => {
                 let amount = o
                     .amount
@@ -256,8 +254,12 @@ pub fn operations_to_requests(
                 };
                 state.neuron_info(account, principal, neuron_index)?;
             }
+            OperationType::ListNeurons => {
+                validate_neuron_management_op()?;
+                state.list_neurons(account)?;
+            }
             OperationType::Burn | OperationType::Mint => {
-                let msg = format!("Unsupported operation type: {:?}", o._type);
+                let msg = format!("Unsupported operation type: {:?}", o.type_);
                 return Err(op_error(o, msg));
             }
             OperationType::Follow => {
@@ -321,7 +323,7 @@ pub fn from_public_key(pk: &models::PublicKey) -> Result<Vec<u8>, ApiError> {
 
 pub fn from_hex(hex: &str) -> Result<Vec<u8>, ApiError> {
     hex::decode(hex)
-        .map_err(|e| ApiError::invalid_request(format!("Hex could not be decoded {}", e)))
+        .map_err(|e| ApiError::invalid_request(format!("Hex could not be decoded {:?}", e)))
 }
 
 pub fn to_hex(v: &[u8]) -> String {
@@ -329,7 +331,8 @@ pub fn to_hex(v: &[u8]) -> String {
 }
 
 pub fn account_from_public_key(pk: &models::PublicKey) -> Result<AccountIdentifier, ApiError> {
-    let pid = principal_id_from_public_key(pk)?;
+    let pid = principal_id_from_public_key(pk)
+        .map_err(|err| ApiError::InvalidPublicKey(false, err.into()))?;
     Ok(to_model_account_identifier(&pid.into()))
 }
 
@@ -338,7 +341,8 @@ pub fn neuron_subaccount_bytes_from_public_key(
     pk: &models::PublicKey,
     neuron_index: u64,
 ) -> Result<[u8; 32], ApiError> {
-    let controller = principal_id_from_public_key(pk)?;
+    let controller = principal_id_from_public_key(pk)
+        .map_err(|err| ApiError::InvalidPublicKey(false, err.into()))?;
     Ok(neuron_subaccount_hash(&controller, neuron_index))
 }
 
@@ -379,18 +383,8 @@ pub fn principal_id_from_public_key_or_principal(
 ) -> Result<PrincipalId, ApiError> {
     match pkp {
         PublicKeyOrPrincipal::Principal(p) => Ok(p),
-        PublicKeyOrPrincipal::PublicKey(pk) => principal_id_from_public_key(&pk),
-    }
-}
-
-pub fn principal_id_from_public_key(pk: &models::PublicKey) -> Result<PrincipalId, ApiError> {
-    match pk.curve_type {
-        models::CurveType::Edwards25519 => EdKeypair::get_principal_id(&pk.hex_bytes),
-        models::CurveType::Secp256K1 => Secp256k1KeyPair::get_principal_id(&pk.hex_bytes),
-        _ => Err(ApiError::InvalidPublicKey(
-            false,
-            format!("Curve Type {} is not supported", pk.curve_type).into(),
-        )),
+        PublicKeyOrPrincipal::PublicKey(pk) => principal_id_from_public_key(&pk)
+            .map_err(|err| ApiError::InvalidPublicKey(false, err.into())),
     }
 }
 
@@ -446,9 +440,9 @@ pub fn from_transaction_operation_results(
     for _type in requests.into_iter() {
         let o = match (&_type, &t.operations[op_idx..]) {
             (Request::Transfer(LedgerOperation::Transfer { .. }), [withdraw, deposit, fee, ..])
-                if withdraw._type.parse::<OperationType>()? == OperationType::Transaction
-                    && deposit._type.parse::<OperationType>()? == OperationType::Transaction
-                    && fee._type.parse::<OperationType>()? == OperationType::Fee =>
+                if withdraw.type_.parse::<OperationType>()? == OperationType::Transaction
+                    && deposit.type_.parse::<OperationType>()? == OperationType::Transaction
+                    && fee.type_.parse::<OperationType>()? == OperationType::Fee =>
             {
                 op_idx += 3;
                 fee

@@ -10,7 +10,7 @@ documentation.workspace = true
 path = "../certificate_orchestrator_interface"
 
 [dependencies]
-anyhow = "1.0.66"
+anyhow = { workspace = true }
 async-trait = "0.1.58"
 axum = { version = "0.6.1", features = ["json"] }
 candid = { workspace = true }
@@ -21,7 +21,8 @@ flate2 = "1.0.22"
 futures = { workspace = true }
 ic-agent = { workspace = true }
 ic-utils = { workspace = true, features = ["raw"] }
-ic-response-verification = "1.2.0"
+ic-response-verification = { workspace = true }
+ic-http-certification = { workspace = true }
 idna = "0.3.0"
 instant-acme = "0.3.2"
 leb128 = "0.2.5"
@@ -36,9 +37,9 @@ serde = { workspace = true }
 serde_cbor = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10.6"
-thiserror = "1.0.37"
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
-tracing = "0.1.37"
-tracing-subscriber = { version = "0.3.16", features = ["json"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 trust-dns-resolver = "0.22.0"

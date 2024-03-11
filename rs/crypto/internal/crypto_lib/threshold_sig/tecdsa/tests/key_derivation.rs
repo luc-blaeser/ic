@@ -16,12 +16,13 @@ fn verify_bip32_extended_key_derivation_max_length_enforced() -> Result<(), Thre
 
     let seed = Seed::from_bytes(b"verify_bip32_extended_key_derivation_max_length");
 
-    let setup = SignatureProtocolSetup::new(
+    let setup = EcdsaSignatureProtocolSetup::new(
         TestConfig::new(EccCurveType::K256),
         nodes,
         threshold,
         threshold,
         seed,
+        true,
     )?;
 
     for i in 0..=255 {
@@ -274,12 +275,13 @@ fn verify_bip32_secp256k1_extended_key_derivation() -> Result<(), ThresholdEcdsa
 
     let seed = Seed::from_bytes(b"verify_bip32_extended_key_derivation");
 
-    let setup = SignatureProtocolSetup::new(
+    let setup = EcdsaSignatureProtocolSetup::new(
         TestConfig::new(EccCurveType::K256),
         nodes,
         threshold,
         threshold,
         seed,
+        true,
     )?;
 
     let master_key = setup.public_key(&DerivationPath::new(vec![]))?;
@@ -336,12 +338,13 @@ fn should_secp256k1_derivation_match_external_bip32_lib() -> Result<(), Threshol
     let rng = &mut reproducible_rng();
     let random_seed = Seed::from_rng(rng);
 
-    let setup = SignatureProtocolSetup::new(
+    let setup = EcdsaSignatureProtocolSetup::new(
         TestConfig::new(EccCurveType::K256),
         nodes,
         threshold,
         threshold,
         random_seed,
+        true,
     )?;
 
     // zeros the high bit to avoid requesting hardened derivation, which we do not support
@@ -393,7 +396,7 @@ fn key_derivation_on_unsupported_alg_fails() {
 
     let path = DerivationPath::new_bip32(&[1, 2, 3]);
 
-    let derived = ic_crypto_internal_threshold_sig_ecdsa::derive_public_key(&mpk, &path);
+    let derived = ic_crypto_internal_threshold_sig_ecdsa::derive_ecdsa_public_key(&mpk, &path);
 
     assert_matches!(
         derived,

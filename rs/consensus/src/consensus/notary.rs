@@ -122,7 +122,7 @@ impl Notary {
         if let Some(start_time) = pool.get_round_start_time(height) {
             let now = self.time_source.get_relative_time();
             if now >= start_time + adjusted_notary_delay {
-                return Some(now.saturating_sub(start_time));
+                return Some(now.saturating_duration_since(start_time));
             }
         }
         None
@@ -196,6 +196,7 @@ mod tests {
     use super::*;
     use ic_consensus_mocks::{dependencies_with_subnet_params, Dependencies};
     use ic_interfaces::consensus_pool::ConsensusPool;
+    use ic_interfaces::time_source::TimeSource;
     use ic_logger::replica_logger::no_op_logger;
     use ic_metrics::MetricsRegistry;
     use ic_test_utilities::{

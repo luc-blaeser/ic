@@ -132,8 +132,8 @@ use crate::wasmtime_embedder::{
 };
 use ic_wasm_transform::{self, Global, Module};
 use wasmparser::{
-    BlockType, Export, ExternalKind, FuncType, GlobalType, Import, MemoryType, Operator,
-    StructuralType, SubType, TypeRef, ValType,
+    BlockType, CompositeType, Export, ExternalKind, FuncType, GlobalType, Import, MemoryType,
+    Operator, SubType, TypeRef, ValType,
 };
 
 use std::collections::BTreeMap;
@@ -481,7 +481,7 @@ const STABLE_BYTEMAP_SIZE_IN_WASM_PAGES: u64 = MAX_STABLE_MEMORY_IN_WASM_PAGES /
 
 fn add_func_type(module: &mut Module, ty: FuncType) -> u32 {
     for (idx, existing_subtype) in module.types.iter().enumerate() {
-        if let StructuralType::Func(existing_ty) = &existing_subtype.structural_type {
+        if let CompositeType::Func(existing_ty) = &existing_subtype.composite_type {
             if *existing_ty == ty {
                 return idx as u32;
             }
@@ -490,27 +490,27 @@ fn add_func_type(module: &mut Module, ty: FuncType) -> u32 {
     module.types.push(SubType {
         is_final: true,
         supertype_idx: None,
-        structural_type: StructuralType::Func(ty),
+        composite_type: CompositeType::Func(ty),
     });
     (module.types.len() - 1) as u32
 }
 
 fn mutate_function_indices(module: &mut Module, f: impl Fn(u32) -> u32) {
-    fn mutate_instructions(f: &impl Fn(u32) -> u32, ops: &mut [Operator]) {
-        for op in ops {
-            match op {
-                Operator::Call { function_index }
-                | Operator::ReturnCall { function_index }
-                | Operator::RefFunc { function_index } => {
-                    *function_index = f(*function_index);
-                }
-                _ => {}
+    fn mutate_instruction(f: &impl Fn(u32) -> u32, op: &mut Operator) {
+        match op {
+            Operator::Call { function_index }
+            | Operator::ReturnCall { function_index }
+            | Operator::RefFunc { function_index } => {
+                *function_index = f(*function_index);
             }
+            _ => {}
         }
     }
 
     for func_body in &mut module.code_sections {
-        mutate_instructions(&f, &mut func_body.instructions)
+        for op in &mut func_body.instructions {
+            mutate_instruction(&f, op);
+        }
     }
 
     for exp in &mut module.exports {
@@ -527,15 +527,15 @@ fn mutate_function_indices(module: &mut Module, f: impl Fn(u32) -> u32) {
                 }
             }
             ic_wasm_transform::ElementItems::ConstExprs { ty: _, exprs } => {
-                for ops in exprs {
-                    mutate_instructions(&f, ops)
+                for op in exprs {
+                    mutate_instruction(&f, op)
                 }
             }
         }
     }
 
     for global in &mut module.globals {
-        mutate_instructions(&f, &mut global.init_expr)
+        mutate_instruction(&f, &mut global.init_expr)
     }
 
     for data_segment in &mut module.data {
@@ -545,9 +545,7 @@ fn mutate_function_indices(module: &mut Module, f: impl Fn(u32) -> u32) {
                 memory_index: _,
                 offset_expr,
             } => {
-                let mut temp = [offset_expr.clone()];
-                mutate_instructions(&f, &mut temp);
-                *offset_expr = temp.into_iter().next().unwrap();
+                mutate_instruction(&f, offset_expr);
             }
         }
     }
@@ -790,13 +788,12 @@ pub(super) fn instrument(
     // type) reference to the `code_section`.
     let mut func_types = Vec::new();
     for i in 0..module.code_sections.len() {
-        if let StructuralType::Func(t) = &module.types[module.functions[i] as usize].structural_type
-        {
+        if let CompositeType::Func(t) = &module.types[module.functions[i] as usize].composite_type {
             func_types.push((i, t.clone()));
         } else {
             return Err(WasmInstrumentationError::InvalidFunctionType(format!(
                 "Function has type which is not a function type. Found type: {:?}",
-                &module.types[module.functions[i] as usize].structural_type
+                &module.types[module.functions[i] as usize].composite_type
             )));
         }
     }
@@ -862,8 +859,13 @@ pub(super) fn instrument(
     for body in &module.code_sections {
         wasm_instruction_count += body.instructions.len() as u64;
     }
-    for glob in &module.globals {
-        wasm_instruction_count += glob.init_expr.len() as u64;
+    for global in &module.globals {
+        // Each global has a single instruction initializer and an `End`
+        // instruction will be added during encoding.
+        // We statically assert this is the case to ensure this calculation is
+        // adjusted if we add support for longer initialization expressions.
+        let _: &Operator = &global.init_expr;
+        wasm_instruction_count += 2;
     }
 
     let result = module.encode().map_err(|err| {
@@ -1136,7 +1138,7 @@ fn export_additional_symbols<'a>(
             content_type: ValType::I64,
             mutable: true,
         },
-        init_expr: vec![Operator::I64Const { value: 0 }, Operator::End],
+        init_expr: Operator::I64Const { value: 0 },
     });
 
     if wasm_native_stable_memory == FlagStatus::Enabled {
@@ -1146,7 +1148,7 @@ fn export_additional_symbols<'a>(
                 content_type: ValType::I64,
                 mutable: true,
             },
-            init_expr: vec![Operator::I64Const { value: 0 }, Operator::End],
+            init_expr: Operator::I64Const { value: 0 },
         });
         // push the accessed page counter
         module.globals.push(Global {
@@ -1154,7 +1156,7 @@ fn export_additional_symbols<'a>(
                 content_type: ValType::I64,
                 mutable: true,
             },
-            init_expr: vec![Operator::I64Const { value: 0 }, Operator::End],
+            init_expr: Operator::I64Const { value: 0 },
         });
     }
 
@@ -1705,18 +1707,16 @@ fn injections_new(code: &[Operator], main_memory_mode: MemoryMode) -> Vec<Inject
     res
 }
 
-// Looks for the data section and if it is present, converts it to a vector of
-// tuples (heap offset, bytes) and then deletes the section.
+// Looks for the active data segments and if present, converts them to a vector of
+// tuples (heap offset, bytes). It retains the passive data segments and clears the
+// content of the active segments. Active data segments not followed by a passive
+// segment can be entirely deleted.
 fn get_data(
     data_section: &mut Vec<ic_wasm_transform::DataSegment>,
 ) -> Result<Segments, WasmInstrumentationError> {
     let res = data_section
         .iter()
-        .filter(|segment| match &segment.kind {
-            ic_wasm_transform::DataSegmentKind::Passive => false,
-            _ => true
-        })
-        .map(|segment| {
+        .filter_map(|segment| {
             let offset = match &segment.kind {
                 ic_wasm_transform::DataSegmentKind::Active {
                     memory_index: _,
@@ -1724,14 +1724,14 @@ fn get_data(
                 } => match offset_expr {
                     Operator::I32Const { value } => *value as usize,
                     Operator::I64Const { value } => *value as usize,
-                    _ => return Err(WasmInstrumentationError::WasmDeserializeError(WasmError::new(
+                    _ => return Some(Err(WasmInstrumentationError::WasmDeserializeError(WasmError::new(
                         "complex initialization expressions for data segments are not supported!".into()
-                    ))),
+                    )))),
                 },
-                ic_wasm_transform::DataSegmentKind::Passive => unreachable!(),
+                ic_wasm_transform::DataSegmentKind::Passive => return None,
             };
 
-            Ok((offset, segment.data.to_vec()))
+            Some(Ok((offset, segment.data.to_vec())))
         })
         .collect::<Result<_,_>>()?;
 

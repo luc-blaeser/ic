@@ -22,7 +22,7 @@ mod src {
             TreasuryDistribution,
         },
         swap_parameters::NeuronBasketConstructionParameters,
-        GovernanceParameters, InitialTokenDistribution, LedgerParameters, SwapParameters,
+        GovernanceParameters, InitialTokenDistribution, SwapParameters,
     };
 } // end mod src
 
@@ -44,12 +44,12 @@ lazy_static! {
                 developer_neurons: vec![src::NeuronDistribution {
                     controller: Some(PrincipalId::new_user_test_id(830947)),
                     dissolve_delay: Some(pb::Duration {
-                        seconds: Some(691793),
+                        seconds: Some(ONE_MONTH_SECONDS * 6),
                     }),
                     memo: Some(763535),
                     stake: Some(pb::Tokens { e8s: Some(756575) }),
                     vesting_period: Some(pb::Duration {
-                        seconds: Some(785490),
+                        seconds: Some(0),
                     }),
                 }],
             }),
@@ -89,7 +89,7 @@ lazy_static! {
                 seconds: Some(482538),
             }),
             neuron_maximum_dissolve_delay: Some(pb::Duration {
-                seconds: Some(927391),
+                seconds: Some(ONE_MONTH_SECONDS * 12),
             }),
             neuron_maximum_dissolve_delay_bonus: Some(pb::Percentage {
                 basis_points: Some(18_00),
@@ -125,13 +125,6 @@ lazy_static! {
             }),
 
             minimum_participants: Some(50),
-
-            minimum_icp: if IS_MATCHED_FUNDING_ENABLED { None } else { Some(pb::Tokens {
-                e8s: Some(12_300_000_000),
-            })},
-            maximum_icp: if IS_MATCHED_FUNDING_ENABLED { None } else { Some(pb::Tokens {
-                e8s: Some(25_000_000_000),
-            })},
             minimum_direct_participation_icp: Some(pb::Tokens {
                 e8s: Some(12_300_000_000-6_100_000_000), // Subtract neurons_fund_investment_icp
             }),
@@ -161,6 +154,10 @@ lazy_static! {
                 e8s: Some(6_100_000_000),
             }),
             neurons_fund_participation: Some(false),
+
+            // Deprecated fields must not be set.
+            minimum_icp: None,
+            maximum_icp: None,
         })
     };
 
@@ -183,11 +180,12 @@ lazy_static! {
                 maximum_participant_icp: Some(pb::Tokens {
                     e8s: Some(1_000 * E8),
                 }),
+                neurons_fund_participation: Some(true),
+
                 // Unset legacy fields
                 minimum_icp: None,
                 maximum_icp: None,
                 neurons_fund_investment_icp: None,
-                neurons_fund_participation: Some(true),
                 ..swap_parameters
             }),
             ..CREATE_SERVICE_NERVOUS_SYSTEM.clone()

@@ -1,15 +1,15 @@
 pub use ic_canister_client_sender::Ed25519KeyPair as EdKeypair;
 use ic_canister_client_sender::Secp256k1KeyPair;
 use ic_rosetta_api::convert::{
-    from_hex, from_model_account_identifier, operations_to_requests, principal_id_from_public_key,
-    to_hex, to_model_account_identifier,
+    from_hex, from_model_account_identifier, operations_to_requests, to_hex,
+    to_model_account_identifier,
 };
 use ic_rosetta_api::models::amount::{signed_amount, tokens_to_amount};
 use ic_rosetta_api::models::operation::OperationType;
 use ic_rosetta_api::models::{
     ConstructionCombineResponse, ConstructionParseResponse, ConstructionPayloadsRequestMetadata,
-    ConstructionPayloadsResponse, CurveType, PublicKey, RosettaSupportedKeyPair, Signature,
-    SignatureType,
+    ConstructionPayloadsResponse, CurveType, PublicKey, Signature, SignatureType,
+    SignedTransaction,
 };
 use ic_rosetta_api::models::{ConstructionSubmitResponse, Error as RosettaError};
 use ic_rosetta_api::request::request_result::RequestResult;
@@ -17,8 +17,9 @@ use ic_rosetta_api::request::transaction_operation_results::TransactionOperation
 use ic_rosetta_api::request::transaction_results::TransactionResults;
 use ic_rosetta_api::request::Request;
 use ic_rosetta_api::request_types::{
-    AddHotKey, ChangeAutoStakeMaturity, Disburse, Follow, MergeMaturity, NeuronInfo, RegisterVote,
-    RemoveHotKey, SetDissolveTimestamp, Spawn, Stake, StakeMaturity, StartDissolve, StopDissolve,
+    AddHotKey, ChangeAutoStakeMaturity, Disburse, Follow, ListNeurons, MergeMaturity, NeuronInfo,
+    RegisterVote, RemoveHotKey, SetDissolveTimestamp, Spawn, Stake, StakeMaturity, StartDissolve,
+    StopDissolve,
 };
 use ic_rosetta_api::transaction_id::TransactionIdentifier;
 use ic_rosetta_api::{convert, errors, errors::ApiError, DEFAULT_TOKEN_SYMBOL};
@@ -27,8 +28,11 @@ use icp_ledger::{AccountIdentifier, BlockIndex, Operation, Tokens};
 use log::debug;
 use rand::{seq::SliceRandom, thread_rng};
 use rosetta_api_serv::RosettaApiHandle;
+use rosetta_core::convert::principal_id_from_public_key;
+use rosetta_core::models::RosettaSupportedKeyPair;
 use std::collections::HashMap;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 
 pub mod rosetta_api_serv;
@@ -86,7 +90,7 @@ where
         // first ask for the fee
         let mut fee_found = false;
         for o in Request::requests_to_operations(&[request.request.clone()], token_name).unwrap() {
-            if o._type.parse::<OperationType>().unwrap() == OperationType::Fee {
+            if o.type_.parse::<OperationType>().unwrap() == OperationType::Fee {
                 fee_found = true;
             } else {
                 dry_run_ops.push(o.clone());
@@ -121,6 +125,7 @@ where
             | Request::MergeMaturity(MergeMaturity { account, .. })
             | Request::StakeMaturity(StakeMaturity { account, .. })
             | Request::NeuronInfo(NeuronInfo { account, .. })
+            | Request::ListNeurons(ListNeurons { account, .. })
             | Request::Follow(Follow { account, .. }) => {
                 all_sender_account_ids.push(to_model_account_identifier(&account));
             }
@@ -153,7 +158,10 @@ where
     );
 
     let metadata_res = ros
-        .construction_metadata(pre_res.options, Some(all_sender_pks.clone()))
+        .construction_metadata(
+            Some(pre_res.options.try_into().unwrap()),
+            Some(all_sender_pks.clone()),
+        )
         .await
         .unwrap()?;
     let dry_run_suggested_fee = metadata_res.suggested_fee.map(|mut suggested_fee| {
@@ -171,7 +179,7 @@ where
 
     if accept_suggested_fee {
         for o in &mut all_ops {
-            if o._type.parse::<OperationType>().unwrap() == OperationType::Fee {
+            if o.type_.parse::<OperationType>().unwrap() == OperationType::Fee {
                 o.amount = Some(signed_amount(-(fee_icpts.get_e8s() as i128), token_name));
             }
         }
@@ -194,7 +202,10 @@ where
         "Preprocess should report that sender's pk is required"
     );
     let metadata_res = ros
-        .construction_metadata(pre_res.options, Some(all_sender_pks.clone()))
+        .construction_metadata(
+            Some(pre_res.options.try_into().unwrap()),
+            Some(all_sender_pks.clone()),
+        )
         .await
         .unwrap()?;
     let suggested_fee = metadata_res.suggested_fee.clone().map(|mut suggested_fee| {
@@ -202,6 +213,7 @@ where
         suggested_fee.pop().unwrap()
     });
 
+    let metadata = ConstructionPayloadsRequestMetadata::try_from(metadata_res.metadata)?;
     // The fee reported here should be the same as the one we got from dry run
     assert_eq!(suggested_fee, dry_run_suggested_fee);
 
@@ -210,7 +222,7 @@ where
             memo: Some(0),
             ingress_end,
             created_at_time,
-            ..metadata_res.metadata
+            ..metadata
         }),
         all_ops,
         Some(all_sender_pks),
@@ -364,7 +376,7 @@ where
     {
         Ok((submit_res, charged_fee)) => {
             let results = convert::from_transaction_operation_results(
-                submit_res.metadata,
+                submit_res.metadata.try_into().unwrap(),
                 DEFAULT_TOKEN_SYMBOL,
             )
             .expect("Couldn't convert metadata to TransactionResults");
@@ -418,7 +430,7 @@ where
     {
         Ok((submit_res, charged_fee)) => Ok((
             submit_res.transaction_identifier.into(),
-            submit_res.metadata,
+            submit_res.metadata.try_into().unwrap(),
             charged_fee,
         )),
         Err(e) => Err(e),
@@ -498,7 +510,9 @@ where
         .unwrap()?;
 
     let submit_res = ros
-        .construction_submit(signed.signed_transaction().unwrap())
+        .construction_submit(
+            SignedTransaction::from_str(&signed.signed_transaction.clone()).unwrap(),
+        )
         .await
         .unwrap()?;
 
@@ -509,18 +523,20 @@ where
 
     // check idempotency
     let submit_res2 = ros
-        .construction_submit(signed.signed_transaction().unwrap())
+        .construction_submit(
+            SignedTransaction::from_str(&signed.signed_transaction.clone()).unwrap(),
+        )
         .await
         .unwrap()?;
     assert_eq!(submit_res, submit_res2);
 
-    let mut txn = signed.signed_transaction().unwrap();
-    for (_, request) in txn.iter_mut() {
+    let mut txn = SignedTransaction::from_str(&signed.signed_transaction).unwrap();
+    for (_, request) in txn.requests.iter_mut() {
         *request = vec![request.last().unwrap().clone()];
     }
 
     let submit_res3 = ros
-        .construction_submit(signed.signed_transaction().unwrap())
+        .construction_submit(SignedTransaction::from_str(&signed.signed_transaction).unwrap())
         .await
         .unwrap()?;
     assert_eq!(submit_res, submit_res3);

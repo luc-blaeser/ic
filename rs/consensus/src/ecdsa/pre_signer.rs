@@ -21,7 +21,6 @@ use ic_types::crypto::canister_threshold_sig::idkg::{
     IDkgTranscriptId, IDkgTranscriptOperation, IDkgTranscriptParams, SignedIDkgDealing,
 };
 use ic_types::crypto::CryptoHashOf;
-use ic_types::malicious_flags::MaliciousFlags;
 use ic_types::signature::BasicSignatureBatch;
 use ic_types::{Height, NodeId};
 use std::cell::RefCell;
@@ -29,12 +28,7 @@ use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
-#[cfg(feature = "malicious_code")]
-use {
-    ic_interfaces::crypto::BasicSigner, ic_registry_client_helpers::node::RegistryVersion,
-    ic_types::crypto::canister_threshold_sig::idkg::IDkgDealing, ic_types::crypto::BasicSigOf,
-    ic_types::crypto::CryptoResult,
-};
+use super::utils::update_purge_height;
 
 pub(crate) trait EcdsaPreSigner: Send {
     /// The on_state_change() called from the main ECDSA path.
@@ -45,15 +39,15 @@ pub(crate) trait EcdsaPreSigner: Send {
     ) -> EcdsaChangeSet;
 }
 
-pub(crate) struct EcdsaPreSignerImpl {
-    node_id: NodeId,
-    consensus_block_cache: Arc<dyn ConsensusBlockCache>,
-    crypto: Arc<dyn ConsensusCrypto>,
+/// Pre-Signer subcomponent.
+pub struct EcdsaPreSignerImpl {
+    pub(crate) node_id: NodeId,
+    pub(crate) consensus_block_cache: Arc<dyn ConsensusBlockCache>,
+    pub(crate) crypto: Arc<dyn ConsensusCrypto>,
     schedule: RoundRobin,
-    metrics: EcdsaPreSignerMetrics,
-    log: ReplicaLogger,
-    #[cfg_attr(not(feature = "malicious_code"), allow(dead_code))]
-    malicious_flags: MaliciousFlags,
+    pub(crate) metrics: EcdsaPreSignerMetrics,
+    pub(crate) log: ReplicaLogger,
+    prev_finalized_height: RefCell<Height>,
 }
 
 impl EcdsaPreSignerImpl {
@@ -63,7 +57,6 @@ impl EcdsaPreSignerImpl {
         crypto: Arc<dyn ConsensusCrypto>,
         metrics_registry: MetricsRegistry,
         log: ReplicaLogger,
-        malicious_flags: MaliciousFlags,
     ) -> Self {
         Self {
             node_id,
@@ -72,7 +65,7 @@ impl EcdsaPreSignerImpl {
             schedule: RoundRobin::default(),
             metrics: EcdsaPreSignerMetrics::new(metrics_registry),
             log,
-            malicious_flags,
+            prev_finalized_height: RefCell::new(Height::from(0)),
         }
     }
 
@@ -99,7 +92,7 @@ impl EcdsaPreSignerImpl {
                 {
                     // Issue a dealing if we are in the dealer list and we haven't
                     //already issued a dealing for this transcript
-                    if transcript_params.dealers().position(self.node_id).is_some()
+                    if transcript_params.dealers().contains(self.node_id)
                         && !self.has_dealer_issued_dealing(
                             ecdsa_pool,
                             &transcript_params.transcript_id(),
@@ -202,10 +195,9 @@ impl EcdsaPreSignerImpl {
                         }
                     };
 
-                    if transcript_params
+                    if !transcript_params
                         .dealers()
-                        .position(signed_dealing.dealer_id())
-                        .is_none()
+                        .contains(signed_dealing.dealer_id())
                     {
                         // The node is not in the dealer list for this transcript
                         self.metrics.pre_sign_errors_inc("unexpected_dealing");
@@ -290,8 +282,7 @@ impl EcdsaPreSignerImpl {
                     self.resolve_ref(transcript_params_ref, block_reader, "send_dealing_support")
                         .and_then(|transcript_params| {
                             transcript_params
-                                .receivers()
-                                .position(self.node_id)
+                                .receiver_index(self.node_id)
                                 .map(|_| (id, transcript_params, signed_dealing))
                         })
                 } else {
@@ -416,10 +407,9 @@ impl EcdsaPreSignerImpl {
                         }
                     };
 
-                    if transcript_params
+                    if !transcript_params
                         .receivers()
-                        .position(support.sig_share.signer)
-                        .is_none()
+                        .contains(support.sig_share.signer)
                     {
                         // The node is not in the receiver list for this transcript,
                         // support share is not expected from it
@@ -475,11 +465,7 @@ impl EcdsaPreSignerImpl {
                         }
                     } else {
                         // If the dealer_id in the share is invalid, drop it.
-                        if transcript_params
-                            .dealers()
-                            .position(support.dealer_id)
-                            .is_none()
-                        {
+                        if !transcript_params.dealers().contains(support.dealer_id) {
                             self.metrics
                                 .pre_sign_errors_inc("missing_hash_invalid_dealer");
                             ret.push(EcdsaChangeAction::RemoveUnvalidated(id));
@@ -624,10 +610,6 @@ impl EcdsaPreSignerImpl {
         match IDkgProtocol::create_dealing(&*self.crypto, transcript_params) {
             Ok(idkg_dealing) => {
                 self.metrics.pre_sign_metrics_inc("dealing_created");
-
-                #[cfg(feature = "malicious_code")]
-                let idkg_dealing = self.crypto_corrupt_dealing(idkg_dealing, transcript_params);
-
                 self.metrics.pre_sign_metrics_inc("dealing_sent");
                 vec![EcdsaChangeAction::AddToValidated(
                     EcdsaMessage::EcdsaSignedDealing(idkg_dealing),
@@ -694,51 +676,6 @@ impl EcdsaPreSignerImpl {
                 Some(EcdsaChangeAction::MoveToValidated(
                     EcdsaMessage::EcdsaSignedDealing(signed_dealing),
                 ))
-            }
-        }
-    }
-
-    /// Helper to corrupt the signed crypto dealing for malicious testing
-    #[cfg(feature = "malicious_code")]
-    fn crypto_corrupt_dealing(
-        &self,
-        idkg_dealing: SignedIDkgDealing,
-        transcript_params: &IDkgTranscriptParams,
-    ) -> SignedIDkgDealing {
-        if !self.malicious_flags.maliciously_corrupt_ecdsa_dealings {
-            return idkg_dealing;
-        }
-
-        let mut rng = rand::thread_rng();
-        let mut exclude_set = BTreeSet::new();
-        exclude_set.insert(self.node_id);
-        match ic_crypto_test_utils_canister_threshold_sigs::corrupt_signed_idkg_dealing(
-            idkg_dealing,
-            transcript_params,
-            self,
-            self.node_id,
-            &exclude_set,
-            &mut rng,
-        ) {
-            Ok(dealing) => {
-                warn!(
-                     every_n_seconds => 2,
-                     self.log,
-                    "Corrupted dealing: transcript_id = {:?}", transcript_params.transcript_id()
-                );
-                self.metrics.pre_sign_metrics_inc("dealing_corrupted");
-                dealing
-            }
-            Err(err) => {
-                warn!(
-                    self.log,
-                    "Failed to corrupt dealing: transcript_id = {:?}, type = {:?}, error = {:?}",
-                    transcript_params.transcript_id(),
-                    transcript_op_summary(transcript_params.operation_type()),
-                    err
-                );
-                self.metrics.pre_sign_errors_inc("corrupt_dealing");
-                panic!("Failed to corrupt dealing")
             }
         }
     }
@@ -867,6 +804,7 @@ impl EcdsaPreSignerImpl {
     ) -> Option<EcdsaChangeSet> {
         match &transcript_params.operation_type() {
             IDkgTranscriptOperation::Random => None,
+            IDkgTranscriptOperation::RandomUnmasked => None,
             IDkgTranscriptOperation::ReshareOfMasked(t) => {
                 load_transcripts(ecdsa_pool, transcript_loader, &[t])
             }
@@ -936,7 +874,7 @@ impl EcdsaPreSignerImpl {
     }
 
     /// Resolves the IDkgTranscriptParamsRef -> IDkgTranscriptParams.
-    fn resolve_ref(
+    pub(crate) fn resolve_ref(
         &self,
         transcript_params_ref: &IDkgTranscriptParamsRef,
         block_reader: &dyn EcdsaBlockReader,
@@ -986,6 +924,17 @@ impl EcdsaPreSigner for EcdsaPreSignerImpl {
         ecdsa_pool.stats().update_active_transcripts(&block_reader);
         ecdsa_pool.stats().update_active_quadruples(&block_reader);
 
+        let mut changes =
+            update_purge_height(&self.prev_finalized_height, block_reader.tip_height())
+                .then(|| {
+                    timed_call(
+                        "purge_artifacts",
+                        || self.purge_artifacts(ecdsa_pool, &block_reader),
+                        &metrics.on_state_change_duration,
+                    )
+                })
+                .unwrap_or_default();
+
         let send_dealings = || {
             timed_call(
                 "send_dealings",
@@ -1014,48 +963,16 @@ impl EcdsaPreSigner for EcdsaPreSignerImpl {
                 &metrics.on_state_change_duration,
             )
         };
-        let purge_artifacts = || {
-            timed_call(
-                "purge_artifacts",
-                || self.purge_artifacts(ecdsa_pool, &block_reader),
-                &metrics.on_state_change_duration,
-            )
-        };
 
-        let calls: [&'_ dyn Fn() -> EcdsaChangeSet; 5] = [
+        let calls: [&'_ dyn Fn() -> EcdsaChangeSet; 4] = [
             &send_dealings,
             &validate_dealings,
             &send_dealing_support,
             &validate_dealing_support,
-            &purge_artifacts,
         ];
-        self.schedule.call_next(&calls)
-    }
-}
 
-// A dealing is corrupted by changing some internal value.
-// Since a dealing is signed, the signature must be re-computed so that the corrupted dealing
-// is not trivially discarded and a proper complaint can be generated.
-// To sign a dealing we only need something that implements the trait BasicSigner<IDkgDealing>,
-// which `ConsensusCrypto` does.
-// However, for Rust something of type dyn ConsensusCrypto (self.crypto is of type
-// Arc<dyn ConsensusCrypto>, but the Arc<> is not relevant here) cannot be coerced into
-// something of type dyn BasicSigner<IDkgDealing>. This is true for any sub trait implemented
-// by ConsensusCrypto and is not specific to Crypto traits.
-// Doing so would require `dyn upcasting coercion`, see
-// https://github.com/rust-lang/rust/issues/65991 and
-// https://articles.bchlr.de/traits-dynamic-dispatch-upcasting.
-// As workaround a trivial implementation of BasicSigner<IDkgDealing> is provided by delegating to
-// self.crypto.
-#[cfg(feature = "malicious_code")]
-impl BasicSigner<IDkgDealing> for EcdsaPreSignerImpl {
-    fn sign_basic(
-        &self,
-        message: &IDkgDealing,
-        signer: NodeId,
-        registry_version: RegistryVersion,
-    ) -> CryptoResult<BasicSigOf<IDkgDealing>> {
-        self.crypto.sign_basic(message, signer, registry_version)
+        changes.append(&mut self.schedule.call_next(&calls));
+        changes
     }
 }
 
@@ -1432,13 +1349,14 @@ mod tests {
     use crate::ecdsa::test_utils::*;
     use assert_matches::assert_matches;
     use ic_crypto_test_utils_canister_threshold_sigs::{
-        CanisterThresholdSigTestEnvironment, IDkgParticipants,
+        setup_masked_random_params, CanisterThresholdSigTestEnvironment, IDkgParticipants,
     };
     use ic_crypto_test_utils_reproducible_rng::reproducible_rng;
     use ic_interfaces::p2p::consensus::{MutablePool, UnvalidatedArtifact};
+    use ic_test_utilities::consensus::EcdsaStatsNoOp;
     use ic_test_utilities::types::ids::{NODE_1, NODE_2, NODE_3, NODE_4};
     use ic_test_utilities_logger::with_test_replica_logger;
-    use ic_types::consensus::ecdsa::{EcdsaObject, EcdsaStatsNoOp};
+    use ic_types::consensus::ecdsa::EcdsaObject;
     use ic_types::crypto::{AlgorithmId, BasicSig, BasicSigOf, CryptoHash};
     use ic_types::time::UNIX_EPOCH;
     use ic_types::{Height, RegistryVersion};
@@ -1548,6 +1466,53 @@ mod tests {
                 assert_eq!(change_set.len(), 2);
                 assert!(is_dealing_added_to_validated(&change_set, &id_4,));
                 assert!(is_dealing_added_to_validated(&change_set, &id_5,));
+            })
+        })
+    }
+
+    // Tests that dealings are purged once the finalized height increases
+    #[test]
+    fn test_ecdsa_dealings_purging() {
+        ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
+            with_test_replica_logger(|logger| {
+                let (mut ecdsa_pool, pre_signer, mut consensus_pool) =
+                    create_pre_signer_dependencies_and_pool(pool_config, logger);
+                let transcript_loader = TestEcdsaTranscriptLoader::default();
+                let transcript_height = Height::from(30);
+                let id_1 = create_transcript_id_with_height(1, Height::from(0));
+                let id_2 = create_transcript_id_with_height(2, transcript_height);
+
+                let dealing1 = create_dealing(id_1, NODE_2);
+                let msg_id1 = dealing1.message_id();
+                let dealing2 = create_dealing(id_2, NODE_2);
+                let msg_id2 = dealing2.message_id();
+                let change_set = vec![
+                    EcdsaChangeAction::AddToValidated(EcdsaMessage::EcdsaSignedDealing(dealing1)),
+                    EcdsaChangeAction::AddToValidated(EcdsaMessage::EcdsaSignedDealing(dealing2)),
+                ];
+                ecdsa_pool.apply_changes(change_set);
+
+                // Finalized height doesn't increase, so dealing1 shouldn't be purged
+                let change_set = pre_signer.on_state_change(&ecdsa_pool, &transcript_loader);
+                assert_eq!(*pre_signer.prev_finalized_height.borrow(), Height::from(0));
+                assert!(change_set.is_empty());
+
+                // Finalized height increases, so dealing1 is purged
+                let new_height = consensus_pool.advance_round_normal_operation_n(29);
+                let change_set = pre_signer.on_state_change(&ecdsa_pool, &transcript_loader);
+                assert_eq!(*pre_signer.prev_finalized_height.borrow(), new_height);
+                assert_eq!(change_set.len(), 1);
+                assert!(is_removed_from_validated(&change_set, &msg_id1));
+
+                ecdsa_pool.apply_changes(change_set);
+
+                // Finalized height increases above dealing2, so it is purged
+                let new_height = consensus_pool.advance_round_normal_operation();
+                let change_set = pre_signer.on_state_change(&ecdsa_pool, &transcript_loader);
+                assert_eq!(*pre_signer.prev_finalized_height.borrow(), new_height);
+                assert_eq!(transcript_height, new_height);
+                assert_eq!(change_set.len(), 1);
+                assert!(is_removed_from_validated(&change_set, &msg_id2));
             })
         })
     }
@@ -2660,10 +2625,11 @@ mod tests {
             &IDkgParticipants::AllNodesAsDealersAndReceivers,
             &mut rng,
         );
-        let params = env.params_for_random_sharing(
+        let params = setup_masked_random_params(
+            &env,
+            AlgorithmId::ThresholdEcdsaSecp256k1,
             &dealers,
             &receivers,
-            AlgorithmId::ThresholdEcdsaSecp256k1,
             &mut rng,
         );
         let tid = params.transcript_id();

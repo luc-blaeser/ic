@@ -10,7 +10,7 @@ use ic_btc_types_internal::BlockBlob;
 use ic_certification_version::{CertificationVersion, CURRENT_CERTIFICATION_VERSION};
 use ic_constants::MAX_INGRESS_TTL;
 use ic_error_types::{ErrorCode, RejectCode, UserError};
-use ic_ic00_types::{EcdsaKeyId, NodeMetrics, NodeMetricsHistoryResponse};
+use ic_management_canister_types::{EcdsaKeyId, NodeMetrics, NodeMetricsHistoryResponse};
 use ic_protobuf::{
     proxy::{try_from_option_field, ProxyDecodeError},
     registry::subnet::v1 as pb_subnet,
@@ -40,7 +40,7 @@ use ic_types::{
     state_sync::{StateSyncVersion, CURRENT_STATE_SYNC_VERSION},
     subnet_id_into_protobuf, subnet_id_try_from_protobuf,
     time::{Time, UNIX_EPOCH},
-    xnet::{StreamHeader, StreamIndex, StreamIndexedQueue, StreamSlice},
+    xnet::{StreamFlags, StreamHeader, StreamIndex, StreamIndexedQueue, StreamSlice},
     CountBytes, CryptoHashOfPartialState, NodeId, NumBytes, PrincipalId, SubnetId,
 };
 use ic_wasm_types::WasmHash;
@@ -95,6 +95,8 @@ pub struct SystemMetadata {
 
     /// DER-encoded public keys of the subnet's nodes.
     pub node_public_keys: BTreeMap<NodeId, Vec<u8>>,
+
+    pub api_boundary_nodes: BTreeMap<NodeId, ApiBoundaryNodeEntry>,
 
     /// "Subnet split in progress" marker: `Some(original_subnet_id)` if this
     /// replicated state is in the process of being split from `original_subnet_id`;
@@ -191,6 +193,21 @@ pub struct NetworkTopology {
     pub bitcoin_mainnet_canister_id: Option<CanisterId>,
 }
 
+/// Full description of the API Boundary Node, which is saved in the metadata.
+/// This entry is formed from two registry records - ApiBoundaryNodeRecord and NodeRecord.
+/// If an ApiBoundaryNodeRecord exists, then a corresponding NodeRecord must exist.
+/// The converse statement is not true.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiBoundaryNodeEntry {
+    /// Domain name, required field from NodeRecord
+    pub domain: String,
+    /// Ipv4, optional field from NodeRecord
+    pub ipv4_address: Option<String>,
+    /// Ipv6, required field from NodeRecord
+    pub ipv6_address: String,
+    pub pubkey: Option<Vec<u8>>,
+}
+
 impl Default for NetworkTopology {
     fn default() -> Self {
         Self {
@@ -275,13 +292,12 @@ impl TryFrom<pb_metadata::NetworkTopology> for NetworkTopology {
                 try_from_option_field(entry.subnet_topology, "NetworkTopology::subnets::V")?,
             );
         }
-        // NetworkTopology.nns_subnet_id will be removed in the following PR
-        // Currently, initialise nns_subnet_id with dummy value in case not found
-        let nns_subnet_id =
-            match try_from_option_field(item.nns_subnet_id, "NetworkTopology::nns_subnet_id") {
-                Ok(subnet_id) => subnet_id_try_from_protobuf(subnet_id)?,
-                Err(_) => SubnetId::new(PrincipalId::new_anonymous()),
-            };
+
+        let nns_subnet_id = subnet_id_try_from_protobuf(try_from_option_field(
+            item.nns_subnet_id,
+            "NetworkTopology::nns_subnet_id",
+        )?)?;
+
         let mut ecdsa_signing_subnets = BTreeMap::new();
         for entry in item.ecdsa_signing_subnets {
             let mut subnet_ids = vec![];
@@ -572,6 +588,19 @@ impl From<&SystemMetadata> for pb_metadata::SystemMetadata {
                     public_key: public_key.clone(),
                 })
                 .collect(),
+            api_boundary_nodes: item
+                .api_boundary_nodes
+                .iter()
+                .map(
+                    |(node_id, api_boundary_node_entry)| pb_metadata::ApiBoundaryNodeEntry {
+                        node_id: Some(node_id_into_protobuf(*node_id)),
+                        domain: api_boundary_node_entry.domain.clone(),
+                        ipv4_address: api_boundary_node_entry.ipv4_address.clone(),
+                        ipv6_address: api_boundary_node_entry.ipv6_address.clone(),
+                        pubkey: api_boundary_node_entry.pubkey.clone(),
+                    },
+                )
+                .collect(),
             blockmaker_metrics_time_series: Some((&item.blockmaker_metrics_time_series).into()),
         }
     }
@@ -636,6 +665,19 @@ impl TryFrom<(pb_metadata::SystemMetadata, &dyn CheckpointLoadingMetrics)> for S
             node_public_keys.insert(node_id_try_from_option(entry.node_id)?, entry.public_key);
         }
 
+        let mut api_boundary_nodes = BTreeMap::<NodeId, ApiBoundaryNodeEntry>::new();
+        for entry in item.api_boundary_nodes {
+            api_boundary_nodes.insert(
+                node_id_try_from_option(entry.node_id)?,
+                ApiBoundaryNodeEntry {
+                    domain: entry.domain,
+                    ipv4_address: entry.ipv4_address,
+                    ipv6_address: entry.ipv6_address,
+                    pubkey: entry.pubkey,
+                },
+            );
+        }
+
         Ok(Self {
             own_subnet_id: subnet_id_try_from_protobuf(try_from_option_field(
                 item.own_subnet_id,
@@ -647,6 +689,7 @@ impl TryFrom<(pb_metadata::SystemMetadata, &dyn CheckpointLoadingMetrics)> for S
             own_subnet_type: SubnetType::default(),
             own_subnet_features: item.own_subnet_features.unwrap_or_default().into(),
             node_public_keys,
+            api_boundary_nodes,
             // Note: `load_checkpoint()` will set this to the contents of `split_marker.pbuf`,
             // when present.
             split_from: None,
@@ -707,6 +750,7 @@ impl SystemMetadata {
             subnet_call_context_manager: Default::default(),
             own_subnet_features: SubnetFeatures::default(),
             node_public_keys: Default::default(),
+            api_boundary_nodes: Default::default(),
             split_from: None,
             // StateManager populates proper values of these fields before
             // committing each state.
@@ -981,6 +1025,7 @@ impl SystemMetadata {
             own_subnet_features: _,
             // Overwritten as soon as the round begins, no explicit action needed.
             node_public_keys: _,
+            api_boundary_nodes: _,
             ref mut split_from,
             subnet_call_context_manager: _,
             // Set by `commit_and_certify()` at the end of the round. Not used before.
@@ -1097,6 +1142,7 @@ impl SystemMetadata {
                         RejectCode::SysTransient,
                         format!("Canister {} migrated during a subnet split", canister_id),
                     )),
+                    deadline: request.deadline,
                 };
                 subnet_queues.push_output_response(response.into());
             }
@@ -1157,6 +1203,9 @@ pub struct Stream {
 
     /// Estimated byte size of `self.messages`.
     messages_size_bytes: usize,
+
+    /// Stream flags observed in the header of the reverse stream.
+    reverse_stream_flags: StreamFlags,
 }
 
 impl Default for Stream {
@@ -1165,11 +1214,15 @@ impl Default for Stream {
         let signals_end = Default::default();
         let reject_signals = VecDeque::default();
         let messages_size_bytes = Self::size_bytes(&messages);
+        let reverse_stream_flags = StreamFlags {
+            responses_only: false,
+        };
         Self {
             messages,
             signals_end,
             reject_signals,
             messages_size_bytes,
+            reverse_stream_flags,
         }
     }
 }
@@ -1186,6 +1239,9 @@ impl From<&Stream> for pb_queues::Stream {
                 .collect(),
             signals_end: item.signals_end.get(),
             reject_signals,
+            reverse_stream_flags: Some(pb_queues::StreamFlags {
+                responses_only: item.reverse_stream_flags.responses_only,
+            }),
         }
     }
 }
@@ -1211,6 +1267,12 @@ impl TryFrom<pb_queues::Stream> for Stream {
             signals_end: item.signals_end.into(),
             reject_signals,
             messages_size_bytes,
+            reverse_stream_flags: item
+                .reverse_stream_flags
+                .map(|flags| StreamFlags {
+                    responses_only: flags.responses_only,
+                })
+                .unwrap_or_default(),
         })
     }
 }
@@ -1224,6 +1286,7 @@ impl Stream {
             signals_end,
             reject_signals: VecDeque::new(),
             messages_size_bytes,
+            reverse_stream_flags: Default::default(),
         }
     }
 
@@ -1239,6 +1302,7 @@ impl Stream {
             signals_end,
             reject_signals,
             messages_size_bytes,
+            reverse_stream_flags: Default::default(),
         }
     }
 
@@ -1251,12 +1315,13 @@ impl Stream {
 
     /// Creates a header for this stream.
     pub fn header(&self) -> StreamHeader {
-        StreamHeader {
-            begin: self.messages.begin(),
-            end: self.messages.end(),
-            signals_end: self.signals_end,
-            reject_signals: self.reject_signals.clone(),
-        }
+        StreamHeader::new(
+            self.messages.begin(),
+            self.messages.end(),
+            self.signals_end,
+            self.reject_signals.clone(),
+            StreamFlags::default(),
+        )
     }
 
     /// Returns a reference to the message queue.
@@ -1374,6 +1439,16 @@ impl Stream {
     fn size_bytes(messages: &StreamIndexedQueue<RequestOrResponse>) -> usize {
         messages.iter().map(|(_, m)| m.count_bytes()).sum()
     }
+
+    /// Returns a reference to the reverse stream flags.
+    pub fn reverse_stream_flags(&self) -> &StreamFlags {
+        &self.reverse_stream_flags
+    }
+
+    /// Sets the reverse stream flags.
+    pub fn set_reverse_stream_flags(&mut self, flags: StreamFlags) {
+        self.reverse_stream_flags = flags;
+    }
 }
 
 impl CountBytes for Stream {
@@ -1385,15 +1460,7 @@ impl CountBytes for Stream {
 
 impl From<Stream> for StreamSlice {
     fn from(val: Stream) -> Self {
-        StreamSlice::new(
-            StreamHeader {
-                begin: val.messages.begin(),
-                end: val.messages.end(),
-                signals_end: val.signals_end,
-                reject_signals: val.reject_signals,
-            },
-            val.messages,
-        )
+        StreamSlice::new(val.header(), val.messages)
     }
 }
 
@@ -1441,7 +1508,9 @@ impl Streams {
                 .entry(response.respondent)
                 .or_default() += msg.count_bytes();
         }
+
         self.streams.entry(destination).or_default().push(msg);
+
         #[cfg(debug_assertions)]
         self.debug_validate_stats();
     }
@@ -1614,6 +1683,16 @@ impl<'a> StreamHandle<'a> {
     /// Garbage collects signals before `new_signals_begin`.
     pub fn discard_signals_before(&mut self, new_signals_begin: StreamIndex) {
         self.stream.discard_signals_before(new_signals_begin);
+    }
+
+    /// Returns a reference to the reverse stream flags.
+    pub fn reverse_stream_flags(&self) -> &StreamFlags {
+        &self.stream.reverse_stream_flags
+    }
+
+    /// Sets the reverse stream flags.
+    pub fn set_reverse_stream_flags(&mut self, flags: StreamFlags) {
+        self.stream.set_reverse_stream_flags(flags);
     }
 }
 
@@ -2267,6 +2346,7 @@ pub(crate) mod testing {
             subnet_call_context_manager: Default::default(),
             own_subnet_features: SubnetFeatures::default(),
             node_public_keys: Default::default(),
+            api_boundary_nodes: Default::default(),
             split_from: None,
             prev_state_hash: Default::default(),
             state_sync_version: CURRENT_STATE_SYNC_VERSION,

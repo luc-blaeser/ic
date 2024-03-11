@@ -20,6 +20,10 @@ pub enum OrchestratorError {
     /// version
     SubnetMissingError(SubnetId, RegistryVersion),
 
+    /// The given node id does not map to an `ApiBoundaryNodeRecord` at the
+    /// given version
+    ApiBoundaryNodeMissingError(NodeId, RegistryVersion),
+
     /// An error occurred when querying the Registry that prevents Orchestrator
     /// from making progress
     RegistryClientError(RegistryClientError),
@@ -57,6 +61,9 @@ pub enum OrchestratorError {
 
     /// SNP error while registering a SEV-SNP node
     SnpError(String),
+
+    /// Network configuration error
+    NetworkConfigurationError(String),
 }
 
 impl OrchestratorError {
@@ -120,6 +127,11 @@ impl fmt::Display for OrchestratorError {
                 "Subnet ID {:?} does not exist in the Registry at registry version {:?}",
                 subnet_id, registry_version
             ),
+            OrchestratorError::ApiBoundaryNodeMissingError(node_id, registry_version) => write!(
+                f,
+                "Api Boundary Node ID {:?} does not exist in the Registry at registry version {:?}",
+                node_id, registry_version
+            ),
             OrchestratorError::ReplicaVersionParseError(e) => {
                 write!(f, "Failed to parse replica version: {}", e)
             }
@@ -130,6 +142,9 @@ impl fmt::Display for OrchestratorError {
             ),
             OrchestratorError::UpgradeError(msg) => write!(f, "Failed to upgrade: {}", msg),
             OrchestratorError::SnpError(msg) => write!(f, "SEV-SNP Error: {}", msg),
+            OrchestratorError::NetworkConfigurationError(msg) => {
+                write!(f, "Failed to apply network configuration: {}", msg)
+            }
         }
     }
 }

@@ -1,3 +1,4 @@
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
 load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
 load("@bazel_skylib//rules:run_binary.bzl", "run_binary")
 load("@io_bazel_rules_docker//docker/package_managers:download_pkgs.bzl", "download_pkgs")
@@ -17,6 +18,11 @@ exports_files([
 ALIASES = {
     "//rs/utils": "utils",
 }
+
+bool_flag(
+    name = "k8s",
+    build_setting_default = False,
+)
 
 rust_library(
     name = "tests",
@@ -123,8 +129,10 @@ symlink_dir(
     targets = {
         "//rs/registry/admin:ic-admin": "ic-admin",
         "//rs/state_tool:state-tool": "state-tool",
-        "//rs/canister_sandbox/sandbox_launcher": "sandbox_launcher",
-        "//rs/canister_sandbox": "canister_sandbox",
+        "//rs/canister_sandbox:compiler_sandbox": "compiler_sandbox",
+        "//rs/canister_sandbox:sandbox_launcher": "sandbox_launcher",
+        "//rs/canister_sandbox:canister_sandbox": "canister_sandbox",
+        "@crate_index//:ic-wasm__ic-wasm": "ic-wasm",
     },
 )
 
@@ -133,8 +141,9 @@ symlink_dir(
     targets = {
         "//rs/backup:ic-backup": "ic-backup",
         "//rs/replay:ic-replay": "ic-replay",
-        "//rs/canister_sandbox/sandbox_launcher": "sandbox_launcher",
-        "//rs/canister_sandbox": "canister_sandbox",
+        "//rs/canister_sandbox:compiler_sandbox": "compiler_sandbox",
+        "//rs/canister_sandbox:sandbox_launcher": "sandbox_launcher",
+        "//rs/canister_sandbox:canister_sandbox": "canister_sandbox",
     },
 )
 

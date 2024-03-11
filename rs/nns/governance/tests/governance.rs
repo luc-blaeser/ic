@@ -18,7 +18,7 @@ use fixtures::{
     environment_fixture::CanisterCallReply, new_motion_proposal, principal, NNSBuilder,
     NNSStateChange, NeuronBuilder, ProposalNeuronBehavior, NNS,
 };
-use futures::future::{join_all, FutureExt};
+use futures::future::FutureExt;
 use ic_base_types::{CanisterId, NumBytes, PrincipalId};
 use ic_crypto_sha2::Sha256;
 use ic_nervous_system_clients::canister_status::{CanisterStatusResultV2, CanisterStatusType};
@@ -54,9 +54,7 @@ use ic_nns_governance::{
     init::GovernanceCanisterInitPayloadBuilder,
     pb::v1::{
         add_or_remove_node_provider::Change,
-        governance::{
-            GovernanceCachedMetrics, GovernanceCachedMetricsChange, MigrationsDesc, SeedAccounts,
-        },
+        governance::{GovernanceCachedMetrics, GovernanceCachedMetricsChange, MigrationsDesc},
         governance_error::ErrorType::{
             self, InsufficientFunds, NotAuthorized, NotFound, PreconditionFailed, ResourceExhausted,
         },
@@ -75,8 +73,6 @@ use ic_nns_governance::{
         neurons_fund_snapshot::NeuronsFundNeuronPortion,
         proposal::{self, Action, ActionDesc},
         reward_node_provider::{RewardMode, RewardToAccount, RewardToNeuron},
-        settle_community_fund_participation,
-        settle_community_fund_participation::Committed,
         settle_neurons_fund_participation_request, swap_background_information,
         AddOrRemoveNodeProvider, ApproveGenesisKyc, Ballot, BallotChange, BallotInfo,
         BallotInfoChange, CreateServiceNervousSystem, Empty, ExecuteNnsFunction,
@@ -85,14 +81,14 @@ use ic_nns_governance::{
         ListNeuronsResponse, ListProposalInfo, ListProposalInfoResponse, ManageNeuron,
         ManageNeuronResponse, MostRecentMonthlyNodeProviderRewards, Motion, NetworkEconomics,
         Neuron, NeuronChange, NeuronState, NeuronType, NeuronsFundData, NeuronsFundParticipation,
-        NeuronsFundSnapshot, NnsFunction, NodeProvider, OpenSnsTokenSwap, Proposal, ProposalChange,
-        ProposalData, ProposalDataChange,
+        NeuronsFundSnapshot, NnsFunction, NodeProvider, Proposal, ProposalChange, ProposalData,
+        ProposalDataChange,
         ProposalRewardStatus::{self, AcceptVotes, ReadyToSettle},
         ProposalStatus::{self, Rejected},
         RewardEvent, RewardNodeProvider, RewardNodeProviders, SetDefaultFollowees,
-        SettleCommunityFundParticipation, SettleNeuronsFundParticipationRequest,
-        SwapBackgroundInformation, SwapParticipationLimits, Tally, TallyChange, Topic,
-        UpdateNodeProvider, Vote, WaitForQuietState, WaitForQuietStateDesc,
+        SettleNeuronsFundParticipationRequest, SwapBackgroundInformation, SwapParticipationLimits,
+        Tally, TallyChange, Topic, UpdateNodeProvider, Vote, WaitForQuietState,
+        WaitForQuietStateDesc,
     },
     proposals::create_service_nervous_system::ExecutedCreateServiceNervousSystemProposal,
 };
@@ -101,8 +97,7 @@ use ic_sns_root::{GetSnsCanistersSummaryRequest, GetSnsCanistersSummaryResponse}
 use ic_sns_swap::pb::v1::{
     self as sns_swap_pb,
     IdealMatchedParticipationFunction as IdealMatchedParticipationFunctionSwapPb, Lifecycle,
-    LinearScalingCoefficient, NeuronBasketConstructionParameters,
-    NeuronsFundParticipationConstraints, Params,
+    LinearScalingCoefficient, NeuronsFundParticipationConstraints,
 };
 use ic_sns_wasm::pb::v1::{
     DeployNewSnsRequest, DeployNewSnsResponse, DeployedSns, ListDeployedSnsesRequest,
@@ -123,9 +118,6 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
 };
-
-#[cfg(not(feature = "test"))]
-use ic_sns_swap::pb::v1::CfNeuron;
 
 /// The 'fake' module is the old scheme for providing NNS test fixtures, aka
 /// the FakeDriver. It is being used here until the older tests have been
@@ -796,7 +788,6 @@ async fn test_cascade_following_new() {
                 ..Default::default()
             },
         )
-        .await
         .unwrap();
 
     // The fee should now be 1 ICP since the fees are charged upfront.
@@ -809,7 +800,7 @@ async fn test_cascade_following_new() {
             proposal_id: Some(ProposalId { id: 1 }),
             vote: Vote::Yes as i32
         },
-        nns.get_neuron(&id).recent_ballots.get(0).unwrap()
+        nns.get_neuron(&id).recent_ballots.first().unwrap()
     );
     // Check that the vote is registered in the proposal
     assert_eq!(
@@ -1024,7 +1015,7 @@ async fn test_cascade_following_new() {
         },
         nns.get_neuron(&NeuronId { id: 2 })
             .recent_ballots
-            .get(0)
+            .first()
             .unwrap()
     );
     // The proposal should now be accepted and executed.
@@ -1226,7 +1217,6 @@ async fn test_cascade_following() {
             ..Default::default()
         },
     )
-    .await
     .unwrap();
 
     // The fee should now be 1 ICP since the fees are charged upfront.
@@ -1251,7 +1241,7 @@ async fn test_cascade_following() {
             .get(&1)
             .unwrap()
             .recent_ballots
-            .get(0)
+            .first()
             .unwrap()
     );
     // Check that the vote is registered in the proposal
@@ -1301,7 +1291,7 @@ async fn test_cascade_following() {
             .get(&2)
             .unwrap()
             .recent_ballots
-            .get(0)
+            .first()
             .unwrap()
     );
     // The proposal should now be accepted and executed.
@@ -1362,7 +1352,6 @@ async fn test_minimum_icp_xdr_conversion_rate() {
                 ..Default::default()
             },
         )
-        .await
         .unwrap_err()
         .error_type
     );
@@ -1387,7 +1376,6 @@ async fn test_minimum_icp_xdr_conversion_rate() {
             ..Default::default()
         },
     )
-    .await
     .unwrap();
 }
 
@@ -1510,7 +1498,6 @@ async fn test_node_provider_must_be_registered() {
                 ..Default::default()
             },
         )
-        .await
         .unwrap_err()
         .error_type
     );
@@ -1533,7 +1520,6 @@ async fn test_node_provider_must_be_registered() {
             ..Default::default()
         },
     )
-    .await
     .unwrap();
 }
 
@@ -1570,7 +1556,6 @@ async fn test_sufficient_stake() {
                 ..Default::default()
             },
         )
-        .await
         .unwrap_err()
         .error_type
     );
@@ -1594,7 +1579,6 @@ async fn test_sufficient_stake() {
             ..Default::default()
         },
     )
-    .await
     .unwrap();
 }
 
@@ -1656,7 +1640,6 @@ async fn test_all_follow_proposer() {
             ..Default::default()
         },
     )
-    .await
     .unwrap();
     // The proposal should now be accepted and executed.
     assert_eq!(
@@ -1699,7 +1682,6 @@ async fn test_follow_negative() {
             ..Default::default()
         },
     )
-    .await
     .unwrap();
     // No controller for 4 yet.
     let result = fake::register_vote(
@@ -1857,7 +1839,6 @@ async fn test_no_default_follow_for_governance() {
             ..Default::default()
         },
     )
-    .await
     .unwrap();
     // Now vote yes for neurons 5-7.
     for i in 5..=7 {
@@ -1927,7 +1908,6 @@ async fn test_no_voting_after_deadline() {
                 ..Default::default()
             },
         )
-        .await
         .unwrap();
     let proposal_data = gov.get_proposal_data(proposal_id).unwrap();
     let deadline_seconds = proposal_data
@@ -2188,7 +2168,6 @@ async fn test_manage_neuron() {
             ..Default::default()
         },
     )
-    .await
     .unwrap();
     assert_eq!(
         ProposalStatus::Open,
@@ -2279,7 +2258,7 @@ async fn test_manage_neuron() {
                     .get(&(Topic::NeuronManagement as i32))
                     .unwrap()
                     .followees
-                    .get(0)
+                    .first()
                     .unwrap()
                     .id
             })
@@ -2304,7 +2283,6 @@ async fn test_manage_neuron() {
             ..Default::default()
         },
     )
-    .await
     .unwrap();
     // Now process the proposals: proposal should be executed as
     // neuron 2 is the sole followee of neuron 1 on the manage neuron
@@ -2384,7 +2362,6 @@ async fn test_sufficient_stake_for_manage_neuron() {
                 ..Default::default()
             },
         )
-        .await
         .unwrap_err();
     assert_eq!(
         ErrorType::InsufficientFunds,
@@ -2416,7 +2393,6 @@ async fn test_sufficient_stake_for_manage_neuron() {
             ..Default::default()
         },
     )
-    .await
     .unwrap();
 }
 
@@ -2481,7 +2457,6 @@ async fn test_invalid_proposals_fail() {
             ..Default::default()
         },
     )
-    .await
     .unwrap();
 }
 
@@ -2520,7 +2495,6 @@ async fn test_compute_tally_while_open() {
                 ..Default::default()
             },
         )
-        .await
         .unwrap();
 
     // Tally should have the smaller neuron voting yes.
@@ -2564,7 +2538,6 @@ async fn test_compute_tally_after_decided() {
                 ..Default::default()
             },
         )
-        .await
         .unwrap();
 
     // Tally should have the larger neuron voting yes, and the proposal is decided.
@@ -2629,7 +2602,6 @@ async fn test_no_compute_tally_after_deadline() {
                 ..Default::default()
             },
         )
-        .await
         .unwrap();
 
     // Advance time past the deadline.
@@ -2739,7 +2711,6 @@ async fn test_reward_event_proposals_last_longer_than_reward_period() {
                 ..Default::default()
             },
         )
-        .await
         .unwrap();
 
     // Let's advance time by two reward periods, but less than the
@@ -2923,7 +2894,6 @@ async fn test_restricted_proposals_are_not_eligible_for_voting_rewards() {
             ..Default::default()
         },
     )
-    .await
     .unwrap();
 
     {
@@ -3129,7 +3099,6 @@ async fn test_genesis_in_the_future_in_supported() {
                 ..Default::default()
             },
         )
-        .await
         .unwrap();
     let short_proposal_pid = gov
         .make_proposal(
@@ -3152,7 +3121,6 @@ async fn test_genesis_in_the_future_in_supported() {
                 ..Default::default()
             },
         )
-        .await
         .unwrap();
 
     fake_driver.advance_time_by(REWARD_DISTRIBUTION_PERIOD_SECONDS);
@@ -3218,7 +3186,6 @@ async fn test_genesis_in_the_future_in_supported() {
                 ..Default::default()
             },
         )
-        .await
         .unwrap();
 
     fake_driver.advance_time_by(REWARD_DISTRIBUTION_PERIOD_SECONDS);
@@ -4077,7 +4044,6 @@ fn test_get_neuron_ids_by_principal() {
 fn empty_fixture() -> GovernanceProto {
     GovernanceProto {
         economics: Some(NetworkEconomics::with_default_values()),
-        seed_accounts: Some(SeedAccounts::default()),
         ..Default::default()
     }
 }
@@ -5421,18 +5387,15 @@ fn test_neuron_spawn() {
 
     // An attempt to spawn a neuron should simply return an error and
     // change nothing.
-    let spawn_res = gov
-        .spawn_neuron(
-            &id,
-            &from,
-            &Spawn {
-                new_controller: Some(child_controller),
-                nonce: None,
-                percentage_to_spawn: None,
-            },
-        )
-        .now_or_never()
-        .unwrap();
+    let spawn_res = gov.spawn_neuron(
+        &id,
+        &from,
+        &Spawn {
+            new_controller: Some(child_controller),
+            nonce: None,
+            percentage_to_spawn: None,
+        },
+    );
     assert_matches!(
         spawn_res,
         Err(GovernanceError{error_type: code, error_message: msg})
@@ -5469,8 +5432,6 @@ fn test_neuron_spawn() {
                 percentage_to_spawn: None,
             },
         )
-        .now_or_never()
-        .unwrap()
         .unwrap();
 
     // We should now have 2 neurons.
@@ -5599,18 +5560,15 @@ fn test_neuron_spawn_with_subaccount() {
 
     // An attempt to spawn a neuron should simply return an error and
     // change nothing.
-    let spawn_res = gov
-        .spawn_neuron(
-            &id,
-            &from,
-            &Spawn {
-                new_controller: Some(child_controller),
-                nonce: None,
-                percentage_to_spawn: None,
-            },
-        )
-        .now_or_never()
-        .unwrap();
+    let spawn_res = gov.spawn_neuron(
+        &id,
+        &from,
+        &Spawn {
+            new_controller: Some(child_controller),
+            nonce: None,
+            percentage_to_spawn: None,
+        },
+    );
     assert_matches!(
         spawn_res,
         Err(GovernanceError{error_type: code, error_message: msg})
@@ -5648,8 +5606,6 @@ fn test_neuron_spawn_with_subaccount() {
                 percentage_to_spawn: None,
             },
         )
-        .now_or_never()
-        .unwrap()
         .unwrap();
 
     let creation_timestamp = driver.now();
@@ -5806,8 +5762,6 @@ fn assert_neuron_spawn_partial(
                 percentage_to_spawn: Some(percentage),
             },
         )
-        .now_or_never()
-        .unwrap()
         .unwrap();
 
     let creation_timestamp = driver.now();
@@ -5903,18 +5857,15 @@ fn test_neuron_with_non_self_authenticating_controller_cannot_be_spawned() {
 
     let non_self_authenticating_principal_id = PrincipalId::new_user_test_id(144);
 
-    let result: Result<NeuronId, GovernanceError> = gov
-        .spawn_neuron(
-            &id,
-            &from,
-            &Spawn {
-                new_controller: Some(non_self_authenticating_principal_id),
-                nonce: None,
-                percentage_to_spawn: None,
-            },
-        )
-        .now_or_never()
-        .unwrap();
+    let result: Result<NeuronId, GovernanceError> = gov.spawn_neuron(
+        &id,
+        &from,
+        &Spawn {
+            new_controller: Some(non_self_authenticating_principal_id),
+            nonce: None,
+            percentage_to_spawn: None,
+        },
+    );
 
     assert_matches!(
         result,
@@ -6261,53 +6212,49 @@ async fn test_not_for_profit_neurons() {
 
     // A normal neuron can't issue a manage neuron proposal to disburse,
     // split or disburse-to-neuron.
-    let result = gov
-        .make_proposal(
-            normal_neuron.id.as_ref().unwrap(),
-            normal_neuron.controller.as_ref().unwrap(),
-            &Proposal {
-                title: Some("A Reasonable Title".to_string()),
-                action: Some(proposal::Action::ManageNeuron(Box::new(ManageNeuron {
-                    neuron_id_or_subaccount: Some(NeuronIdOrSubaccount::NeuronId(
-                        normal_neuron.id.unwrap(),
-                    )),
-                    id: None,
-                    command: Some(manage_neuron::Command::Disburse(manage_neuron::Disburse {
-                        amount: None,
-                        to_account: None,
-                    })),
-                }))),
-                summary: "".to_string(),
-                url: "".to_string(),
-            },
-        )
-        .await;
+    let result = gov.make_proposal(
+        normal_neuron.id.as_ref().unwrap(),
+        normal_neuron.controller.as_ref().unwrap(),
+        &Proposal {
+            title: Some("A Reasonable Title".to_string()),
+            action: Some(proposal::Action::ManageNeuron(Box::new(ManageNeuron {
+                neuron_id_or_subaccount: Some(NeuronIdOrSubaccount::NeuronId(
+                    normal_neuron.id.unwrap(),
+                )),
+                id: None,
+                command: Some(manage_neuron::Command::Disburse(manage_neuron::Disburse {
+                    amount: None,
+                    to_account: None,
+                })),
+            }))),
+            summary: "".to_string(),
+            url: "".to_string(),
+        },
+    );
     assert!(result.is_err());
     assert_eq!(result.err().unwrap().error_type(), ErrorType::NotAuthorized);
 
     // A not for profit neuron, on the other hand, can.
     // The followee of the managed neuron must make the proposal, in this case.
-    let result = gov
-        .make_proposal(
-            normal_neuron.id.as_ref().unwrap(),
-            normal_neuron.controller.as_ref().unwrap(),
-            &Proposal {
-                title: Some("A Reasonable Title".to_string()),
-                action: Some(proposal::Action::ManageNeuron(Box::new(ManageNeuron {
-                    neuron_id_or_subaccount: Some(NeuronIdOrSubaccount::NeuronId(
-                        not_for_profit_neuron.id.unwrap(),
-                    )),
-                    id: None,
-                    command: Some(manage_neuron::Command::Disburse(manage_neuron::Disburse {
-                        amount: None,
-                        to_account: None,
-                    })),
-                }))),
-                summary: "".to_string(),
-                url: "".to_string(),
-            },
-        )
-        .await;
+    let result = gov.make_proposal(
+        normal_neuron.id.as_ref().unwrap(),
+        normal_neuron.controller.as_ref().unwrap(),
+        &Proposal {
+            title: Some("A Reasonable Title".to_string()),
+            action: Some(proposal::Action::ManageNeuron(Box::new(ManageNeuron {
+                neuron_id_or_subaccount: Some(NeuronIdOrSubaccount::NeuronId(
+                    not_for_profit_neuron.id.unwrap(),
+                )),
+                id: None,
+                command: Some(manage_neuron::Command::Disburse(manage_neuron::Disburse {
+                    amount: None,
+                    to_account: None,
+                })),
+            }))),
+            summary: "".to_string(),
+            url: "".to_string(),
+        },
+    );
 
     result.expect("Failed.");
 }
@@ -7265,7 +7212,7 @@ fn make_proposal_with_action(
     proposer_n: &NeuronId,
     action: proposal::Action,
 ) -> ProposalId {
-    match gov
+    let response = match gov
         .manage_neuron(
             proposer_p,
             &ManageNeuron {
@@ -7285,9 +7232,10 @@ fn make_proposal_with_action(
         .command
         .unwrap()
     {
-        manage_neuron_response::Command::MakeProposal(resp) => resp.proposal_id.unwrap(),
+        manage_neuron_response::Command::MakeProposal(resp) => resp,
         _ => panic!("Invalid response"),
-    }
+    };
+    response.proposal_id.unwrap()
 }
 
 // When a neuron A follows neuron B on topic Unspecified, and B votes on topic
@@ -7378,7 +7326,7 @@ fn test_default_followees() {
     // Despite having default followees on the Unspecified topic, topics Governance and
     // SnsAndCommunityFund shouldn't have default following, i.e. when the voter_neuron votes in
     // all other topics, the neuron we just created should follow, except in these two topics.
-    let not_governance_nor_sale_proposal_id = make_proposal_with_action(
+    let not_governance_nor_sns_proposal_id = make_proposal_with_action(
         &mut gov,
         &voter_pid,
         &voter_neuron,
@@ -7386,7 +7334,7 @@ fn test_default_followees() {
             principals: vec![voter_pid],
         }),
     );
-    let expected_followed_proposal_ids = vec![not_governance_nor_sale_proposal_id];
+    let expected_followed_proposal_ids = vec![not_governance_nor_sns_proposal_id];
     assert_eq!(
         followed_proposal_ids(&mut gov),
         expected_followed_proposal_ids,
@@ -7406,32 +7354,16 @@ fn test_default_followees() {
         expected_followed_proposal_ids
     );
 
-    let sale_proposal_id = make_proposal_with_action(
+    let sns_proposal_id = make_proposal_with_action(
         &mut gov,
         &voter_pid,
         &voter_neuron,
-        proposal::Action::OpenSnsTokenSwap(OpenSnsTokenSwap {
-            target_swap_canister_id: Some(*TARGET_SWAP_CANISTER_ID),
-            params: Some(Params {
-                min_participants: 100,
-                min_icp_e8s: 20 * E8,
-                max_icp_e8s: 1000 * E8,
-                min_direct_participation_icp_e8s: Some(20 * E8),
-                max_direct_participation_icp_e8s: Some(1000 * E8),
-                min_participant_icp_e8s: 10 * E8,
-                max_participant_icp_e8s: 12 * E8,
-                swap_due_timestamp_seconds: 0,
-                sns_token_e8s: 1000 * E8,
-                neuron_basket_construction_parameters: Some(NeuronBasketConstructionParameters {
-                    count: BASKET_COUNT,
-                    dissolve_delay_interval_seconds: 30 * ONE_DAY_SECONDS,
-                }),
-                sale_delay_seconds: None,
-            }),
-            community_fund_investment_e8s: Some(0),
-        }),
+        CREATE_SERVICE_NERVOUS_SYSTEM_PROPOSAL
+            .action
+            .clone()
+            .unwrap(),
     );
-    assert!(!followed_proposal_ids(&mut gov).contains(&sale_proposal_id));
+    assert!(!followed_proposal_ids(&mut gov).contains(&sns_proposal_id));
     assert_eq!(
         followed_proposal_ids(&mut gov),
         expected_followed_proposal_ids
@@ -8367,6 +8299,69 @@ fn test_filter_proposal_ballots() {
     );
 }
 
+#[tokio::test]
+async fn test_make_proposal_message() {
+    let principal1 = principal(1);
+
+    let mut driver = fake::FakeDriver::default();
+
+    let proposal = Proposal {
+        action: Some(Action::CreateServiceNervousSystem(
+            CREATE_SERVICE_NERVOUS_SYSTEM_WITH_MATCHED_FUNDING.clone(),
+        )),
+        // Fill in the rest of the fields with those of a motion proposal.
+        // (They are not relevant to this test.)
+        ..new_motion_proposal()
+    };
+
+    let proto = GovernanceProto {
+        wait_for_quiet_threshold_seconds: 100,
+        economics: Some(NetworkEconomics::with_default_values()),
+        neurons: btreemap! {
+            1 => Neuron {
+                id: Some(NeuronId { id: 1 }),
+                controller: Some(principal1),
+                hot_keys: vec![],
+                cached_neuron_stake_e8s: 10 * E8,
+                account: driver.random_byte_array().to_vec(),
+                dissolve_state: Some(DissolveState::DissolveDelaySeconds(MIN_DISSOLVE_DELAY_FOR_VOTE_ELIGIBILITY_SECONDS)),
+                ..Default::default()
+            },
+        },
+        ..Default::default()
+    };
+
+    let mut gov = Governance::new(
+        proto,
+        driver.get_fake_env(),
+        driver.get_fake_ledger(),
+        driver.get_fake_cmc(),
+    );
+
+    // submit proposal
+    let make_proposal_response = match gov
+        .manage_neuron(
+            &principal1,
+            &ManageNeuron {
+                id: None,
+                neuron_id_or_subaccount: Some(NeuronIdOrSubaccount::NeuronId(NeuronId { id: 1 })),
+                command: Some(Command::MakeProposal(Box::new(proposal))),
+            },
+        )
+        .await
+        .command
+        .expect("Couldn't submit proposal.")
+    {
+        manage_neuron_response::Command::MakeProposal(resp) => resp,
+        r => panic!("Invalid response {:?}", r),
+    };
+
+    assert_eq!(
+        make_proposal_response.message,
+        Some("The proposal has been created successfully.".to_string())
+    )
+}
+
 #[test]
 fn test_omit_large_fields() {
     let principal1 = principal(1);
@@ -8810,7 +8805,6 @@ async fn test_max_number_of_proposals_with_ballots() {
                 ..Default::default()
             },
         )
-        .await
         .unwrap();
     }
     assert_eq!(
@@ -8830,8 +8824,7 @@ async fn test_max_number_of_proposals_with_ballots() {
             })),
             ..Default::default()
         },
-    )
-    .await, Err(GovernanceError{error_type, error_message: _}) if error_type==ResourceExhausted as i32);
+    ), Err(GovernanceError{error_type, error_message: _}) if error_type==ResourceExhausted as i32);
     // Let's try a NnsCanisterUpgrade. This proposal type is whitelisted, so it can
     // be submitted even though the max is reached.
     assert_matches!(
@@ -8848,8 +8841,7 @@ async fn test_max_number_of_proposals_with_ballots() {
                 })),
                 ..Default::default()
             },
-        )
-        .await,
+        ),
         Ok(_)
     );
 
@@ -8880,8 +8872,7 @@ async fn test_max_number_of_proposals_with_ballots() {
             })),
             ..Default::default()
         },
-    )
-    .await, Err(GovernanceError{error_type, error_message: _}) if error_type==ResourceExhausted as i32);
+    ), Err(GovernanceError{error_type, error_message: _}) if error_type==ResourceExhausted as i32);
 
     // Let's make a reward event happen
     fake_driver.advance_time_by(REWARD_DISTRIBUTION_PERIOD_SECONDS);
@@ -8901,7 +8892,6 @@ async fn test_max_number_of_proposals_with_ballots() {
             ..Default::default()
         },
     )
-    .await
     .unwrap();
 }
 
@@ -8989,34 +8979,29 @@ fn test_proposal_gc() {
 
 #[test]
 fn test_gc_ignores_exempt_proposals() {
-    let props =
-        (1..1000)
-            .collect::<Vec<u64>>()
-            .iter()
-            .map(|x| {
-                (
-                    *x,
-                    ProposalData {
-                        id: Some(ProposalId { id: *x }),
-                        decided_timestamp_seconds: 60,
-                        reward_event_round: 1,
-                        sns_token_swap_lifecycle: Some(Lifecycle::Committed as i32),
-                        proposal: Some(Proposal {
-                            title: Some("A Reasonable Title".to_string()),
-                            action: Some(if x % 2 == 0 {
-                                Action::OpenSnsTokenSwap(OpenSnsTokenSwap::default())
-                            } else {
-                                Action::CreateServiceNervousSystem(
-                                    CreateServiceNervousSystem::default(),
-                                )
-                            }),
-                            ..Default::default()
-                        }),
+    let props = (1..1000)
+        .collect::<Vec<u64>>()
+        .iter()
+        .map(|x| {
+            (
+                *x,
+                ProposalData {
+                    id: Some(ProposalId { id: *x }),
+                    decided_timestamp_seconds: 60,
+                    reward_event_round: 1,
+                    sns_token_swap_lifecycle: Some(Lifecycle::Committed as i32),
+                    proposal: Some(Proposal {
+                        title: Some("A Reasonable Title".to_string()),
+                        action: Some(Action::CreateServiceNervousSystem(
+                            CreateServiceNervousSystem::default(),
+                        )),
                         ..Default::default()
-                    },
-                )
-            })
-            .collect::<BTreeMap<u64, ProposalData>>();
+                    }),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect::<BTreeMap<u64, ProposalData>>();
     let proto = GovernanceProto {
         economics: Some(NetworkEconomics::with_default_values()),
         proposals: props.clone(),
@@ -9065,7 +9050,6 @@ async fn test_id_v1_works() {
             ..Default::default()
         },
     )
-    .await
     .unwrap();
     assert_eq!(
         ProposalStatus::Open,
@@ -9243,6 +9227,7 @@ fn test_compute_cached_metrics() {
             cached_neuron_stake_e8s: 100_000_000,
             dissolve_state: Some(DissolveState::DissolveDelaySeconds(1)),
             neuron_type: Some(NeuronType::Seed as i32),
+            controller: Some(PrincipalId::new_user_test_id(123)),
             ..Default::default()
         },
         2 => Neuron {
@@ -9252,36 +9237,42 @@ fn test_compute_cached_metrics() {
             joined_community_fund_timestamp_seconds: Some(1),
             maturity_e8s_equivalent: 450_988_012,
             neuron_type: Some(NeuronType::Ect as i32),
+            controller: Some(PrincipalId::new_user_test_id(123)),
             ..Default::default()
         },
         3 => Neuron {
             id: Some(NeuronId {id: 3}),
             cached_neuron_stake_e8s: 568_000_000,
             dissolve_state: Some(DissolveState::DissolveDelaySeconds(ONE_YEAR_SECONDS * 4)),
+            controller: Some(PrincipalId::new_user_test_id(123)),
             ..Default::default()
         },
         4 => Neuron {
             id: Some(NeuronId {id: 4}),
             cached_neuron_stake_e8s: 1_123_000_000,
             dissolve_state: Some(DissolveState::DissolveDelaySeconds(ONE_YEAR_SECONDS * 4)),
+            controller: Some(PrincipalId::new_user_test_id(123)),
             ..Default::default()
         },
         5 => Neuron {
             id: Some(NeuronId {id: 5}),
             cached_neuron_stake_e8s: 6_087_000_000,
             dissolve_state: Some(DissolveState::DissolveDelaySeconds(ONE_YEAR_SECONDS * 8)),
+            controller: Some(PrincipalId::new_user_test_id(123)),
             ..Default::default()
         },
         6 => Neuron {
             id: Some(NeuronId {id: 6}),
             cached_neuron_stake_e8s: 0,
             dissolve_state: Some(DissolveState::DissolveDelaySeconds(5)),
+            controller: Some(PrincipalId::new_user_test_id(123)),
             ..Default::default()
         },
         7 => Neuron {
             id: Some(NeuronId {id: 7}),
             cached_neuron_stake_e8s: 100,
             dissolve_state: Some(DissolveState::DissolveDelaySeconds(5)),
+            controller: Some(PrincipalId::new_user_test_id(123)),
             ..Default::default()
         },
         8 => Neuron {
@@ -9292,6 +9283,7 @@ fn test_compute_cached_metrics() {
             )),
             neuron_type: Some(NeuronType::Seed as i32),
             staked_maturity_e8s_equivalent: Some(100_000_000),
+            controller: Some(PrincipalId::new_user_test_id(123)),
             ..Default::default()
         },
         9 => Neuron {
@@ -9302,6 +9294,7 @@ fn test_compute_cached_metrics() {
             )),
             staked_maturity_e8s_equivalent: Some(100_000_000),
             neuron_type: Some(NeuronType::Ect as i32),
+            controller: Some(PrincipalId::new_user_test_id(123)),
             ..Default::default()
         },
         10 => Neuron {
@@ -9318,6 +9311,7 @@ fn test_compute_cached_metrics() {
             dissolve_state: Some(DissolveState::WhenDissolvedTimestampSeconds(
                 now + ONE_YEAR_SECONDS * 5,
             )),
+            controller: Some(PrincipalId::new_user_test_id(123)),
             ..Default::default()
         },
         12 => Neuron {
@@ -9326,22 +9320,26 @@ fn test_compute_cached_metrics() {
             dissolve_state: Some(DissolveState::WhenDissolvedTimestampSeconds(
                 now + ONE_YEAR_SECONDS * 7,
             )),
+            controller: Some(PrincipalId::new_user_test_id(123)),
             ..Default::default()
         },
         13 => Neuron {
             id: Some(NeuronId {id: 13}),
             cached_neuron_stake_e8s: 4_450_000_000,
+            controller: Some(PrincipalId::new_user_test_id(123)),
             ..Default::default()
         },
         14 => Neuron {
             id: Some(NeuronId {id: 14}),
             cached_neuron_stake_e8s: 1_220_000_000,
+            controller: Some(PrincipalId::new_user_test_id(123)),
             ..Default::default()
         },
         15 => Neuron {
             id: Some(NeuronId {id: 15}),
             cached_neuron_stake_e8s: 100_000_000,
             dissolve_state: Some(DissolveState::WhenDissolvedTimestampSeconds(1)),
+            controller: Some(PrincipalId::new_user_test_id(123)),
             ..Default::default()
         },
     };
@@ -9774,7 +9772,7 @@ fn test_update_node_provider() {
     assert_eq!(
         gov.heap_data
             .node_providers
-            .get(0)
+            .first()
             .unwrap()
             .reward_account
             .as_ref()
@@ -9942,31 +9940,31 @@ fn test_increase_dissolve_delay() {
 // 20, and 100 ICP. The first neuron is controlled by principal A and
 // the second and third by principal B.
 //
-// At first none of the neurons have joined the community fund. The
-// global metric of total ICP in the community fund should be zero and
+// At first none of the neurons have joined the Neurons' Fund. The
+// global metric of total ICP in the Neurons' Fund should be zero and
 // the total ICP in neurons should be 130.
 //
-// Principal A tries to join the community fund for neuron 3. This
+// Principal A tries to join the Neurons' Fund for neuron 3. This
 // should fail as A is not the controller.
 //
-// Principal B now tries to join the community fund for neuron 3. This
+// Principal B now tries to join the Neurons' Fund for neuron 3. This
 // should succeed and the global metric should now show that 100 ICP
-// are in the community fund.
+// are in the Neurons' Fund.
 //
-// Principal A tries to join the community fund for neuron 1. This
+// Principal A tries to join the Neurons' Fund for neuron 1. This
 // should succeed and the global metric should now show 110 ICP in the
-// community fund.
+// Neurons' Fund.
 //
 // The time advances.
 //
-// Principal B tries to join the community fund for neuron 3
+// Principal B tries to join the Neurons' Fund for neuron 3
 // (again). This should fail as this neuron is already in the
-// community fund.
+// Neurons' Fund.
 //
 // At the end of all this, 110 ICP should be reported as being in the
-// community fund and 130 ICP reported as the total ICP in neurons.
+// Neurons' Fund and 130 ICP reported as the total ICP in neurons.
 #[test]
-fn test_join_community_fund() {
+fn test_join_neurons_fund() {
     let now = 778899;
     let principal_a = 42;
     let principal_b = 128;
@@ -10010,7 +10008,7 @@ fn test_join_community_fund() {
         assert_eq!(130 * 100_000_000, actual_metrics.total_staked_e8s);
         assert_eq!(0, actual_metrics.community_fund_total_staked_e8s);
     }
-    // Try to join community fund with the wrong controller (A instead of B).
+    // Try to join Neurons' Fund with the wrong controller (A instead of B).
     {
         let result = gov
             .manage_neuron(
@@ -10031,7 +10029,7 @@ fn test_join_community_fund() {
             .unwrap();
         assert_eq!(ErrorType::NotAuthorized, result.err().unwrap().error_type());
     }
-    // Join the community fund for neuron 3.
+    // Join the Neurons' Fund for neuron 3.
     {
         let result = gov
             .manage_neuron(
@@ -10079,7 +10077,7 @@ fn test_join_community_fund() {
     }
     // Advance time by two days...
     driver.advance_time_by(60 * 60 * 24 * 2);
-    // Join the community fund for neuron 1.
+    // Join the Neurons' Fund for neuron 1.
     {
         let result = gov
             .manage_neuron(
@@ -10117,9 +10115,9 @@ fn test_join_community_fund() {
                 .unwrap_or(0)
         );
     }
-    // Principal B tries to join the community fund for neuron 3
+    // Principal B tries to join the Neurons' Fund for neuron 3
     // (again). This should fail as this neuron is already in the
-    // community fund.
+    // Neurons' Fund.
     {
         let result = gov
             .manage_neuron(
@@ -10143,7 +10141,7 @@ fn test_join_community_fund() {
             result.err().unwrap().error_type()
         );
     }
-    // Principal B leaves the community fund for Neuron 3
+    // Principal B leaves the Neurons' Fund for Neuron 3
     {
         let result = gov
             .manage_neuron(
@@ -10164,7 +10162,7 @@ fn test_join_community_fund() {
             .unwrap();
         assert!(result.is_ok());
     }
-    // Principal B tries to leave the community fund again for neuron 3, should fail
+    // Principal B tries to leave the Neurons' Fund again for neuron 3, should fail
     // since it already left.
     {
         let result = gov
@@ -10271,20 +10269,21 @@ fn wait_for_quiet_test_helper(
         fake_driver.get_fake_ledger(),
         fake_driver.get_fake_cmc(),
     );
-    let pid = tokio_test::block_on(gov.make_proposal(
-        &NeuronId { id: 0 },
-        // Must match neuron 1's serialized_id.
-        &principal(0),
-        &Proposal {
-            title: Some("A Reasonable Title".to_string()),
-            summary: "Summary".to_string(),
-            action: Some(proposal::Action::Motion(Motion {
-                motion_text: "Some proposal".to_string(),
-            })),
-            ..Default::default()
-        },
-    ))
-    .unwrap();
+    let pid = gov
+        .make_proposal(
+            &NeuronId { id: 0 },
+            // Must match neuron 1's serialized_id.
+            &principal(0),
+            &Proposal {
+                title: Some("A Reasonable Title".to_string()),
+                summary: "Summary".to_string(),
+                action: Some(proposal::Action::Motion(Motion {
+                    motion_text: "Some proposal".to_string(),
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let expected_initial_deadline_seconds =
         DEFAULT_TEST_START_TIMESTAMP_SECONDS + initial_expiration_seconds;
     let initial_deadline_seconds = gov
@@ -11179,7 +11178,6 @@ async fn test_known_neurons() {
             ..Default::default()
         },
     )
-    .await
     .unwrap();
 
     gov.make_proposal(
@@ -11198,7 +11196,6 @@ async fn test_known_neurons() {
             ..Default::default()
         },
     )
-    .await
     .unwrap();
     assert_eq!(
         gov.get_neuron_info(&NeuronId { id: 1 })
@@ -11247,7 +11244,6 @@ async fn test_known_neurons() {
                 ..Default::default()
             },
         )
-        .await
         .unwrap();
 
     assert_eq!(
@@ -11280,7 +11276,6 @@ async fn test_known_neurons() {
             ..Default::default()
         },
     )
-    .await
     .unwrap();
     assert_eq!(
         gov.get_neuron_info(&NeuronId { id: 2 })
@@ -11563,11 +11558,11 @@ lazy_static! {
                 cf_neurons: vec![
                     sns_swap_pb::CfNeuron::try_new(
                         1,
-                        COMMUNITY_FUND_INVESTMENT_E8S * 60 / 100,
+                        NEURONS_FUND_INVESTMENT_E8S * 60 / 100,
                     ).unwrap(),
                     sns_swap_pb::CfNeuron::try_new(
                         2,
-                        COMMUNITY_FUND_INVESTMENT_E8S * 10 / 100
+                        NEURONS_FUND_INVESTMENT_E8S * 10 / 100
                     ).unwrap(),
                 ],
             },
@@ -11575,7 +11570,7 @@ lazy_static! {
                 hotkey_principal: principal(2).to_string(),
                 cf_neurons: vec![sns_swap_pb::CfNeuron::try_new(
                     3,
-                    COMMUNITY_FUND_INVESTMENT_E8S * 30 / 100,
+                    NEURONS_FUND_INVESTMENT_E8S * 30 / 100,
                 ).unwrap()],
             },
         ];
@@ -11802,7 +11797,7 @@ lazy_static! {
             21342385865,
         ),
         allocated_neurons_fund_participation_icp_e8s: Some(
-            19208147279,
+            19208147278,
         ),
     });
 
@@ -11999,6 +11994,17 @@ lazy_static! {
         .unwrap()),
     );
 
+    static ref EXPECTED_FAILING_LIST_DEPLOYED_SNSES_CALL: (ExpectedCallCanisterMethodCallArguments<'static>, CanisterCallResult) = (
+        ExpectedCallCanisterMethodCallArguments {
+            target: SNS_WASM_CANISTER_ID,
+            method_name: "list_deployed_snses",
+            request: Encode!(&ListDeployedSnsesRequest {}).unwrap(),
+        },
+        Err((
+            None, "list_deployed_snses failed for no apparent reason.".to_string()
+        ))
+    );
+
     static ref EXPECTED_SWAP_GET_STATE_CALL: (ExpectedCallCanisterMethodCallArguments<'static>, CanisterCallResult) = (
         ExpectedCallCanisterMethodCallArguments {
             target: CanisterId::try_from(*TARGET_SWAP_CANISTER_ID).unwrap(),
@@ -12106,35 +12112,6 @@ lazy_static! {
         fallback_controller_principal_ids: vec![*DEVELOPER_PRINCIPAL_ID],
     };
 
-    static ref EXPECTED_SWAP_OPEN_CALL: ExpectedCallCanisterMethodCallArguments<'static> = ExpectedCallCanisterMethodCallArguments {
-        target: CanisterId::try_from(*TARGET_SWAP_CANISTER_ID).unwrap(),
-        method_name: "open",
-        request: Encode!(&sns_swap_pb::OpenRequest {
-            params: Some(SWAP_PARAMS.clone()),
-            cf_participants: CF_PARTICIPANTS.clone(),
-            open_sns_token_swap_proposal_id: Some(1),
-        })
-        .unwrap(),
-    };
-
-    static ref OPEN_SNS_TOKEN_SWAP_PROPOSAL: Proposal = Proposal {
-        title: Some("Open SNS Token Swap".to_string()),
-        summary: "".to_string(),
-        action: Some(proposal::Action::OpenSnsTokenSwap(OpenSnsTokenSwap {
-            target_swap_canister_id: Some(*TARGET_SWAP_CANISTER_ID),
-            params: Some(SWAP_PARAMS.clone()),
-            community_fund_investment_e8s: Some(COMMUNITY_FUND_INVESTMENT_E8S),
-        })),
-        ..Default::default()
-    };
-
-    static ref LEGACY_CREATE_SERVICE_NERVOUS_SYSTEM_PROPOSAL: Proposal = Proposal {
-        title: Some("Create a Service Nervous System".to_string()),
-        summary: "".to_string(),
-        action: Some(proposal::Action::CreateServiceNervousSystem(CREATE_SERVICE_NERVOUS_SYSTEM.clone())),
-        ..Default::default()
-    };
-
     static ref CREATE_SERVICE_NERVOUS_SYSTEM_PROPOSAL: Proposal = Proposal {
         title: Some("Create a Service Nervous System".to_string()),
         summary: "".to_string(),
@@ -12142,41 +12119,15 @@ lazy_static! {
         ..Default::default()
     };
 
-    static ref LEGACY_SNS_INIT_PAYLOAD: SnsInitPayload = SnsInitPayload::try_from(ExecutedCreateServiceNervousSystemProposal {
-        current_timestamp_seconds: DEFAULT_TEST_START_TIMESTAMP_SECONDS,
-         create_service_nervous_system: CREATE_SERVICE_NERVOUS_SYSTEM.clone(),
-         proposal_id: 1,
-         neurons_fund_participants: CF_PARTICIPANTS.clone(),
-         random_swap_start_time: GlobalTimeOfDay {
-             seconds_after_utc_midnight: Some(RANDOM_U64)
-         },
-         neurons_fund_participation_constraints: None,
-    }).unwrap();
-
     static ref SNS_INIT_PAYLOAD: SnsInitPayload = SnsInitPayload::try_from(ExecutedCreateServiceNervousSystemProposal {
         current_timestamp_seconds: DEFAULT_TEST_START_TIMESTAMP_SECONDS,
         create_service_nervous_system: CREATE_SERVICE_NERVOUS_SYSTEM_WITH_MATCHED_FUNDING.clone(),
         proposal_id: 1,
-        neurons_fund_participants: vec![],
         random_swap_start_time: GlobalTimeOfDay {
             seconds_after_utc_midnight: Some(RANDOM_U64)
         },
         neurons_fund_participation_constraints: NEURONS_FUND_PARTICIPATION_CONSTRAINTS.clone(),
     }).unwrap();
-
-    static ref LEGACY_EXPECTED_DEPLOY_NEW_SNS_CALL: (ExpectedCallCanisterMethodCallArguments<'static>, CanisterCallResult) = (
-        ExpectedCallCanisterMethodCallArguments {
-            target: SNS_WASM_CANISTER_ID,
-            method_name: "deploy_new_sns",
-            request: Encode!(&DeployNewSnsRequest {
-                sns_init_payload: Some(LEGACY_SNS_INIT_PAYLOAD.clone())
-            }).unwrap(),
-        },
-        Ok(Encode!(&DeployNewSnsResponse {
-            error: None,
-            ..Default::default()
-        }).unwrap())
-    );
 
     static ref EXPECTED_DEPLOY_NEW_SNS_CALL: (ExpectedCallCanisterMethodCallArguments<'static>, CanisterCallResult) = (
         ExpectedCallCanisterMethodCallArguments {
@@ -12206,301 +12157,12 @@ lazy_static! {
     );
 }
 
-const COMMUNITY_FUND_INVESTMENT_E8S: u64 = 61 * E8;
-
-/// Multiple calls to settle_community_fund should be idempotent.
-///
-/// TODO[NNS1-2632]: Remove this test once `settle_community_fund_participation` is deprecated.
-#[cfg(not(feature = "test"))]
-#[tokio::test]
-async fn test_settle_community_fund_is_idempotent() {
-    use settle_community_fund_participation::Result;
-
-    // Step 1: Prepare the world.
-    let governance_proto = GovernanceProto {
-        economics: Some(NetworkEconomics::with_default_values()),
-        neurons: SWAP_ID_TO_NEURON.clone(),
-        ..Default::default()
-    };
-
-    let expected_call_canister_method_calls: Arc<Mutex<VecDeque<_>>> = Arc::new(Mutex::new(
-        [
-            EXPECTED_LIST_DEPLOYED_SNSES_CALL.clone(),
-            // Called by validation.
-            EXPECTED_SWAP_GET_STATE_CALL.clone(),
-            // Called again by fetch_swap_background_information. This is
-            // admittedly a bit wasteful, but not super horrible.
-            EXPECTED_SWAP_GET_STATE_CALL.clone(),
-            EXPECTED_SNS_ROOT_GET_SNS_CANISTERS_SUMMARY_CALL.clone(),
-            (
-                EXPECTED_SWAP_OPEN_CALL.clone(),
-                Ok(Encode!(&sns_swap_pb::OpenResponse {}).unwrap()),
-            ),
-        ]
-        .into(),
-    ));
-
-    let driver = fake::FakeDriver::default().with_ledger_accounts(vec![]); // Initialize the minting account
-
-    let mut gov = Governance::new(
-        governance_proto,
-        Box::new(MockEnvironment {
-            expected_call_canister_method_calls: Arc::clone(&expected_call_canister_method_calls),
-            call_canister_method_min_duration: None,
-        }),
-        driver.get_fake_ledger(),
-        driver.get_fake_cmc(),
-    );
-
-    // Step 2: Run code under test.
-
-    // Create an OpenSnsTokenSwap Proposal that will decrement CF neuron's stake a measurable amount
-    let proposal_id = gov
-        .make_proposal(
-            &NeuronId { id: 1 },
-            &principal(1),
-            &OPEN_SNS_TOKEN_SWAP_PROPOSAL,
-        )
-        .await
-        .unwrap();
-
-    // Step 3: Inspect results.
-
-    let proposal = gov.get_proposal_data(proposal_id).unwrap();
-    // Assert that the proposal is executed and the lifecycle has been set
-    assert!(proposal.executed_timestamp_seconds > 0);
-    assert_eq!(
-        proposal.sns_token_swap_lifecycle,
-        Some(sns_swap_pb::Lifecycle::Open as i32)
-    );
-
-    // Calculate the AccountIdentifier of SNS Governance for balance lookups
-    let sns_governance_icp_account =
-        AccountIdentifier::new(*SNS_GOVERNANCE_CANISTER_ID, /* Subaccount*/ None);
-
-    // Get the treasury accounts balance
-    let sns_governance_treasury_balance_before_commitment = driver
-        .get_fake_ledger()
-        .account_balance(sns_governance_icp_account)
-        .await
-        .unwrap();
-
-    // The value should be zero since the maturity has not been minted
-    assert_eq!(
-        sns_governance_treasury_balance_before_commitment.get_e8s(),
-        0
-    );
-
-    // Settle the CommunityFund participation for the first time.
-    let response = gov
-        .settle_community_fund_participation(
-            *TARGET_SWAP_CANISTER_ID,
-            &SettleCommunityFundParticipation {
-                open_sns_token_swap_proposal_id: Some(proposal.id.unwrap().id),
-                result: Some(Result::Committed(Committed {
-                    sns_governance_canister_id: Some(*SNS_GOVERNANCE_CANISTER_ID),
-                    total_direct_contribution_icp_e8s: None,
-                    total_neurons_fund_contribution_icp_e8s: None,
-                })),
-            },
-        )
-        .await;
-
-    // Assert that the settling process succeeded
-    assert!(response.is_ok(), "{:?}", response);
-
-    // Get the treasury account's balance again
-    let sns_governance_treasury_balance_after_commitment = driver
-        .get_fake_ledger()
-        .account_balance(sns_governance_icp_account)
-        .await
-        .unwrap();
-
-    // The balance should now not be zero.
-    assert!(sns_governance_treasury_balance_after_commitment.get_e8s() > 0);
-    assert!(
-        sns_governance_treasury_balance_after_commitment
-            > sns_governance_treasury_balance_before_commitment
-    );
-
-    // Make sure the ProposalData's sns_token_swap_lifecycle was also set, as this is how
-    // idempotency is achieved
-    let proposal = gov.get_proposal_data(proposal_id).unwrap();
-    assert_eq!(
-        proposal.sns_token_swap_lifecycle,
-        Some(sns_swap_pb::Lifecycle::Committed as i32)
-    );
-
-    // Try to settle the CommunityFund participation for the second time.
-    let response = gov
-        .settle_community_fund_participation(
-            *TARGET_SWAP_CANISTER_ID,
-            &SettleCommunityFundParticipation {
-                open_sns_token_swap_proposal_id: Some(proposal.id.unwrap().id),
-                result: Some(Result::Committed(Committed {
-                    sns_governance_canister_id: Some(*SNS_GOVERNANCE_CANISTER_ID),
-                    total_direct_contribution_icp_e8s: None,
-                    total_neurons_fund_contribution_icp_e8s: None,
-                })),
-            },
-        )
-        .await;
-
-    // Assert that the call did not fail.
-    assert!(response.is_ok());
-
-    // Get the treasury account's balance again
-    let sns_governance_treasury_balance_after_second_settle_call = driver
-        .get_fake_ledger()
-        .account_balance(sns_governance_icp_account)
-        .await
-        .unwrap();
-
-    // Assert that no work has been done, the balance should not have changed
-    assert_eq!(
-        sns_governance_treasury_balance_after_commitment,
-        sns_governance_treasury_balance_after_second_settle_call
-    );
-
-    // Assert that the ProposalData's sns_token_swap_lifecycle hasn't changed
-    let proposal = gov.get_proposal_data(proposal_id).unwrap();
-    assert_eq!(
-        proposal.sns_token_swap_lifecycle,
-        Some(sns_swap_pb::Lifecycle::Committed as i32)
-    );
-}
-
-/// Failure when settling the CommunityFund should result in the Lifecycle remaining
-/// what it was before the method invocation.
-///
-/// TODO[NNS1-2632]: Remove this test once `settle_community_fund_participation` is deprecated.
-#[tokio::test]
-async fn test_settle_community_fund_participation_restores_lifecycle_on_failure() {
-    use settle_community_fund_participation::Result;
-
-    // Step 1: Prepare the world.
-    let governance_proto = GovernanceProto {
-        economics: Some(NetworkEconomics::with_default_values()),
-        neurons: SWAP_ID_TO_NEURON.clone(),
-        ..Default::default()
-    };
-
-    let expected_call_canister_method_calls: Arc<Mutex<VecDeque<_>>> = Arc::new(Mutex::new(
-        [
-            EXPECTED_LIST_DEPLOYED_SNSES_CALL.clone(),
-            // Called by validation.
-            EXPECTED_SWAP_GET_STATE_CALL.clone(),
-            // Called again by fetch_swap_background_information. This is
-            // admittedly a bit wasteful, but not super horrible.
-            EXPECTED_SWAP_GET_STATE_CALL.clone(),
-            EXPECTED_SNS_ROOT_GET_SNS_CANISTERS_SUMMARY_CALL.clone(),
-            (
-                EXPECTED_SWAP_OPEN_CALL.clone(),
-                Ok(Encode!(&sns_swap_pb::OpenResponse {}).unwrap()),
-            ),
-        ]
-        .into(),
-    ));
-
-    let driver = fake::FakeDriver::default();
-
-    let icp_ledger: SpyLedger = SpyLedger::new(vec![LedgerReply::TransferFunds(Err(
-        NervousSystemError::new_with_message("Error conducting the the transfer"),
-    ))]);
-
-    let mut gov = Governance::new(
-        governance_proto,
-        Box::new(MockEnvironment {
-            expected_call_canister_method_calls: Arc::clone(&expected_call_canister_method_calls),
-            call_canister_method_min_duration: None,
-        }),
-        Box::new(icp_ledger),
-        driver.get_fake_cmc(),
-    );
-
-    // Step 2: Run code under test.
-
-    // Create an OpenSnsTokenSwap Proposal that will decrement CF neuron's stake a measurable amount
-    let proposal_id = gov
-        .make_proposal(
-            &NeuronId { id: 1 },
-            &principal(1),
-            &OPEN_SNS_TOKEN_SWAP_PROPOSAL,
-        )
-        .await
-        .unwrap();
-
-    // Step 3: Inspect results.
-
-    let proposal = gov.get_proposal_data(proposal_id).unwrap();
-    // Assert that the proposal is executed and the lifecycle has been set
-    assert!(proposal.executed_timestamp_seconds > 0);
-    assert_eq!(
-        proposal.sns_token_swap_lifecycle,
-        Some(sns_swap_pb::Lifecycle::Open as i32)
-    );
-
-    // Calculate the AccountIdentifier of SNS Governance for balance lookups
-    let sns_governance_icp_account =
-        AccountIdentifier::new(*SNS_GOVERNANCE_CANISTER_ID, /* Subaccount*/ None);
-
-    // Get the treasury accounts balance
-    let sns_governance_treasury_balance_before_commitment = driver
-        .get_fake_ledger()
-        .account_balance(sns_governance_icp_account)
-        .await
-        .unwrap();
-
-    // The value should be zero since the maturity has not been minted
-    assert_eq!(
-        sns_governance_treasury_balance_before_commitment.get_e8s(),
-        0
-    );
-
-    // Settle the CommunityFund participation. This should fail with the error added to
-    // the ICP SpyLedger
-    let response = gov
-        .settle_community_fund_participation(
-            *TARGET_SWAP_CANISTER_ID,
-            &SettleCommunityFundParticipation {
-                open_sns_token_swap_proposal_id: Some(proposal.id.unwrap().id),
-                result: Some(Result::Committed(Committed {
-                    sns_governance_canister_id: Some(*SNS_GOVERNANCE_CANISTER_ID),
-                    total_direct_contribution_icp_e8s: None,
-                    total_neurons_fund_contribution_icp_e8s: None,
-                })),
-            },
-        )
-        .await;
-
-    // Assert that the settling process failed as expected
-    assert!(response.is_err(), "{:?}", response);
-
-    // Get the treasury account's balance again
-    let sns_governance_treasury_balance_after_commitment = driver
-        .get_fake_ledger()
-        .account_balance(sns_governance_icp_account)
-        .await
-        .unwrap();
-
-    // The balance should still be zero.
-    assert_eq!(
-        sns_governance_treasury_balance_after_commitment.get_e8s(),
-        0
-    );
-
-    // Make sure the ProposalData's sns_token_swap_lifecycle is still Open.
-    let proposal = gov.get_proposal_data(proposal_id).unwrap();
-    assert_eq!(
-        proposal.sns_token_swap_lifecycle,
-        Some(sns_swap_pb::Lifecycle::Open as i32)
-    );
-}
+const NEURONS_FUND_INVESTMENT_E8S: u64 = 61 * E8;
 
 /// Failure when settling the Neurons' fund should result in the Lifecycle remaining
 /// what it was before the method invocation.
 #[tokio::test]
-async fn test_settle_neurons_fund_participation_restores_lifecycle_on_failure() {
+async fn test_settle_neurons_fund_participation_restores_lifecycle_on_sns_w_failure() {
     use settle_neurons_fund_participation_request::{Committed, Result};
 
     // Step 1: Prepare the world.
@@ -12515,24 +12177,19 @@ async fn test_settle_neurons_fund_participation_restores_lifecycle_on_failure() 
             // Called during proposal execution
             EXPECTED_DEPLOY_NEW_SNS_CALL.clone(),
             // Called during first settlement call
-            EXPECTED_LIST_DEPLOYED_SNSES_CALL.clone(),
-            // Called during second settlement call
-            EXPECTED_LIST_DEPLOYED_SNSES_CALL.clone(),
+            EXPECTED_FAILING_LIST_DEPLOYED_SNSES_CALL.clone(),
         ]
         .into(),
     ));
 
     let driver = fake::FakeDriver::default();
-    let icp_ledger: SpyLedger = SpyLedger::new(vec![LedgerReply::TransferFunds(Err(
-        NervousSystemError::new_with_message("Error conducting the the transfer"),
-    ))]);
     let mut gov = Governance::new(
         governance_proto,
         Box::new(MockEnvironment {
             expected_call_canister_method_calls: Arc::clone(&expected_call_canister_method_calls),
             call_canister_method_min_duration: None,
         }),
-        Box::new(icp_ledger),
+        driver.get_fake_ledger(),
         driver.get_fake_cmc(),
     );
 
@@ -12546,7 +12203,6 @@ async fn test_settle_neurons_fund_participation_restores_lifecycle_on_failure() 
             &principal(1),
             &CREATE_SERVICE_NERVOUS_SYSTEM_PROPOSAL,
         )
-        .await
         .unwrap();
 
     // Step 3: Inspect results.
@@ -12575,8 +12231,8 @@ async fn test_settle_neurons_fund_participation_restores_lifecycle_on_failure() 
         0
     );
 
-    // Settle the Neurons' Fund participation. This should fail with the error added to
-    // the ICP SpyLedger.
+    // Settle the Neurons' Fund participation. This should fail due to
+    // `EXPECTED_FAILING_LIST_DEPLOYED_SNSES_CALL`.
     let response = gov
         .settle_neurons_fund_participation(
             *TARGET_SWAP_CANISTER_ID,
@@ -12591,7 +12247,19 @@ async fn test_settle_neurons_fund_participation_restores_lifecycle_on_failure() 
         )
         .await;
 
-    assert!(response.is_err(), "Expected error, got {:?}", response);
+    let settle_neurons_fund_participation_response =
+        assert_matches!(response, Err(err) => err.to_string());
+    assert!(
+        settle_neurons_fund_participation_response
+            .contains("not authorized to settle Neurons' Fund participation"),
+        "unexpected settle_neurons_fund_participation_response: {:?}",
+        settle_neurons_fund_participation_response,
+    );
+    assert!(
+        settle_neurons_fund_participation_response.contains("list_deployed_snses failed"),
+        "unexpected settle_neurons_fund_participation_response: {:?}",
+        settle_neurons_fund_participation_response,
+    );
 
     // Get the treasury account's balance again
     let sns_governance_treasury_balance_after_commitment = driver
@@ -12612,38 +12280,139 @@ async fn test_settle_neurons_fund_participation_restores_lifecycle_on_failure() 
         proposal.sns_token_swap_lifecycle,
         Some(sns_swap_pb::Lifecycle::Open as i32)
     );
+
+    // Inspect the proposal fields related to the Neurons' Fund
+    assert_eq!(proposal.cf_participants, vec![]);
+    assert_eq!(proposal.neurons_fund_data, *NEURONS_FUND_DATA_BEFORE_SETTLE);
 }
 
-#[cfg(not(feature = "test"))]
-fn assert_neurons_fund_decremented(
-    gov: &Governance,
-    nf_participants: Vec<sns_swap_pb::CfParticipant>,
-    original_state: BTreeMap<u64, Neuron>,
-) {
-    for participant in nf_participants {
-        for nf_neuron in participant.cf_neurons {
-            let CfNeuron {
-                nns_neuron_id,
-                amount_icp_e8s,
-                has_created_neuron_recipes: _,
-            } = nf_neuron;
+/// Failure when settling the Neurons' Fund should result in the Lifecycle remaining
+/// what it was before the method invocation.
+#[tokio::test]
+async fn test_settle_neurons_fund_participation_restores_lifecycle_on_ledger_failure() {
+    use settle_neurons_fund_participation_request::{Committed, Result};
 
-            let current_neuron_maturity = gov
-                .neuron_store
-                .with_neuron(&NeuronId { id: nns_neuron_id }, |n| n.clone())
-                .unwrap()
-                .maturity_e8s_equivalent;
-            let original_neuron_maturity = original_state
-                .get(&nns_neuron_id)
-                .unwrap()
-                .maturity_e8s_equivalent;
+    // Step 1: Prepare the world.
+    let governance_proto = GovernanceProto {
+        economics: Some(NetworkEconomics::with_default_values()),
+        neurons: SWAP_ID_TO_NEURON.clone(),
+        ..Default::default()
+    };
 
-            assert_eq!(
-                current_neuron_maturity + amount_icp_e8s,
-                original_neuron_maturity
-            );
-        }
-    }
+    let expected_call_canister_method_calls: Arc<Mutex<VecDeque<_>>> = Arc::new(Mutex::new(
+        [
+            // Called during proposal execution
+            EXPECTED_DEPLOY_NEW_SNS_CALL.clone(),
+            // Called during first settlement call
+            EXPECTED_LIST_DEPLOYED_SNSES_CALL.clone(),
+        ]
+        .into(),
+    ));
+
+    let driver = fake::FakeDriver::default();
+    let icp_ledger: SpyLedger = SpyLedger::new(vec![LedgerReply::TransferFunds(Err(
+        NervousSystemError::new_with_message("Error conducting the transfer"),
+    ))]);
+    let mut gov = Governance::new(
+        governance_proto,
+        Box::new(MockEnvironment {
+            expected_call_canister_method_calls: Arc::clone(&expected_call_canister_method_calls),
+            call_canister_method_min_duration: None,
+        }),
+        Box::new(icp_ledger),
+        driver.get_fake_cmc(),
+    );
+
+    // Step 2: Run code under test.
+
+    // Create a CreateServiceNervousSystem proposal that will decrement NF neuron's stake
+    // by a measurable amount.
+    let proposal_id = gov
+        .make_proposal(
+            &NeuronId { id: 1 },
+            &principal(1),
+            &CREATE_SERVICE_NERVOUS_SYSTEM_PROPOSAL,
+        )
+        .unwrap();
+
+    // Step 3: Inspect results.
+    let proposal = gov.get_proposal_data(proposal_id).unwrap();
+    // Assert that the proposal is executed and the lifecycle has been set
+    assert!(proposal.executed_timestamp_seconds > 0, "{:?}", proposal);
+    assert_eq!(
+        proposal.sns_token_swap_lifecycle,
+        Some(sns_swap_pb::Lifecycle::Open as i32)
+    );
+
+    // Calculate the AccountIdentifier of SNS Governance for balance lookups
+    let sns_governance_icp_account =
+        AccountIdentifier::new(*SNS_GOVERNANCE_CANISTER_ID, /* Subaccount*/ None);
+
+    // Get the treasury accounts balance
+    let sns_governance_treasury_balance_before_commitment = driver
+        .get_fake_ledger()
+        .account_balance(sns_governance_icp_account)
+        .await
+        .unwrap();
+
+    // The value should be zero since the maturity has not been minted
+    assert_eq!(
+        sns_governance_treasury_balance_before_commitment.get_e8s(),
+        0
+    );
+
+    // Settle the Neurons' Fund participation. This should fail due to the ICP Ledger transfer error.
+    let response = gov
+        .settle_neurons_fund_participation(
+            *TARGET_SWAP_CANISTER_ID,
+            SettleNeuronsFundParticipationRequest {
+                nns_proposal_id: Some(proposal.id.unwrap().id),
+                result: Some(Result::Committed(Committed {
+                    sns_governance_canister_id: Some(*SNS_GOVERNANCE_CANISTER_ID),
+                    total_direct_participation_icp_e8s: Some(45_000 * E8),
+                    total_neurons_fund_participation_icp_e8s: Some(50_000 * E8),
+                })),
+            },
+        )
+        .await;
+
+    let settle_neurons_fund_participation_response =
+        assert_matches!(response, Err(err) => err.to_string());
+    assert!(
+        settle_neurons_fund_participation_response
+            .contains("Minting ICP from the Neuron's Fund failed"),
+        "unexpected settle_neurons_fund_participation_response: {:?}",
+        settle_neurons_fund_participation_response,
+    );
+    assert!(
+        settle_neurons_fund_participation_response.contains("Error conducting the transfer"),
+        "unexpected settle_neurons_fund_participation_response: {:?}",
+        settle_neurons_fund_participation_response,
+    );
+
+    // Get the treasury account's balance again
+    let sns_governance_treasury_balance_after_commitment = driver
+        .get_fake_ledger()
+        .account_balance(sns_governance_icp_account)
+        .await
+        .unwrap();
+
+    // The balance should still be zero.
+    assert_eq!(
+        sns_governance_treasury_balance_after_commitment.get_e8s(),
+        0
+    );
+
+    // Make sure the ProposalData's sns_token_swap_lifecycle is still Open.
+    let proposal = gov.get_proposal_data(proposal_id).unwrap();
+    assert_eq!(
+        proposal.sns_token_swap_lifecycle,
+        Some(sns_swap_pb::Lifecycle::Open as i32)
+    );
+
+    // Inspect the proposal fields related to the Neurons' Fund
+    assert_eq!(proposal.cf_participants, vec![]);
+    assert_eq!(proposal.neurons_fund_data, *NEURONS_FUND_DATA_BEFORE_SETTLE);
 }
 
 fn assert_neurons_fund_unchanged(gov: &Governance, original_state: BTreeMap<u64, Neuron>) {
@@ -12657,147 +12426,6 @@ fn assert_neurons_fund_unchanged(gov: &Governance, original_state: BTreeMap<u64,
             original_neuron.maturity_e8s_equivalent
         );
     }
-}
-
-/// TODO[NNS1-2632]: Remove this test once `settle_community_fund_participation` is deprecated.
-#[cfg(not(feature = "test"))]
-#[tokio::test]
-async fn test_create_service_nervous_system_settles_community_fund_commit() {
-    // Step 1: Prepare the world.
-    let governance_proto = GovernanceProto {
-        economics: Some(NetworkEconomics::with_default_values()),
-        neurons: SWAP_ID_TO_NEURON.clone(),
-        ..Default::default()
-    };
-
-    let expected_call_canister_method_calls: Arc<Mutex<VecDeque<_>>> = Arc::new(Mutex::new(
-        [
-            // Called during proposal execution
-            LEGACY_EXPECTED_DEPLOY_NEW_SNS_CALL.clone(),
-            // Called during settlement
-            EXPECTED_LIST_DEPLOYED_SNSES_CALL.clone(),
-        ]
-        .into(),
-    ));
-
-    let driver = fake::FakeDriver::default().with_ledger_accounts(vec![]); // Initialize the minting account
-    let mut gov = Governance::new(
-        governance_proto,
-        Box::new(MockEnvironment {
-            expected_call_canister_method_calls: Arc::clone(&expected_call_canister_method_calls),
-            call_canister_method_min_duration: None,
-        }),
-        driver.get_fake_ledger(),
-        driver.get_fake_cmc(),
-    );
-
-    // Step 2: Run code under test. This is done indirectly via proposal. The
-    // proposal is executed right away, because of the "passage of time", as
-    // experienced via the MockEnvironment in gov.
-    gov.make_proposal(
-        &NeuronId { id: 1 },
-        &principal(1),
-        &LEGACY_CREATE_SERVICE_NERVOUS_SYSTEM_PROPOSAL,
-    )
-    .await
-    .unwrap();
-
-    // Step 3: Inspect results.
-
-    // Step 3.1: Inspect the proposal. In particular, look at its execution status.
-    assert_eq!(
-        gov.heap_data.proposals.len(),
-        1,
-        "{:#?}",
-        gov.heap_data.proposals
-    );
-    let mut proposals: Vec<(_, _)> = gov.heap_data.proposals.iter().collect();
-    let (_id, proposal) = proposals.pop().unwrap();
-    assert_eq!(
-        proposal.proposal.as_ref().unwrap().title.as_ref().unwrap(),
-        "Create a Service Nervous System",
-        "{:#?}",
-        proposal.proposal.as_ref().unwrap()
-    );
-    assert_eq!(
-        proposal.executed_timestamp_seconds, DEFAULT_TEST_START_TIMESTAMP_SECONDS,
-        "{:#?}",
-        proposal
-    );
-    assert_eq!(proposal.cf_participants, *CF_PARTICIPANTS);
-    assert_eq!(
-        proposal.sns_token_swap_lifecycle,
-        Some(sns_swap_pb::Lifecycle::Open as i32)
-    );
-    assert_eq!(proposal.failed_timestamp_seconds, 0, "{:#?}", proposal);
-    assert_eq!(proposal.failure_reason, None, "{:#?}", proposal);
-    assert_eq!(proposal.derived_proposal_information, None);
-
-    // Assert all of the maturity has been decremented and is held in escrow
-    assert_neurons_fund_decremented(&gov, CF_PARTICIPANTS.clone(), SWAP_ID_TO_NEURON.clone());
-
-    // Cannot be purged yet, because Community Fund participation has not been settled yet.
-    let proposal = ProposalData {
-        reward_event_round: 1, // Pretend that proposal is now settled.
-        ..proposal.clone()
-    };
-    let now = DEFAULT_TEST_START_TIMESTAMP_SECONDS + 999 * SECONDS_PER_DAY;
-    let voting_period_seconds = gov.voting_period_seconds()(proposal.topic());
-    assert_eq!(
-        proposal.reward_status(now, voting_period_seconds),
-        ProposalRewardStatus::Settled,
-    );
-    assert!(!proposal.can_be_purged(now, voting_period_seconds));
-
-    // Settle CF participation (Commit).
-    {
-        use settle_community_fund_participation::{Committed, Result};
-        gov.settle_community_fund_participation(
-            *TARGET_SWAP_CANISTER_ID,
-            &SettleCommunityFundParticipation {
-                open_sns_token_swap_proposal_id: Some(proposal.id.unwrap().id),
-                result: Some(Result::Committed(Committed {
-                    sns_governance_canister_id: Some(*SNS_GOVERNANCE_CANISTER_ID),
-                    total_direct_contribution_icp_e8s: None,
-                    total_neurons_fund_contribution_icp_e8s: None,
-                })),
-            },
-        )
-        .await
-        .unwrap();
-
-        // Re-inspect the proposal.
-        let mut proposals: Vec<(_, _)> = gov.heap_data.proposals.iter().collect();
-        assert_eq!(proposals.len(), 1);
-        let (_id, proposal) = proposals.pop().unwrap();
-
-        // Force proposal to be seen as Settled (from a voting rewards point of view).
-        let proposal = ProposalData {
-            reward_event_round: 1,
-            ..proposal.clone()
-        };
-        assert_eq!(
-            proposal.reward_status(now, voting_period_seconds),
-            ProposalRewardStatus::Settled,
-        );
-
-        // Unlike a short while ago (right before this block), we are now settled
-        assert_eq!(
-            proposal.sns_token_swap_lifecycle,
-            Some(sns_swap_pb::Lifecycle::Committed as i32),
-        );
-        assert!(proposal.can_be_purged(now, voting_period_seconds));
-    }
-
-    // Step 3.2: Make sure expected canister call(s) take place.
-    assert!(
-        expected_call_canister_method_calls
-            .lock()
-            .unwrap()
-            .is_empty(),
-        "Calls that should have been made, but were not: {:#?}",
-        expected_call_canister_method_calls,
-    );
 }
 
 #[tokio::test]
@@ -12836,7 +12464,6 @@ async fn test_create_service_nervous_system_failure_due_to_swap_deployment_error
         &principal(1),
         &CREATE_SERVICE_NERVOUS_SYSTEM_PROPOSAL,
     )
-    .await
     .unwrap();
 
     // Step 3: Inspect results.
@@ -12934,7 +12561,6 @@ async fn test_create_service_nervous_system_settles_neurons_fund_commit() {
         &principal(1),
         &CREATE_SERVICE_NERVOUS_SYSTEM_PROPOSAL,
     )
-    .await
     .unwrap();
 
     // Step 3: Inspect results.
@@ -13039,145 +12665,6 @@ async fn test_create_service_nervous_system_settles_neurons_fund_commit() {
     );
 }
 
-/// TODO[NNS1-2632]: Remove this test once `settle_community_fund_participation` is deprecated.
-#[cfg(not(feature = "test"))]
-#[tokio::test]
-async fn test_create_service_nervous_system_settles_community_fund_abort() {
-    // Step 1: Prepare the world.
-    let governance_proto = GovernanceProto {
-        economics: Some(NetworkEconomics::with_default_values()),
-        neurons: SWAP_ID_TO_NEURON.clone(),
-        ..Default::default()
-    };
-
-    let expected_call_canister_method_calls: Arc<Mutex<VecDeque<_>>> = Arc::new(Mutex::new(
-        [
-            // Called during proposal execution
-            LEGACY_EXPECTED_DEPLOY_NEW_SNS_CALL.clone(),
-            // Called during settlement
-            EXPECTED_LIST_DEPLOYED_SNSES_CALL.clone(),
-        ]
-        .into(),
-    ));
-
-    let driver = fake::FakeDriver::default().with_ledger_accounts(vec![]); // Initialize the minting account
-    let mut gov = Governance::new(
-        governance_proto,
-        Box::new(MockEnvironment {
-            expected_call_canister_method_calls: Arc::clone(&expected_call_canister_method_calls),
-            call_canister_method_min_duration: None,
-        }),
-        driver.get_fake_ledger(),
-        driver.get_fake_cmc(),
-    );
-
-    // Step 2: Run code under test. This is done indirectly via proposal. The
-    // proposal is executed right away, because of the "passage of time", as
-    // experienced via the MockEnvironment in gov.
-    gov.make_proposal(
-        &NeuronId { id: 1 },
-        &principal(1),
-        &LEGACY_CREATE_SERVICE_NERVOUS_SYSTEM_PROPOSAL,
-    )
-    .await
-    .unwrap();
-
-    // Step 3: Inspect results.
-
-    // Step 3.1: Inspect the proposal. In particular, look at its execution status.
-    assert_eq!(
-        gov.heap_data.proposals.len(),
-        1,
-        "{:#?}",
-        gov.heap_data.proposals
-    );
-    let mut proposals: Vec<(_, _)> = gov.heap_data.proposals.iter().collect();
-    let (_id, proposal) = proposals.pop().unwrap();
-    assert_eq!(
-        proposal.proposal.as_ref().unwrap().title.as_ref().unwrap(),
-        "Create a Service Nervous System",
-        "{:#?}",
-        proposal.proposal.as_ref().unwrap()
-    );
-    assert_eq!(
-        proposal.executed_timestamp_seconds, DEFAULT_TEST_START_TIMESTAMP_SECONDS,
-        "{:#?}",
-        proposal
-    );
-    assert_eq!(proposal.cf_participants, *CF_PARTICIPANTS);
-    assert_eq!(
-        proposal.sns_token_swap_lifecycle,
-        Some(sns_swap_pb::Lifecycle::Open as i32)
-    );
-    assert_eq!(proposal.failed_timestamp_seconds, 0, "{:#?}", proposal);
-    assert_eq!(proposal.failure_reason, None, "{:#?}", proposal);
-    assert_eq!(proposal.derived_proposal_information, None);
-
-    // Assert all of the maturity has been decremented and is held in escrow
-    assert_neurons_fund_decremented(&gov, CF_PARTICIPANTS.clone(), SWAP_ID_TO_NEURON.clone());
-
-    // Cannot be purged yet, because Community Fund participation has not been settled yet.
-    let proposal = ProposalData {
-        reward_event_round: 1, // Pretend that proposal is now settled.
-        ..proposal.clone()
-    };
-    let now = DEFAULT_TEST_START_TIMESTAMP_SECONDS + 999 * SECONDS_PER_DAY;
-    let voting_period_seconds = gov.voting_period_seconds()(proposal.topic());
-    assert_eq!(
-        proposal.reward_status(now, voting_period_seconds),
-        ProposalRewardStatus::Settled,
-    );
-    assert!(!proposal.can_be_purged(now, voting_period_seconds));
-
-    // Settle CF participation (Abort).
-    {
-        use settle_community_fund_participation::{Aborted, Result};
-        gov.settle_community_fund_participation(
-            *TARGET_SWAP_CANISTER_ID,
-            &SettleCommunityFundParticipation {
-                open_sns_token_swap_proposal_id: Some(proposal.id.unwrap().id),
-                result: Some(Result::Aborted(Aborted::default())),
-            },
-        )
-        .await
-        .unwrap();
-
-        // Re-inspect the proposal.
-        let mut proposals: Vec<(_, _)> = gov.heap_data.proposals.iter().collect();
-        assert_eq!(proposals.len(), 1);
-        let (_id, proposal) = proposals.pop().unwrap();
-
-        // Force proposal to be seen as Settled (from a voting rewards point of view).
-        let proposal = ProposalData {
-            reward_event_round: 1,
-            ..proposal.clone()
-        };
-        assert_eq!(
-            proposal.reward_status(now, voting_period_seconds),
-            ProposalRewardStatus::Settled,
-        );
-
-        // Unlike a short while ago (right before this block), we are now settled
-        assert_eq!(
-            proposal.sns_token_swap_lifecycle,
-            Some(sns_swap_pb::Lifecycle::Aborted as i32),
-        );
-        assert!(proposal.can_be_purged(now, voting_period_seconds));
-
-        assert_neurons_fund_unchanged(&gov, SWAP_ID_TO_NEURON.clone());
-    }
-
-    // Step 3.2: Make sure expected canister call(s) take place.
-    assert!(
-        expected_call_canister_method_calls
-            .lock()
-            .unwrap()
-            .is_empty(),
-        "Calls that should have been made, but were not: {:#?}",
-        expected_call_canister_method_calls,
-    );
-}
-
 #[tokio::test]
 async fn test_create_service_nervous_system_settles_neurons_fund_abort() {
     // Step 1: Prepare the world.
@@ -13216,7 +12703,6 @@ async fn test_create_service_nervous_system_settles_neurons_fund_abort() {
         &principal(1),
         &CREATE_SERVICE_NERVOUS_SYSTEM_PROPOSAL,
     )
-    .await
     .unwrap();
 
     // Step 3: Inspect results.
@@ -13370,7 +12856,6 @@ async fn test_create_service_nervous_system_proposal_execution_fails() {
         &principal(1),
         &CREATE_SERVICE_NERVOUS_SYSTEM_PROPOSAL,
     )
-    .await
     .unwrap();
 
     // Step 3: Inspect results.
@@ -13425,203 +12910,6 @@ async fn test_create_service_nervous_system_proposal_execution_fails() {
     );
 }
 
-/// TODO[NNS1-2632]: Remove this test once `settle_community_fund_participation` is deprecated.
-#[cfg(not(feature = "test"))]
-#[tokio::test]
-async fn test_settle_community_fund_is_idempotent_for_create_service_nervous_system() {
-    use settle_community_fund_participation::Result;
-
-    // Step 1: Prepare the world.
-    let governance_proto = GovernanceProto {
-        economics: Some(NetworkEconomics::with_default_values()),
-        neurons: SWAP_ID_TO_NEURON.clone(),
-        ..Default::default()
-    };
-
-    let expected_call_canister_method_calls: Arc<Mutex<VecDeque<_>>> = Arc::new(Mutex::new(
-        [
-            // Called during proposal execution
-            EXPECTED_DEPLOY_NEW_SNS_CALL.clone(),
-            // Called during first settlement call
-            EXPECTED_LIST_DEPLOYED_SNSES_CALL.clone(),
-            // Called during second settlement call
-            EXPECTED_LIST_DEPLOYED_SNSES_CALL.clone(),
-            // Called during third settlement call
-            EXPECTED_LIST_DEPLOYED_SNSES_CALL.clone(),
-        ]
-        .into(),
-    ));
-
-    let driver = fake::FakeDriver::default().with_ledger_accounts(vec![]); // Initialize the minting account
-    let mut gov = Governance::new(
-        governance_proto,
-        Box::new(MockEnvironment {
-            expected_call_canister_method_calls: Arc::clone(&expected_call_canister_method_calls),
-            call_canister_method_min_duration: None,
-        }),
-        driver.get_fake_ledger(),
-        driver.get_fake_cmc(),
-    );
-
-    // Step 2: Run code under test.
-
-    // Create a CreateServiceNervousSystem proposal that will decrement NF neuron's stake a measurable amount
-    let proposal_id = gov
-        .make_proposal(
-            &NeuronId { id: 1 },
-            &principal(1),
-            &LEGACY_CREATE_SERVICE_NERVOUS_SYSTEM_PROPOSAL,
-        )
-        .await
-        .unwrap();
-
-    let proposal = gov.get_proposal_data(proposal_id).unwrap();
-    // Assert that the proposal is executed and the lifecycle has been set
-    assert!(proposal.executed_timestamp_seconds > 0);
-    assert_eq!(
-        proposal.sns_token_swap_lifecycle,
-        Some(sns_swap_pb::Lifecycle::Open as i32)
-    );
-
-    // Calculate the AccountIdentifier of SNS Governance for balance lookups
-    let sns_governance_icp_account =
-        AccountIdentifier::new(*SNS_GOVERNANCE_CANISTER_ID, /* Subaccount*/ None);
-
-    // Get the treasury accounts balance
-    let sns_governance_treasury_balance_before_commitment = driver
-        .get_fake_ledger()
-        .account_balance(sns_governance_icp_account)
-        .await
-        .unwrap();
-
-    // The value should be zero since the maturity has not been minted
-    assert_eq!(
-        sns_governance_treasury_balance_before_commitment.get_e8s(),
-        0
-    );
-
-    // Settle the CommunityFund participation for the first time.
-    let response = gov
-        .settle_community_fund_participation(
-            *TARGET_SWAP_CANISTER_ID,
-            &SettleCommunityFundParticipation {
-                open_sns_token_swap_proposal_id: Some(proposal.id.unwrap().id),
-                result: Some(Result::Committed(Committed {
-                    sns_governance_canister_id: Some(*SNS_GOVERNANCE_CANISTER_ID),
-                    total_direct_contribution_icp_e8s: None,
-                    total_neurons_fund_contribution_icp_e8s: None,
-                })),
-            },
-        )
-        .await;
-
-    // Assert that the settling process succeeded
-    assert!(response.is_ok(), "{:?}", response);
-
-    // Get the treasury account's balance again
-    let sns_governance_treasury_balance_after_commitment = driver
-        .get_fake_ledger()
-        .account_balance(sns_governance_icp_account)
-        .await
-        .unwrap();
-
-    // The balance should now not be zero.
-    assert!(sns_governance_treasury_balance_after_commitment.get_e8s() > 0);
-    assert!(
-        sns_governance_treasury_balance_after_commitment
-            > sns_governance_treasury_balance_before_commitment
-    );
-
-    // Make sure the ProposalData's sns_token_swap_lifecycle was also set, as this is how
-    // idempotency is achieved
-    let proposal = gov.get_proposal_data(proposal_id).unwrap();
-    assert_eq!(
-        proposal.sns_token_swap_lifecycle,
-        Some(sns_swap_pb::Lifecycle::Committed as i32)
-    );
-
-    // Try to settle the CommunityFund participation for the second time.
-    let response = gov
-        .settle_community_fund_participation(
-            *TARGET_SWAP_CANISTER_ID,
-            &SettleCommunityFundParticipation {
-                open_sns_token_swap_proposal_id: Some(proposal.id.unwrap().id),
-                result: Some(Result::Committed(Committed {
-                    sns_governance_canister_id: Some(*SNS_GOVERNANCE_CANISTER_ID),
-                    total_direct_contribution_icp_e8s: None,
-                    total_neurons_fund_contribution_icp_e8s: None,
-                })),
-            },
-        )
-        .await;
-
-    // Assert that the call did not fail.
-    assert!(response.is_ok());
-
-    // Get the treasury account's balance again
-    let sns_governance_treasury_balance_after_second_settle_call = driver
-        .get_fake_ledger()
-        .account_balance(sns_governance_icp_account)
-        .await
-        .unwrap();
-
-    // Assert that no work has been done, the balance should not have changed
-    assert_eq!(
-        sns_governance_treasury_balance_after_commitment,
-        sns_governance_treasury_balance_after_second_settle_call
-    );
-
-    // Assert that the ProposalData's sns_token_swap_lifecycle hasn't changed
-    let proposal = gov.get_proposal_data(proposal_id).unwrap();
-    assert_eq!(
-        proposal.sns_token_swap_lifecycle,
-        Some(sns_swap_pb::Lifecycle::Committed as i32)
-    );
-
-    // Try to settle the third time, now by calling the new `settle_neurons_fund_participation`
-    // function.
-    let response = gov
-        .settle_neurons_fund_participation(
-            *TARGET_SWAP_CANISTER_ID,
-            SettleNeuronsFundParticipationRequest {
-                nns_proposal_id: Some(proposal.id.unwrap().id),
-                result: Some(
-                    settle_neurons_fund_participation_request::Result::Committed(
-                        settle_neurons_fund_participation_request::Committed {
-                            sns_governance_canister_id: Some(*SNS_GOVERNANCE_CANISTER_ID),
-                            total_direct_participation_icp_e8s: Some(100_000 * E8),
-                            total_neurons_fund_participation_icp_e8s: Some(50_000 * E8),
-                        },
-                    ),
-                ),
-            },
-        )
-        .await;
-
-    // Assert that the call did not fail.
-    assert!(response.is_ok(), "Expected Ok result, got {:?}", response);
-
-    // Get the treasury account's balance again
-    let sns_governance_treasury_balance_after_second_settle_call = driver
-        .get_fake_ledger()
-        .account_balance(sns_governance_icp_account)
-        .await
-        .unwrap();
-
-    // Assert that no work has been done, the balance should not have changed
-    assert_eq!(
-        sns_governance_treasury_balance_after_commitment,
-        sns_governance_treasury_balance_after_second_settle_call
-    );
-
-    // Assert that the ProposalData's sns_token_swap_lifecycle hasn't changed
-    let proposal = gov.get_proposal_data(proposal_id).unwrap();
-    assert_eq!(
-        proposal.sns_token_swap_lifecycle,
-        Some(sns_swap_pb::Lifecycle::Committed as i32)
-    );
-}
-
 #[tokio::test]
 async fn test_settle_neurons_fund_is_idempotent_for_create_service_nervous_system() {
     use settle_neurons_fund_participation_request::{Committed, Result};
@@ -13667,7 +12955,6 @@ async fn test_settle_neurons_fund_is_idempotent_for_create_service_nervous_syste
             &principal(1),
             &CREATE_SERVICE_NERVOUS_SYSTEM_PROPOSAL,
         )
-        .await
         .unwrap();
 
     let proposal = gov.get_proposal_data(proposal_id).unwrap();
@@ -13703,8 +12990,9 @@ async fn test_settle_neurons_fund_is_idempotent_for_create_service_nervous_syste
                 nns_proposal_id: Some(proposal.id.unwrap().id),
                 result: Some(Result::Committed(Committed {
                     sns_governance_canister_id: Some(*SNS_GOVERNANCE_CANISTER_ID),
-                    total_direct_participation_icp_e8s: Some(100_000 * E8),
-                    total_neurons_fund_participation_icp_e8s: Some(50_000 * E8),
+                    // This amount should result in some NF funds and some refunds.
+                    total_direct_participation_icp_e8s: Some(40_000 * E8),
+                    total_neurons_fund_participation_icp_e8s: Some(69_439_371_803),
                 })),
             },
         )
@@ -13733,6 +13021,12 @@ async fn test_settle_neurons_fund_is_idempotent_for_create_service_nervous_syste
         proposal.sns_token_swap_lifecycle,
         Some(sns_swap_pb::Lifecycle::Committed as i32)
     );
+    // Inspect the proposal fields related to the Neurons' Fund
+    assert_eq!(proposal.cf_participants, vec![]);
+    assert_eq!(
+        proposal.neurons_fund_data,
+        *NEURONS_FUND_DATA_AFTER_SETTLE_COMMIT
+    );
 
     // Settle the Neurons' Fund participation for the second time.
     let response = gov
@@ -13742,8 +13036,9 @@ async fn test_settle_neurons_fund_is_idempotent_for_create_service_nervous_syste
                 nns_proposal_id: Some(proposal.id.unwrap().id),
                 result: Some(Result::Committed(Committed {
                     sns_governance_canister_id: Some(*SNS_GOVERNANCE_CANISTER_ID),
-                    total_direct_participation_icp_e8s: Some(100_000 * E8),
-                    total_neurons_fund_participation_icp_e8s: Some(50_000 * E8),
+                    // This amount should result in some NF funds and some refunds.
+                    total_direct_participation_icp_e8s: Some(40_000 * E8),
+                    total_neurons_fund_participation_icp_e8s: Some(69_439_371_803),
                 })),
             },
         )
@@ -13770,46 +13065,11 @@ async fn test_settle_neurons_fund_is_idempotent_for_create_service_nervous_syste
         proposal.sns_token_swap_lifecycle,
         Some(sns_swap_pb::Lifecycle::Committed as i32)
     );
-
-    // Try to settle the third time, now by calling the old `settle_community_fund_participation`
-    // function.
-    let response = gov
-        .settle_community_fund_participation(
-            *TARGET_SWAP_CANISTER_ID,
-            &SettleCommunityFundParticipation {
-                open_sns_token_swap_proposal_id: Some(proposal.id.unwrap().id),
-                result: Some(settle_community_fund_participation::Result::Committed(
-                    settle_community_fund_participation::Committed {
-                        sns_governance_canister_id: Some(*SNS_GOVERNANCE_CANISTER_ID),
-                        total_direct_contribution_icp_e8s: None,
-                        total_neurons_fund_contribution_icp_e8s: None,
-                    },
-                )),
-            },
-        )
-        .await;
-
-    // Assert that the call did not fail.
-    assert!(response.is_ok());
-
-    // Get the treasury account's balance again
-    let sns_governance_treasury_balance_after_second_settle_call = driver
-        .get_fake_ledger()
-        .account_balance(sns_governance_icp_account)
-        .await
-        .unwrap();
-
-    // Assert that no work has been done, the balance should not have changed
+    // Inspect the proposal fields related to the Neurons' Fund
+    assert_eq!(proposal.cf_participants, vec![]);
     assert_eq!(
-        sns_governance_treasury_balance_after_commitment,
-        sns_governance_treasury_balance_after_second_settle_call
-    );
-
-    // Assert that the ProposalData's sns_token_swap_lifecycle hasn't changed
-    let proposal = gov.get_proposal_data(proposal_id).unwrap();
-    assert_eq!(
-        proposal.sns_token_swap_lifecycle,
-        Some(sns_swap_pb::Lifecycle::Committed as i32)
+        proposal.neurons_fund_data,
+        *NEURONS_FUND_DATA_AFTER_SETTLE_COMMIT
     );
 }
 
@@ -14033,7 +13293,6 @@ async fn test_proposal_url_not_on_list_fails() {
             url: "https://foo.com".to_string(),
         },
     )
-    .await
     .unwrap_err();
 
     // Submit a proposal with a URL on the whitelist
@@ -14050,177 +13309,7 @@ async fn test_proposal_url_not_on_list_fails() {
             url: "https://forum.dfinity.org/anything".to_string(),
         },
     )
-    .await
     .unwrap();
-}
-
-#[tokio::test]
-async fn make_open_sns_token_swap_proposals_concurrently_targeting_the_same_sns() {
-    let proposal = Proposal {
-        title: Some("Put Widget Dapp Under SNS Control".to_string()),
-        url: "https://forum.dfinity.org/why-the-widget-sns-will-be-epic".to_string(),
-        summary: "Best Dapp evar.".to_string(),
-        action: Some(Action::OpenSnsTokenSwap(OpenSnsTokenSwap {
-            target_swap_canister_id: Some(*TARGET_SWAP_CANISTER_ID),
-            params: Some(SWAP_PARAMS.clone()),
-            community_fund_investment_e8s: None,
-        })),
-    };
-
-    let proposals = vec![
-        proposal.clone(),
-        proposal.clone(),
-        proposal.clone(),
-        proposal.clone(),
-        proposal.clone(),
-    ];
-    drop(proposal);
-
-    make_open_sns_token_swap_proposals_concurrently(proposals).await;
-}
-
-#[tokio::test]
-async fn make_open_sns_token_swap_proposals_concurrently_targeting_different_snses() {
-    let proposal_1 = Proposal {
-        title: Some("Put Widget Dapp Under SNS Control".to_string()),
-        url: "https://forum.dfinity.org/why-the-widget-sns-will-be-epic".to_string(),
-        summary: "Best Dapp evar.".to_string(),
-        action: Some(Action::OpenSnsTokenSwap(OpenSnsTokenSwap {
-            target_swap_canister_id: Some(*TARGET_SWAP_CANISTER_ID),
-            params: Some(SWAP_PARAMS.clone()),
-            community_fund_investment_e8s: None,
-        })),
-    };
-
-    // Same as proposal_1, except targets a different swap.
-    let proposal_2 = Proposal {
-        title: Some("Put Widget Dapp Under SNS Control".to_string()),
-        url: "https://forum.dfinity.org/why-the-widget-sns-will-be-epic".to_string(),
-        summary: "Best Dapp evar.".to_string(),
-        action: Some(Action::OpenSnsTokenSwap(OpenSnsTokenSwap {
-            target_swap_canister_id: Some(principal(760_407)),
-            params: Some(SWAP_PARAMS.clone()),
-            community_fund_investment_e8s: None,
-        })),
-    };
-
-    let proposals = vec![proposal_1, proposal_2];
-
-    make_open_sns_token_swap_proposals_concurrently(proposals).await;
-}
-
-lazy_static! {
-    static ref MAKE_OPEN_SNS_TOKEN_SWAP_PROPOSALS_CONCURRENTLY_MUTEX: tokio::sync::Mutex<()> =
-        tokio::sync::Mutex::new(());
-}
-
-async fn make_open_sns_token_swap_proposals_concurrently(proposals: Vec<Proposal>) {
-    // Step 1: Prepare the world.
-
-    // This can only be run one at a time.
-    let _unlock_on_return = MAKE_OPEN_SNS_TOKEN_SWAP_PROPOSALS_CONCURRENTLY_MUTEX
-        .lock()
-        .await;
-
-    let expected_call_canister_method_calls = Arc::new(Mutex::new(VecDeque::from([
-        EXPECTED_LIST_DEPLOYED_SNSES_CALL.clone(),
-        EXPECTED_SWAP_GET_STATE_CALL.clone(),
-        EXPECTED_SWAP_GET_STATE_CALL.clone(),
-        EXPECTED_SNS_ROOT_GET_SNS_CANISTERS_SUMMARY_CALL.clone(),
-    ])));
-    let environment = Box::new(MockEnvironment {
-        expected_call_canister_method_calls: Arc::clone(&expected_call_canister_method_calls),
-
-        // Try "really hard" to make the first dequeued request block all
-        // others. This is overkill, because even with 1 ms,
-        // --runs_per_test=1000 resulted in no flakes.
-        call_canister_method_min_duration: Some(std::time::Duration::from_millis(100)),
-    });
-
-    let fake_driver = fake::FakeDriver::default();
-    let fixture = GovernanceProto {
-        short_voting_period_seconds: SECONDS_PER_DAY,
-        neuron_management_voting_period_seconds: Some(SECONDS_PER_DAY),
-        wait_for_quiet_threshold_seconds: SECONDS_PER_DAY,
-        ..fixture_two_neurons_second_is_bigger()
-    };
-
-    static mut GOVERNANCE: Option<Governance> = None;
-    // This mirrors what we do in canister.rs. unsafe is needed, because we are
-    // using a mutable static. This is very bad when the object is touched by >
-    // 1 thread, but we only have one thread here.
-    unsafe {
-        GOVERNANCE = Some(Governance::new(
-            fixture,
-            environment,
-            fake_driver.get_fake_ledger(),
-            fake_driver.get_fake_cmc(),
-        ));
-    }
-    fn governance_mut() -> &'static mut Governance {
-        // Ditto the comment on the previous unsafe block.
-        unsafe { GOVERNANCE.as_mut().unwrap() }
-    }
-
-    // Step 2: Call the code under test.
-
-    // Make proposals concurrently.
-    let controller_1 = principal(1);
-    let requests = proposals.iter().map(|proposal: &Proposal| {
-        // Notice that we do NOT await here. That will be done later,
-        // indirectly via join_all. That way, all of these requests are
-        // made concurrently.
-        governance_mut().make_proposal(&NeuronId { id: 1 }, &controller_1, proposal)
-    });
-    let responses = join_all(requests).await;
-
-    // Step 3: Inspect results.
-
-    // One request went through, but not the other one.
-    let mut ok_count = 0;
-    let mut err_count = 0;
-    for response in &responses {
-        match response {
-            Ok(ProposalId { id }) => {
-                assert!(*id > 0);
-                ok_count += 1;
-            }
-
-            Err(GovernanceError {
-                error_type,
-                error_message,
-            }) => {
-                // Assert that type is Unavailable.
-                let error_type = ErrorType::try_from(*error_type).unwrap();
-                assert_eq!(error_type, ErrorType::Unavailable, "{}", error_message);
-
-                // Assert that message contains all the right keywords.
-                assert!(
-                    error_message.contains("OpenSnsTokenSwap"),
-                    "{}",
-                    error_message
-                );
-                let error_message = error_message.to_lowercase();
-                assert!(error_message.contains("another"), "{}", error_message);
-                assert!(error_message.contains("proposal"), "{}", error_message);
-                assert!(error_message.contains("try again"), "{}", error_message);
-
-                err_count += 1;
-            }
-        }
-    }
-    assert_eq!(ok_count, 1, "{} {}", ok_count, err_count);
-    assert_eq!(err_count, responses.len() - 1, "{} {}", ok_count, err_count);
-
-    // All expected canister calls were made.
-    assert!(
-        expected_call_canister_method_calls
-            .lock()
-            .unwrap()
-            .is_empty(),
-        "Calls that should have been made, but were not: {:#?}",
-        expected_call_canister_method_calls,
-    );
 }
 
 #[test]

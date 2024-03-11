@@ -7,6 +7,7 @@ BACKUP_RUNTIME_DEPS = ["//rs/tests:backup/binaries"]
 
 system_test(
     name = "backup_manager_test",
+    flaky = True,
     proc_macro_deps = MACRO_DEPENDENCIES,
     tags = [
         "experimental_system_test_colocation",
@@ -23,6 +24,7 @@ system_test(
 
 system_test(
     name = "catch_up_loop_prevention_test",
+    flaky = True,
     malicious = True,
     proc_macro_deps = MACRO_DEPENDENCIES,
     tags = [
@@ -30,6 +32,7 @@ system_test(
         "system_test_nightly",
     ],
     target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
+    test_timeout = "eternal",
     uses_guestos_dev = True,
     runtime_deps = ["//ic-os:scripts/build-bootstrap-config-image.sh"] + GRAFANA_RUNTIME_DEPS,
     deps = DEPENDENCIES + ["//rs/tests"],
@@ -51,7 +54,11 @@ system_test(
 
 system_test(
     name = "cow_safety_test",
+    flaky = True,
     proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "k8s",
+    ],
     target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
     runtime_deps = GUESTOS_RUNTIME_DEPS,
     deps = DEPENDENCIES + ["//rs/tests"],
@@ -59,6 +66,7 @@ system_test(
 
 system_test(
     name = "dual_workload_test",
+    flaky = True,
     proc_macro_deps = MACRO_DEPENDENCIES,
     target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
     runtime_deps = GUESTOS_RUNTIME_DEPS,
@@ -67,8 +75,12 @@ system_test(
 
 system_test(
     name = "liveness_with_equivocation_test",
+    flaky = True,
     malicious = True,
     proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "k8s",
+    ],
     target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
     uses_guestos_dev = True,
     uses_guestos_dev_test = True,
@@ -78,7 +90,11 @@ system_test(
 
 system_test(
     name = "max_ingress_payload_size_test",
+    flaky = True,
     proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "k8s",
+    ],
     target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
     runtime_deps = GUESTOS_RUNTIME_DEPS,
     deps = DEPENDENCIES + ["//rs/tests"],
@@ -86,7 +102,11 @@ system_test(
 
 system_test(
     name = "max_xnet_payload_size_test",
+    flaky = True,
     proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "k8s",
+    ],
     target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
     runtime_deps = GUESTOS_RUNTIME_DEPS,
     deps = DEPENDENCIES + ["//rs/tests"],
@@ -94,7 +114,11 @@ system_test(
 
 system_test(
     name = "node_graceful_leaving_test",
+    flaky = True,
     proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "k8s",
+    ],
     target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
     runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,
     deps = DEPENDENCIES + ["//rs/tests"],
@@ -102,6 +126,7 @@ system_test(
 
 system_test(
     name = "subnet_splitting_test",
+    flaky = True,
     proc_macro_deps = MACRO_DEPENDENCIES,
     tags = [
         "experimental_system_test_colocation",
@@ -119,8 +144,12 @@ system_test(
 
 system_test(
     name = "replica_determinism_test",
+    flaky = True,
     malicious = True,
     proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "k8s",
+    ],
     target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
     uses_guestos_dev = True,
     uses_guestos_dev_test = True,
@@ -130,8 +159,12 @@ system_test(
 
 system_test(
     name = "request_auth_malicious_replica_test",
+    flaky = True,
     malicious = True,
     proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "k8s",
+    ],
     target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
     uses_guestos_dev = True,
     uses_guestos_dev_test = True,
@@ -141,8 +174,12 @@ system_test(
 
 system_test(
     name = "safety_test",
+    flaky = True,
     malicious = True,
     proc_macro_deps = MACRO_DEPENDENCIES,
+    tags = [
+        "k8s",
+    ],
     target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
     uses_guestos_dev = True,
     uses_guestos_dev_test = True,
@@ -212,6 +249,7 @@ system_test(
 
 system_test(
     name = "adding_nodes_to_subnet_test",
+    flaky = True,
     proc_macro_deps = MACRO_DEPENDENCIES,
     target_compatible_with = ["@platforms//os:linux"],  # requires libssh that does not build on Mac OS
     runtime_deps = GUESTOS_RUNTIME_DEPS + NNS_CANISTER_RUNTIME_DEPS,

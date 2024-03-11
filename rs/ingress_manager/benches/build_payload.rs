@@ -11,7 +11,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use ic_artifact_pool::ingress_pool::IngressPoolImpl;
 use ic_constants::MAX_INGRESS_TTL;
-use ic_ingress_manager::IngressManager;
+use ic_ingress_manager::{CustomRandomState, IngressManager};
 use ic_interfaces::{
     ingress_manager::IngressSelector,
     ingress_pool::{ChangeAction, ChangeSet, IngressPool},
@@ -35,9 +35,9 @@ use ic_test_utilities::{
     state::{CanisterStateBuilder, ReplicatedStateBuilder},
     types::ids::{node_test_id, subnet_test_id},
     types::messages::SignedIngressBuilder,
-    FastForwardTimeSource,
 };
 use ic_test_utilities_registry::test_subnet_record;
+use ic_test_utilities_time::FastForwardTimeSource;
 use ic_types::{
     artifact::IngressMessageId, batch::ValidationContext, ingress::IngressStatus,
     malicious_flags::MaliciousFlags, CanisterId, Cycles, Height, NumBytes, PrincipalId,
@@ -115,6 +115,7 @@ where
                 Arc::new(state_manager),
                 cycles_account_manager,
                 MaliciousFlags::default(),
+                CustomRandomState::default(),
             ),
             registry,
             canisters,

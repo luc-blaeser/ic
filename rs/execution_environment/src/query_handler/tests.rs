@@ -3,7 +3,7 @@ use ic_base_types::{CanisterId, NumSeconds};
 use ic_btc_interface::NetworkInRequest as BitcoinNetwork;
 use ic_config::execution_environment::INSTRUCTION_OVERHEAD_PER_QUERY_CALL;
 use ic_error_types::{ErrorCode, UserError};
-use ic_ic00_types::{BitcoinGetBalanceArgs, BitcoinGetUtxosArgs, Payload};
+use ic_management_canister_types::{BitcoinGetBalanceArgs, BitcoinGetUtxosArgs, Payload};
 use ic_registry_subnet_type::SubnetType;
 use ic_test_utilities::{
     types::ids::user_test_id,
@@ -1398,7 +1398,7 @@ fn query_stats_are_collected() {
 fn test_incorrect_query_name() {
     let test = ExecutionTestBuilder::new().build();
     let method = "unknown method".to_string();
-    match test.query(
+    let Err(err) = test.query(
         UserQuery {
             source: user_test_id(2),
             receiver: CanisterId::ic_00(),
@@ -1409,16 +1409,14 @@ fn test_incorrect_query_name() {
         },
         Arc::new(test.state().clone()),
         vec![],
-    ) {
-        Err(e) => {
-            assert_eq!(e.code(), ErrorCode::CanisterMethodNotFound);
-            assert_eq!(
-                e.description(),
-                format!("Query method {} not found.", method)
-            );
-        }
-        _ => panic!("Unexpected result."),
-    }
+    ) else {
+        panic!("Unexpected result.");
+    };
+    assert_eq!(err.code(), ErrorCode::CanisterMethodNotFound);
+    assert_eq!(
+        err.description(),
+        format!("Query method {} not found.", method)
+    );
 }
 
 #[test]

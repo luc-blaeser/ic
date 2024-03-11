@@ -10,12 +10,12 @@ use ic_interfaces::{
 use ic_interfaces_registry::RegistryClient;
 use ic_protobuf::types::v1 as pb;
 use ic_registry_client_helpers::subnet::SubnetRegistry;
-use ic_types::crypto::crypto_hash;
 use ic_types::{
     batch::ValidationContext,
     consensus::{
-        dkg, Block, CatchUpContent, CatchUpPackage, ConsensusMessageHashable, HasHeight,
-        HashedBlock, HashedRandomBeacon, Payload, RandomBeaconContent, Rank,
+        dkg, Block, BlockPayload, CatchUpContent, CatchUpPackage, ConsensusMessageHashable,
+        HasHeight, HashedBlock, HashedRandomBeacon, Payload, RandomBeaconContent, Rank,
+        SummaryPayload,
     },
     crypto::{
         threshold_sig::ni_dkg::NiDkgTag, CombinedThresholdSig, CombinedThresholdSigOf, CryptoHash,
@@ -25,8 +25,18 @@ use ic_types::{
     time::UNIX_EPOCH,
     Height, SubnetId, Time,
 };
+use ic_types::{
+    consensus::ecdsa::{EcdsaBlockReader, EcdsaStats, RequestId},
+    crypto::{
+        canister_threshold_sig::idkg::{IDkgDealingSupport, IDkgTranscriptParams},
+        crypto_hash,
+    },
+};
 use phantom_newtype::Id;
-use std::sync::{Arc, RwLock};
+use std::{
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 #[macro_export]
 macro_rules! assert_changeset_matches_pattern {
@@ -169,7 +179,13 @@ pub fn make_genesis(summary: dkg::Summary) -> CatchUpPackage {
     let high_dkg_id = summary.current_transcript(&NiDkgTag::HighThreshold).dkg_id;
     let block = Block::new(
         Id::from(CryptoHash(Vec::new())),
-        Payload::new(crypto_hash, (summary, None).into()),
+        Payload::new(
+            crypto_hash,
+            BlockPayload::Summary(SummaryPayload {
+                dkg: summary,
+                ecdsa: None,
+            }),
+        ),
         height,
         Rank(0),
         ValidationContext {
@@ -190,10 +206,34 @@ pub fn make_genesis(summary: dkg::Summary) -> CatchUpPackage {
             HashedBlock::new(crypto_hash, block),
             HashedRandomBeacon::new(crypto_hash, random_beacon),
             Id::from(CryptoHash(Vec::new())),
+            None,
         ),
         signature: ThresholdSignature {
             signer: high_dkg_id,
             signature: CombinedThresholdSigOf::new(CombinedThresholdSig(vec![])),
         },
     }
+}
+
+pub struct EcdsaStatsNoOp {}
+impl EcdsaStats for EcdsaStatsNoOp {
+    fn update_active_transcripts(&self, _block_reader: &dyn EcdsaBlockReader) {}
+    fn update_active_quadruples(&self, _block_reader: &dyn EcdsaBlockReader) {}
+    fn record_support_validation(&self, _support: &IDkgDealingSupport, _duration: Duration) {}
+    fn record_support_aggregation(
+        &self,
+        _transcript_params: &IDkgTranscriptParams,
+        _support_shares: &[IDkgDealingSupport],
+        _duration: Duration,
+    ) {
+    }
+    fn record_transcript_creation(
+        &self,
+        _transcript_params: &IDkgTranscriptParams,
+        _duration: Duration,
+    ) {
+    }
+    fn update_active_signature_requests(&self, _requests: Vec<RequestId>) {}
+    fn record_sig_share_validation(&self, _request_id: &RequestId, _duration: Duration) {}
+    fn record_sig_share_aggregation(&self, _request_id: &RequestId, _duration: Duration) {}
 }

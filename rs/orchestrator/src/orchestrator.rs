@@ -1,16 +1,19 @@
 use crate::args::OrchestratorArgs;
+use crate::boundary_node::BoundaryNodeManager;
 use crate::catch_up_package_provider::CatchUpPackageProvider;
 use crate::dashboard::{Dashboard, OrchestratorDashboard};
 use crate::firewall::Firewall;
 use crate::hostos_upgrade::HostosUpgrader;
+use crate::ipv4_network::Ipv4Configurator;
 use crate::metrics::OrchestratorMetrics;
 use crate::process_manager::ProcessManager;
 use crate::registration::NodeRegistration;
 use crate::registry_helper::RegistryHelper;
 use crate::ssh_access_manager::SshAccessManager;
 use crate::upgrade::Upgrade;
+use get_if_addrs::get_if_addrs;
 use ic_config::metrics::{Config as MetricsConfig, Exporter};
-use ic_crypto::{CryptoComponent, CryptoComponentForNonReplicaProcess};
+use ic_crypto::CryptoComponent;
 use ic_crypto_node_key_generation::{generate_node_keys_once, NodeKeyGenerationError};
 use ic_crypto_tls_interfaces::TlsHandshake;
 use ic_http_endpoints_metrics::MetricsHttpEndpoint;
@@ -38,6 +41,7 @@ pub struct Orchestrator {
     _metrics_runtime: MetricsHttpEndpoint,
     upgrade: Option<Upgrade>,
     hostos_upgrade: Option<HostosUpgrader>,
+    boundary_node_manager: Option<BoundaryNodeManager>,
     firewall: Option<Firewall>,
     ssh_access_manager: Option<SshAccessManager>,
     orchestrator_dashboard: Option<OrchestratorDashboard>,
@@ -49,6 +53,7 @@ pub struct Orchestrator {
     subnet_id: Arc<RwLock<Option<SubnetId>>>,
     // Handles of async tasks used to wait for their completion
     task_handles: Vec<JoinHandle<()>>,
+    ipv4_configurator: Option<Ipv4Configurator>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -114,7 +119,18 @@ impl Orchestrator {
 
         let version = replica_version.clone();
         thread::spawn(move || loop {
-            let message = format!("\nNode-id: {}\nReplica version: {}\n\n", node_id, version);
+            let (ipv4, ipv6) = Self::get_ip_addresses();
+
+            let message = indoc::formatdoc!(
+                r#"
+                    Node-id: {node_id}
+                    Replica version: {version}
+                    IPv6: {ipv6}
+                    IPv4: {ipv4}
+
+                "#
+            );
+
             UtilityCommand::notify_host(&message, 1);
             thread::sleep(Duration::from_secs(15 * 60));
         });
@@ -150,7 +166,7 @@ impl Orchestrator {
         let crypto_config = config.crypto.clone();
         let c_metrics = metrics_registry.clone();
         let crypto = tokio::task::spawn_blocking(move || {
-            Arc::new(CryptoComponent::new_for_non_replica_process(
+            Arc::new(CryptoComponent::new(
                 &crypto_config,
                 Some(tokio::runtime::Handle::current()),
                 c_registry.get_registry_client(),
@@ -167,7 +183,7 @@ impl Orchestrator {
             &slog_logger,
             &metrics_registry,
             registry.get_registry_client(),
-            crypto.clone(),
+            Arc::clone(&crypto) as _,
         );
         let metrics = Arc::new(metrics);
 
@@ -182,7 +198,7 @@ impl Orchestrator {
             Arc::clone(&registry_client),
             Arc::clone(&metrics),
             node_id,
-            Arc::clone(&crypto) as Arc<dyn CryptoComponentForNonReplicaProcess>,
+            Arc::clone(&crypto) as _,
             registry_local_store.clone(),
         );
 
@@ -196,7 +212,7 @@ impl Orchestrator {
         let cup_provider = Arc::new(CatchUpPackageProvider::new(
             Arc::clone(&registry),
             args.cup_dir.clone(),
-            crypto.clone(),
+            Arc::clone(&crypto) as _,
             logger.clone(),
             node_id,
         ));
@@ -215,7 +231,7 @@ impl Orchestrator {
                 replica_version.clone(),
                 args.replica_config_file.clone(),
                 node_id,
-                ic_binary_directory,
+                ic_binary_directory.clone(),
                 registry_replicator,
                 args.replica_binary_dir.clone(),
                 logger.clone(),
@@ -224,10 +240,12 @@ impl Orchestrator {
             .await,
         );
 
-        let hostos_version = UtilityCommand::request_hostos_version().and_then(|v| {
-            HostosVersion::try_from(v)
-                .map_err(|e| format!("Unable to parse HostOS version: {:?}", e))
-        });
+        let hostos_version = UtilityCommand::request_hostos_version()
+            .await
+            .and_then(|v| {
+                HostosVersion::try_from(v)
+                    .map_err(|e| format!("Unable to parse HostOS version: {:?}", e))
+            });
 
         let hostos_upgrade = match hostos_version.clone() {
             Err(e) => {
@@ -248,12 +266,28 @@ impl Orchestrator {
             ),
         };
 
+        let boundary_node = BoundaryNodeManager::new(
+            Arc::clone(&registry),
+            Arc::clone(&metrics),
+            replica_version.clone(),
+            node_id,
+            ic_binary_directory.clone(),
+            logger.clone(),
+        );
+
         let firewall = Firewall::new(
             node_id,
             Arc::clone(&registry),
             Arc::clone(&metrics),
             config.firewall.clone(),
             cup_provider.clone(),
+            logger.clone(),
+        );
+
+        let ipv4_configurator = Ipv4Configurator::new(
+            Arc::clone(&registry),
+            Arc::clone(&metrics),
+            ic_binary_directory,
             logger.clone(),
         );
 
@@ -267,6 +301,7 @@ impl Orchestrator {
             node_id,
             ssh_access_manager.get_last_applied_parameters(),
             firewall.get_last_applied_version(),
+            ipv4_configurator.get_last_applied_version(),
             replica_process,
             Arc::clone(&subnet_id),
             replica_version,
@@ -283,6 +318,7 @@ impl Orchestrator {
             _metrics_runtime,
             upgrade,
             hostos_upgrade,
+            boundary_node_manager: Some(boundary_node),
             firewall: Some(firewall),
             ssh_access_manager: Some(ssh_access_manager),
             orchestrator_dashboard,
@@ -291,6 +327,7 @@ impl Orchestrator {
             exit_signal,
             subnet_id,
             task_handles: Default::default(),
+            ipv4_configurator: Some(ipv4_configurator),
         })
     }
 
@@ -350,13 +387,35 @@ impl Orchestrator {
             exit_signal: Receiver<bool>,
             log: ReplicaLogger,
         ) {
-            // This timeout is a last resort trying to revive the upgrade monitoring
-            // in case it gets stuck in an unexpected situation for longer than 15 minutes.
+            // Wait for a minute before starting the first loop, to allow the
+            // registry some time to catch up, after starting.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+
+            // Run the HostOS upgrade loop with a 15 minute timeout, waiting 1
+            // minute between checks. This timeout is a last resort trying to
+            // revive the upgrade monitoring in case it gets stuck in an
+            // unexpected situation.
+            let interval = Duration::from_secs(60);
             let timeout = Duration::from_secs(60 * 15);
-            upgrade
-                .upgrade_loop(exit_signal, CHECK_INTERVAL_SECS, timeout)
-                .await;
+
+            upgrade.upgrade_loop(exit_signal, interval, timeout).await;
             info!(log, "Shut down the HostOS upgrade loop");
+        }
+
+        async fn boundary_node_check(
+            mut boundary_node_manager: BoundaryNodeManager,
+            mut exit_signal: Receiver<bool>,
+            log: ReplicaLogger,
+        ) {
+            while !*exit_signal.borrow() {
+                boundary_node_manager.check().await;
+
+                tokio::select! {
+                    _ = tokio::time::sleep(CHECK_INTERVAL_SECS) => {}
+                    _ = exit_signal.changed() => {}
+                }
+            }
+            info!(log, "Shut down the boundary node management loop");
         }
 
         async fn tecdsa_key_rotation_check(
@@ -380,10 +439,11 @@ impl Orchestrator {
             info!(log, "Shut down the tECDSA key rotation loop");
         }
 
-        async fn ssh_key_and_firewall_rules_checks(
+        async fn ssh_key_and_firewall_rules_and_ipv4_config_checks(
             maybe_subnet_id: Arc<RwLock<Option<SubnetId>>>,
             mut ssh_access_manager: SshAccessManager,
             mut firewall: Firewall,
+            mut ipv4_configurator: Ipv4Configurator,
             mut exit_signal: Receiver<bool>,
             log: ReplicaLogger,
         ) {
@@ -394,12 +454,17 @@ impl Orchestrator {
                     .await;
                 // Check and update the firewall rules
                 firewall.check_and_update().await;
+                // Check and update the network configuration
+                ipv4_configurator.check_and_update().await;
                 tokio::select! {
                     _ = tokio::time::sleep(CHECK_INTERVAL_SECS) => {}
                     _ = exit_signal.changed() => {}
                 }
             }
-            info!(log, "Shut down the ssh keys & firewall monitoring loop");
+            info!(
+                log,
+                "Shut down the ssh keys, firewall, and IPv4 config monitoring loop"
+            );
         }
 
         async fn serve_dashboard(
@@ -430,20 +495,34 @@ impl Orchestrator {
             )));
         }
 
-        if let (Some(ssh), Some(firewall)) = (self.ssh_access_manager.take(), self.firewall.take())
-        {
+        if let Some(boundary_node) = self.boundary_node_manager.take() {
+            info!(self.logger, "Spawning boundary node management loop");
+            self.task_handles.push(tokio::spawn(boundary_node_check(
+                boundary_node,
+                self.exit_signal.clone(),
+                self.logger.clone(),
+            )));
+        }
+
+        if let (Some(ssh), Some(firewall), Some(ipv4_configurator)) = (
+            self.ssh_access_manager.take(),
+            self.firewall.take(),
+            self.ipv4_configurator.take(),
+        ) {
             info!(
                 self.logger,
                 "Spawning the ssh-key and firewall rules check loop"
             );
-            self.task_handles
-                .push(tokio::spawn(ssh_key_and_firewall_rules_checks(
+            self.task_handles.push(tokio::spawn(
+                ssh_key_and_firewall_rules_and_ipv4_config_checks(
                     Arc::clone(&self.subnet_id),
                     ssh,
                     firewall,
+                    ipv4_configurator,
                     self.exit_signal.clone(),
                     self.logger.clone(),
-                )));
+                ),
+            ));
         }
         if let Some(dashboard) = self.orchestrator_dashboard.take() {
             info!(self.logger, "Spawning the orchestrator dashboard");
@@ -506,5 +585,31 @@ impl Orchestrator {
         let metrics = OrchestratorMetrics::new(metrics_registry);
 
         (metrics, metrics_endpoint)
+    }
+
+    fn get_ip_addresses() -> (String, String) {
+        let ifaces = get_if_addrs().unwrap_or_default();
+
+        let ipv4 = ifaces
+            .iter()
+            .find_map(|iface| match iface.addr {
+                get_if_addrs::IfAddr::V4(ref addr) if !addr.ip.is_loopback() => {
+                    Some(addr.ip.to_string())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| "none configured".to_string());
+
+        let ipv6 = ifaces
+            .iter()
+            .find_map(|iface| match iface.addr {
+                get_if_addrs::IfAddr::V6(ref addr) if !addr.ip.is_loopback() => {
+                    Some(addr.ip.to_string())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| "none configured".to_string());
+
+        (ipv4, ipv6)
     }
 }

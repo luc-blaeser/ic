@@ -67,7 +67,6 @@ pub mod artifact;
 pub mod artifact_kind;
 pub mod batch;
 pub mod canister_http;
-pub mod chunkable;
 pub mod consensus;
 pub mod crypto;
 pub mod filetree_sync;
@@ -139,16 +138,12 @@ pub struct HeightTag {}
 /// The block height.
 // Note [ExecutionRound vs Height]
 pub type Height = AmountOf<HeightTag, u64>;
-
-/// Length of an epoch of query statistics in blocks
-pub const QUERY_STATS_EPOCH_LENGTH: u64 = 2000;
-
 pub struct QueryStatsTag {}
 /// The epoch as used by query stats aggregation.
 pub type QueryStatsEpoch = AmountOf<QueryStatsTag, u64>;
 
-pub fn epoch_from_height(height: Height) -> QueryStatsEpoch {
-    QueryStatsEpoch::from(height.get() / QUERY_STATS_EPOCH_LENGTH)
+pub fn epoch_from_height(height: Height, epoch_length: u64) -> QueryStatsEpoch {
+    QueryStatsEpoch::from(height.get() / epoch_length)
 }
 
 /// Converts a NodeId into its protobuf definition.  Normally, we would use
@@ -469,12 +464,12 @@ const GB: u64 = 1024 * 1024 * 1024;
 /// The upper limit on the stable memory size.
 /// This constant is used by other crates to define other constants, that's why
 /// it is public and `u64` (`NumBytes` cannot be used in const expressions).
-pub const MAX_STABLE_MEMORY_IN_BYTES: u64 = 96 * GB;
+pub const MAX_STABLE_MEMORY_IN_BYTES: u64 = 400 * GB;
 
 /// The upper limit on the Wasm memory size.
 /// This constant is used by other crates to define other constants, that's why
 /// it is public and `u64` (`NumBytes` cannot be used in const expressions).
-pub const MAX_WASM_MEMORY_IN_BYTES: u64 = 64 * GB;
+pub const MAX_WASM_MEMORY_IN_BYTES: u64 = 400 * GB;
 
 const MIN_MEMORY_ALLOCATION: NumBytes = NumBytes::new(0);
 pub const MAX_MEMORY_ALLOCATION: NumBytes =

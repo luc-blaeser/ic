@@ -1,6 +1,6 @@
 use ic_crypto_internal_threshold_sig_ecdsa::*;
 use ic_crypto_test_utils_reproducible_rng::reproducible_rng;
-use rand::Rng;
+use rand::{Rng, RngCore};
 
 #[test]
 fn not_affected_by_point_serialization_bug() -> ThresholdEcdsaResult<()> {
@@ -157,6 +157,77 @@ fn p256_wide_reduce_scalar_expected_value() -> ThresholdEcdsaResult<()> {
 }
 
 #[test]
+fn scalar_deserializaion_errors_if_byte_length_invalid() {
+    let rng = &mut reproducible_rng();
+    for curve in EccCurveType::all() {
+        let max_bytes: usize = curve.scalar_bytes() * 100;
+        for num_bytes in 0..=max_bytes {
+            if num_bytes == curve.scalar_bytes() {
+                continue;
+            }
+            let mut bytes = vec![0u8; num_bytes];
+            rng.fill_bytes(&mut bytes[..]);
+            assert_eq!(
+                EccScalar::deserialize(curve, &bytes[..]),
+                Err(ThresholdEcdsaSerializationError(
+                    "Unexpected length".to_string()
+                ))
+            );
+        }
+    }
+}
+
+#[test]
+fn scalar_deserializaion_errors_is_over_the_order() {
+    for curve in EccCurveType::all() {
+        let bytes = vec![0xFFu8; curve.scalar_bytes()];
+        assert_eq!(
+            EccScalar::deserialize(curve, &bytes[..]),
+            Err(ThresholdEcdsaSerializationError(
+                "Invalid point encoding".to_string()
+            ))
+        );
+    }
+}
+
+#[test]
+fn scalar_from_bytes_wide_errors_if_byte_length_invalid() {
+    let rng = &mut reproducible_rng();
+    for curve in EccCurveType::all() {
+        let valid_num_bytes = curve.scalar_bytes() * 2;
+        let min_bytes = valid_num_bytes + 1;
+        let max_bytes: usize = curve.scalar_bytes() * 100;
+        for num_bytes in min_bytes..=max_bytes {
+            let mut bytes = vec![0u8; num_bytes];
+            rng.fill_bytes(&mut bytes[..]);
+            assert_eq!(
+                EccScalar::from_bytes_wide(curve, &bytes[..]),
+                Err(ThresholdEcdsaError::InvalidScalar)
+            );
+        }
+    }
+}
+
+#[test]
+fn point_deserialization_errors_if_byte_length_invalid() {
+    let rng = &mut reproducible_rng();
+    for curve in EccCurveType::all() {
+        let max_bytes: usize = curve.point_bytes() * 100;
+        for num_bytes in 0..=max_bytes {
+            if num_bytes == curve.point_bytes() {
+                continue;
+            }
+            let mut bytes = vec![0u8; num_bytes];
+            rng.fill_bytes(&mut bytes[..]);
+            assert_eq!(
+                EccPoint::deserialize(curve, &bytes[..]),
+                Err(ThresholdEcdsaError::InvalidPoint)
+            );
+        }
+    }
+}
+
+#[test]
 fn test_scalar_negate() -> ThresholdEcdsaResult<()> {
     let rng = &mut reproducible_rng();
 
@@ -181,11 +252,19 @@ fn test_scalar_negate() -> ThresholdEcdsaResult<()> {
 
 #[test]
 fn test_point_mul_by_node_index() -> ThresholdEcdsaResult<()> {
+    let rng = &mut reproducible_rng();
     for curve in EccCurveType::all() {
         let g = EccPoint::generator_g(curve);
 
-        for node_index in 0..300 {
-            let g_ni = g.mul_by_node_index(node_index)?;
+        let mut node_indices: Vec<_> = (0..300).collect();
+        node_indices.push(u32::MAX - 1);
+        node_indices.push(u32::MAX);
+        for _ in 0..100 {
+            node_indices.push(rng.gen());
+        }
+
+        for node_index in node_indices {
+            let g_ni = g.mul_by_node_index_vartime(node_index)?;
 
             let scalar = EccScalar::from_node_index(curve, node_index);
             let g_s = g.scalar_mul(&scalar)?;
@@ -249,6 +328,54 @@ fn test_point_negate() -> ThresholdEcdsaResult<()> {
 
             let should_be_zero = n_random_point.add_points(&random_point)?;
             assert_eq!(should_be_zero, id);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_mul_by_g_is_correct() -> ThresholdEcdsaResult<()> {
+    let rng = &mut reproducible_rng();
+
+    for curve_type in EccCurveType::all() {
+        let g = EccPoint::generator_g(curve_type);
+        for small in 0..1024 {
+            let s = EccScalar::from_u64(curve_type, small);
+            assert_eq!(g.scalar_mul(&s)?, EccPoint::mul_by_g(&s));
+        }
+
+        for _iteration in 0..300 {
+            let s = EccScalar::random(curve_type, rng);
+            assert_eq!(g.scalar_mul(&s)?, EccPoint::mul_by_g(&s));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_y_is_even() -> ThresholdEcdsaResult<()> {
+    let rng = &mut reproducible_rng();
+
+    for curve_type in EccCurveType::all() {
+        let g = EccPoint::generator_g(curve_type);
+
+        for _trial in 0..100 {
+            let s = EccScalar::random(curve_type, rng);
+            let p = g.scalar_mul(&s)?;
+            let np = p.negate();
+
+            match (p.is_y_even()?, np.is_y_even()?) {
+                (true, true) => panic!("Both point and its negation have even y"),
+                (false, false) => panic!("Neither point nor its negation have even y"),
+                (true, false) => {
+                    assert_eq!(p.affine_y()?.sign(), 0x00);
+                    assert_eq!(np.affine_y()?.sign(), 0x01);
+                }
+                (false, true) => {
+                    assert_eq!(p.affine_y()?.sign(), 0x01);
+                    assert_eq!(np.affine_y()?.sign(), 0x00)
+                }
+            }
         }
     }
     Ok(())
@@ -380,6 +507,10 @@ fn test_mul_n_vartime_naf() -> ThresholdEcdsaResult<()> {
                 }
 
                 // create refs of pairs
+
+                // False positive `map_identity` warning.
+                // See: https://github.com/rust-lang/rust-clippy/pull/11792 (merged)
+                #[allow(clippy::map_identity)]
                 let refs_of_pairs: Vec<_> = pairs.iter().map(|(p, s)| (p, s)).collect();
 
                 // compute the result using an optimized algorithm, which is to be tested
@@ -387,30 +518,6 @@ fn test_mul_n_vartime_naf() -> ThresholdEcdsaResult<()> {
 
                 assert_eq!(computed_result, expected_result);
             }
-        }
-    }
-
-    Ok(())
-}
-
-#[test]
-fn test_mul2_table() -> ThresholdEcdsaResult<()> {
-    let rng = &mut reproducible_rng();
-
-    for curve in EccCurveType::all() {
-        let g = EccPoint::hash_to_point(curve, &rng.gen::<[u8; 32]>(), b"g")?;
-        let h = EccPoint::hash_to_point(curve, &rng.gen::<[u8; 32]>(), b"h")?;
-
-        let tbl = EccPointMul2Table::new(g.clone(), h.clone())?;
-
-        for _ in 0..100 {
-            let x = EccScalar::random(curve, rng);
-            let y = EccScalar::random(curve, rng);
-
-            let refv = EccPoint::mul_2_points(&g, &x, &h, &y)?;
-
-            let tblv = tbl.mul2(&x, &y)?;
-            assert_eq!(refv, tblv);
         }
     }
 

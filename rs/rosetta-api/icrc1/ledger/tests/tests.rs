@@ -1,10 +1,11 @@
 use candid::{CandidType, Decode, Encode, Nat};
 use ic_base_types::{CanisterId, PrincipalId};
-use ic_icrc1_ledger::{ChangeFeeCollector, InitArgs, LedgerArgument};
+use ic_icrc1_ledger::{ChangeFeeCollector, FeatureFlags, InitArgs, LedgerArgument};
 use ic_icrc1_ledger_sm_tests::{
-    ARCHIVE_TRIGGER_THRESHOLD, BLOB_META_KEY, BLOB_META_VALUE, DECIMAL_PLACES, FEE, INT_META_KEY,
-    INT_META_VALUE, MINTER, NAT_META_KEY, NAT_META_VALUE, NUM_BLOCKS_TO_ARCHIVE, TEXT_META_KEY,
-    TEXT_META_VALUE, TOKEN_NAME, TOKEN_SYMBOL,
+    get_allowance, send_approval, send_transfer_from, ARCHIVE_TRIGGER_THRESHOLD, BLOB_META_KEY,
+    BLOB_META_VALUE, DECIMAL_PLACES, FEE, INT_META_KEY, INT_META_VALUE, MINTER, NAT_META_KEY,
+    NAT_META_VALUE, NUM_BLOCKS_TO_ARCHIVE, TEXT_META_KEY, TEXT_META_VALUE, TOKEN_NAME,
+    TOKEN_SYMBOL,
 };
 use ic_ledger_canister_core::archive::ArchiveOptions;
 use ic_ledger_core::block::BlockIndex;
@@ -12,6 +13,9 @@ use ic_state_machine_tests::StateMachine;
 use icrc_ledger_types::icrc::generic_metadata_value::MetadataValue as Value;
 use icrc_ledger_types::icrc1::account::Account;
 use icrc_ledger_types::icrc1::transfer::{TransferArg, TransferError};
+use icrc_ledger_types::icrc2::allowance::Allowance;
+use icrc_ledger_types::icrc2::approve::{ApproveArgs, ApproveError};
+use icrc_ledger_types::icrc2::transfer_from::{TransferFromArgs, TransferFromError};
 use num_traits::ToPrimitive;
 use std::path::PathBuf;
 
@@ -83,6 +87,7 @@ fn encode_init_args(args: ic_icrc1_ledger_sm_tests::InitArgs) -> LedgerArgument 
             node_max_memory_size_bytes: None,
             max_message_size_bytes: None,
             controller_id: PrincipalId::new_user_test_id(100),
+            more_controller_ids: None,
             cycles_for_archive_creation: None,
             max_transactions_per_response: None,
         },
@@ -228,11 +233,6 @@ fn test_approve_from_minter() {
 }
 
 #[test]
-fn test_feature_flags() {
-    ic_icrc1_ledger_sm_tests::test_feature_flags(ledger_wasm(), encode_init_args);
-}
-
-#[test]
 fn test_transfer_from_smoke() {
     ic_icrc1_ledger_sm_tests::test_transfer_from_smoke(ledger_wasm(), encode_init_args);
 }
@@ -262,6 +262,21 @@ fn test_approval_trimming() {
     ic_icrc1_ledger_sm_tests::test_approval_trimming(ledger_wasm(), encode_init_args);
 }
 
+#[test]
+fn test_archive_controllers() {
+    ic_icrc1_ledger_sm_tests::test_archive_controllers(ledger_wasm());
+}
+
+#[test]
+fn test_archive_no_additional_controllers() {
+    ic_icrc1_ledger_sm_tests::test_archive_no_additional_controllers(ledger_wasm());
+}
+
+#[test]
+fn test_archive_duplicate_controllers() {
+    ic_icrc1_ledger_sm_tests::test_archive_duplicate_controllers(ledger_wasm());
+}
+
 // #[test]
 // fn test_icrc1_test_suite() {
 //     ic_icrc1_ledger_sm_tests::test_icrc1_test_suite(ledger_wasm(), encode_init_args);
@@ -270,39 +285,11 @@ fn test_approval_trimming() {
 #[cfg_attr(feature = "u256-tokens", ignore)]
 #[test]
 fn test_block_transformation() {
-    fn encode_legacy_init_args(args: ic_icrc1_ledger_sm_tests::InitArgs) -> LegacyLedgerArgument {
-        LegacyLedgerArgument::Init(LegacyInitArgs {
-            minting_account: args.minting_account,
-            fee_collector_account: args.fee_collector_account,
-            initial_balances: args
-                .initial_balances
-                .into_iter()
-                .map(|(account, value)| {
-                    (
-                        account,
-                        value
-                            .0
-                            .to_u64()
-                            .expect("initial balance doesn't fit into u64"),
-                    )
-                })
-                .collect(),
-            transfer_fee: args
-                .transfer_fee
-                .0
-                .to_u64()
-                .expect("transfer fee doesn't fit into u64"),
-            token_name: args.token_name,
-            token_symbol: args.token_symbol,
-            metadata: args.metadata,
-            archive_options: args.archive_options,
-        })
-    }
     ic_icrc1_ledger_sm_tests::icrc1_test_block_transformation(
         std::fs::read(std::env::var("IC_ICRC1_LEDGER_DEPLOYED_VERSION_WASM_PATH").unwrap())
             .unwrap(),
         ledger_wasm(),
-        encode_legacy_init_args,
+        encode_init_args,
     );
 }
 
@@ -378,6 +365,7 @@ fn test_upgrade_from_first_version() {
             node_max_memory_size_bytes: None,
             max_message_size_bytes: None,
             controller_id: PrincipalId::new_user_test_id(100),
+            more_controller_ids: None,
             cycles_for_archive_creation: None,
             max_transactions_per_response: None,
         },
@@ -408,6 +396,98 @@ fn test_upgrade_from_first_version() {
     transfer(&env, ledger_id, account(1), account(3), 1_000_000);
 }
 
+#[test]
+fn test_icrc2_feature_flag_doesnt_disable_icrc2_endpoints() {
+    // Disable ICRC-2 and check the endpoints still work
+
+    let env = StateMachine::new();
+    let init_args = Encode!(&LedgerArgument::Init(InitArgs {
+        minting_account: MINTER,
+        fee_collector_account: None,
+        initial_balances: vec![],
+        transfer_fee: FEE.into(),
+        token_name: TOKEN_NAME.to_string(),
+        decimals: Some(DECIMAL_PLACES),
+        token_symbol: TOKEN_SYMBOL.to_string(),
+        metadata: vec![],
+        archive_options: ArchiveOptions {
+            trigger_threshold: ARCHIVE_TRIGGER_THRESHOLD as usize,
+            num_blocks_to_archive: NUM_BLOCKS_TO_ARCHIVE as usize,
+            node_max_memory_size_bytes: None,
+            max_message_size_bytes: None,
+            controller_id: PrincipalId::new_user_test_id(100),
+            more_controller_ids: None,
+            cycles_for_archive_creation: None,
+            max_transactions_per_response: None,
+        },
+        max_memo_length: None,
+        feature_flags: Some(FeatureFlags { icrc2: false }),
+        maximum_number_of_accounts: None,
+        accounts_overflow_trim_quantity: None,
+    }))
+    .unwrap();
+    let ledger_id = env
+        .install_canister(ledger_wasm(), init_args, None)
+        .unwrap();
+    let user1 = account(1);
+    let user2 = account(2);
+    let user3 = account(3);
+
+    // if ICRC-2 is enabled then none of the following operations
+    // should trap
+
+    assert_eq!(
+        get_allowance(&env, ledger_id, user1, user2),
+        Allowance {
+            allowance: 0u32.into(),
+            expires_at: None
+        }
+    );
+
+    let approval_result = send_approval(
+        &env,
+        ledger_id,
+        user1.owner,
+        &ApproveArgs {
+            from_subaccount: None,
+            spender: user3,
+            amount: 1_000_000u32.into(),
+            expected_allowance: None,
+            expires_at: None,
+            fee: None,
+            memo: None,
+            created_at_time: None,
+        },
+    );
+    assert_eq!(
+        approval_result,
+        Err(ApproveError::InsufficientFunds {
+            balance: 0u32.into()
+        })
+    );
+
+    let transfer_from_result = send_transfer_from(
+        &env,
+        ledger_id,
+        user3.owner,
+        &TransferFromArgs {
+            spender_subaccount: None,
+            from: user1,
+            to: user2,
+            amount: 1_000_000u32.into(),
+            fee: None,
+            memo: None,
+            created_at_time: None,
+        },
+    );
+    assert_eq!(
+        transfer_from_result,
+        Err(TransferFromError::InsufficientAllowance {
+            allowance: 0u32.into()
+        })
+    );
+}
+
 mod verify_written_blocks {
     use super::*;
     use ic_icrc1_ledger::FeatureFlags;
@@ -436,7 +516,7 @@ mod verify_written_blocks {
             from_subaccount: ledger.minter_account.subaccount,
             to: ledger.from_account,
             amount: Nat::from(10 * DEFAULT_AMOUNT),
-            fee: Some(NumTokens::from(0)),
+            fee: Some(NumTokens::from(0u8)),
             created_at_time: Some(ledger.current_time_ns_since_unix_epoch),
             memo: Some(Memo(ByteBuf::from(DEFAULT_MEMO))),
         };
@@ -482,7 +562,7 @@ mod verify_written_blocks {
             from_subaccount: ledger.from_account.subaccount,
             spender: ledger.minter_account,
             amount: Nat::from(2 * DEFAULT_AMOUNT),
-            expected_allowance: Some(Nat::from(0)),
+            expected_allowance: Some(Nat::from(0u8)),
             expires_at: Some(ledger.current_time_ns_since_unix_epoch + 1_000_000),
             fee: Some(Nat::from(DEFAULT_FEE)),
             memo: Some(Memo(ByteBuf::from(DEFAULT_MEMO))),
@@ -525,7 +605,7 @@ mod verify_written_blocks {
             from_subaccount: ledger.from_account.subaccount,
             spender: ledger.minter_account,
             amount: Nat::from(2 * DEFAULT_AMOUNT),
-            expected_allowance: Some(Nat::from(0)),
+            expected_allowance: Some(Nat::from(0u8)),
             expires_at: Some(ledger.current_time_ns_since_unix_epoch + 1_000_000),
             fee: Some(Nat::from(DEFAULT_FEE)),
             memo: Some(Memo(ByteBuf::from(DEFAULT_MEMO))),
@@ -536,7 +616,7 @@ mod verify_written_blocks {
             from: ledger.from_account,
             to: ledger.minter_account,
             amount: Nat::from(DEFAULT_AMOUNT),
-            fee: Some(NumTokens::from(0)),
+            fee: Some(NumTokens::from(0u8)),
             memo: Some(Memo(ByteBuf::from(DEFAULT_MEMO))),
             created_at_time: Some(ledger.current_time_ns_since_unix_epoch),
         };
@@ -571,7 +651,7 @@ mod verify_written_blocks {
             from_subaccount: ledger.from_account.subaccount,
             spender: ledger.spender_account,
             amount: Nat::from(2 * DEFAULT_AMOUNT),
-            expected_allowance: Some(Nat::from(0)),
+            expected_allowance: Some(Nat::from(0u8)),
             expires_at: Some(ledger.current_time_ns_since_unix_epoch + 1_000_000),
             fee: Some(Nat::from(DEFAULT_FEE)),
             memo: Some(Memo(ByteBuf::from(DEFAULT_MEMO))),
@@ -663,6 +743,7 @@ mod verify_written_blocks {
                     node_max_memory_size_bytes: None,
                     max_message_size_bytes: None,
                     controller_id: PrincipalId::new_user_test_id(100),
+                    more_controller_ids: None,
                     cycles_for_archive_creation: None,
                     max_transactions_per_response: None,
                 },
@@ -693,18 +774,18 @@ mod verify_written_blocks {
         fn get_transaction(&self, block_index: BlockIndex) -> Transaction {
             let request = GetTransactionsRequest {
                 start: block_index.into(),
-                length: 1.into(),
+                length: 1u8.into(),
             };
 
-            let wasm_result_bytes = match {
-                self.env
-                    .query(
-                        self.ledger_id,
-                        "get_transactions",
-                        Encode!(&request).unwrap(),
-                    )
-                    .expect("failed to query get_transactions on the ledger")
-            } {
+            let wasm_result_bytes = match self
+                .env
+                .query(
+                    self.ledger_id,
+                    "get_transactions",
+                    Encode!(&request).unwrap(),
+                )
+                .expect("failed to query get_transactions on the ledger")
+            {
                 WasmResult::Reply(bytes) => bytes,
                 WasmResult::Reject(reject) => {
                     panic!("Expected a successful reply, got a reject: {}", reject)

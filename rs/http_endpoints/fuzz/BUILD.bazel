@@ -1,0 +1,64 @@
+load("//bazel:fuzz_testing.bzl", "rust_fuzz_test_binary_afl")
+
+package(default_visibility = ["//visibility:private"])
+
+MACRO_DEPENDENCIES = []
+
+CALLSERVICE_FUZZER_DEPENDENCIES = [
+    "//rs/config",
+    "//rs/http_endpoints/public",
+    "//rs/interfaces",
+    "//rs/interfaces/registry",
+    "//rs/interfaces/registry/mocks",
+    "//rs/monitoring/logger",
+    "//rs/protobuf",
+    "//rs/registry/keys",
+    "//rs/registry/provisional_whitelist",
+    "//rs/test_utilities",
+    "//rs/test_utilities/time",
+    "//rs/types/base_types",
+    "//rs/types/error_types",
+    "//rs/types/types",
+    "//rs/validator/http_request_arbitrary",
+    "@crate_index//:arbitrary",
+    "@crate_index//:axum_0_7_0",
+    "@crate_index//:bytes",
+    "@crate_index//:http_body_1_0_0",
+    "@crate_index//:http_body_util_0_1_0",
+    "@crate_index//:hyper_1_0_0",
+    "@crate_index//:hyper-util",
+    "@crate_index//:ic-agent",
+    "@crate_index//:libfuzzer-sys",
+    "@crate_index//:mockall",
+    "@crate_index//:prost",
+    "@crate_index//:tokio",
+    "@crate_index//:tower",
+    "@crate_index//:tower-test",
+]
+
+# required to compile tests/common
+DEV_DEPENDENCIES = [
+    "//rs/monitoring/metrics",
+    "//rs/certification/test-utils",
+    "//rs/crypto/tree_hash",
+    "//rs/crypto/tls_interfaces/mocks",
+    "//rs/interfaces/mocks",
+    "//rs/interfaces/state_manager",
+    "//rs/interfaces/state_manager/mocks",
+    "//rs/monitoring/pprof",
+    "//rs/registry/routing_table",
+    "//rs/registry/subnet_type",
+    "//rs/replicated_state",
+]
+
+rust_fuzz_test_binary_afl(
+    name = "execute_call_service_afl",
+    testonly = True,
+    srcs = [
+        "fuzz_targets/execute_call_service.rs",
+        "//rs/http_endpoints/public:tests/common/mod.rs",
+    ],
+    crate_root = "fuzz_targets/execute_call_service.rs",
+    proc_macro_deps = MACRO_DEPENDENCIES,
+    deps = CALLSERVICE_FUZZER_DEPENDENCIES + DEV_DEPENDENCIES,
+)

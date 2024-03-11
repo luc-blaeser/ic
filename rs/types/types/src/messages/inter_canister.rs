@@ -1,8 +1,10 @@
-use crate::{ingress::WasmResult, CanisterId, CountBytes, Cycles, Funds, NumBytes, Time};
+use crate::{
+    ingress::WasmResult, time::CoarseTime, CanisterId, CountBytes, Cycles, Funds, NumBytes, Time,
+};
 use ic_error_types::{RejectCode, TryFromError, UserError};
 #[cfg(test)]
 use ic_exhaustive_derive::ExhaustiveSet;
-use ic_ic00_types::{
+use ic_management_canister_types::{
     CanisterIdRecord, CanisterInfoRequest, ClearChunkStoreArgs, InstallChunkedCodeArgs,
     InstallCodeArgsV2, Method, Payload as _, ProvisionalTopUpCanisterArgs, StoredChunksArgs,
     UpdateSettingsArgs, UploadChunkArgs,
@@ -17,10 +19,19 @@ use phantom_newtype::Id;
 use serde::{Deserialize, Serialize};
 use std::{
     convert::{From, TryFrom, TryInto},
+    hash::{Hash, Hasher},
     mem::size_of,
     str::FromStr,
     sync::Arc,
 };
+
+#[cfg(test)]
+mod tests;
+
+/// Special value for the `deadline` field of `Requests`, `Callbacks`,
+/// `CallOrigins` and `Responses` signifying "no deadline", i.e. a guaranteed
+/// response call.
+pub const NO_DEADLINE: CoarseTime = CoarseTime::from_secs_since_unix_epoch(0);
 
 pub struct CallbackIdTag;
 /// A value used as an opaque nonce to couple outgoing calls with their
@@ -40,20 +51,38 @@ pub type CallContextId = Id<CallContextIdTag, u64>;
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RequestMetadata {
     /// Indicates how many steps down the call tree a request is, starting at 0.
-    pub call_tree_depth: Option<u64>,
+    call_tree_depth: u64,
     /// The block time (on the respective subnet) at the start of the call at the
-    /// root of the call tree that this request is part of. This is used for metrics
-    /// only.
-    pub call_tree_start_time: Option<Time>,
-    /// A point in the future vs. `call_tree_start_time` at which a request would ideally have concluded
-    /// its lifecycle on the IC. Unlike `call_tree_depth` and `call_tree_start_time`, the deadline
-    /// does not have to be a constant for the whole call tree. Rather it's valid only for the subtree of
-    /// downstream calls at any point in the tree. Since a call tree can be dissolved from above if
-    /// a corresponding deadline expires, this effectively implies that `call_subtree_deadline` can only
-    /// decrease as we go down the tree.
-    ///
-    /// Reserved for future use (guaranteed replies won't be affected).
-    pub call_subtree_deadline: Option<Time>,
+    /// root of the call tree that this request is part of.
+    call_tree_start_time: Time,
+}
+
+impl RequestMetadata {
+    pub fn new(call_tree_depth: u64, call_tree_start_time: Time) -> Self {
+        Self {
+            call_tree_depth,
+            call_tree_start_time,
+        }
+    }
+
+    /// Creates `RequestMetadata` for a new call tree, i.e. with a given start time and depth 0.
+    pub fn for_new_call_tree(time: Time) -> Self {
+        Self::new(0, time)
+    }
+
+    /// Creates `RequestMetadata` for a downstream call from another metadata, i.e. with depth
+    /// increased by 1 and the same `call_tree_start_time`.
+    pub fn for_downstream_call(&self) -> Self {
+        Self::new(self.call_tree_depth + 1, self.call_tree_start_time)
+    }
+
+    pub fn call_tree_depth(&self) -> &u64 {
+        &self.call_tree_depth
+    }
+
+    pub fn call_tree_start_time(&self) -> &Time {
+        &self.call_tree_start_time
+    }
 }
 
 /// Canister-to-canister request message.
@@ -67,6 +96,8 @@ pub struct Request {
     #[serde(with = "serde_bytes")]
     pub method_payload: Vec<u8>,
     pub metadata: Option<RequestMetadata>,
+    /// If non-zero, this is a best-effort call.
+    pub deadline: CoarseTime,
 }
 
 impl Request {
@@ -129,6 +160,7 @@ impl Request {
                     Err(_) => None,
                 }
             }
+            Ok(Method::FetchCanisterLogs) => None, // TODO(IC-272).
             Ok(Method::UploadChunk) => match UploadChunkArgs::decode(&self.method_payload) {
                 Ok(record) => Some(record.get_canister_id()),
                 Err(_) => None,
@@ -143,7 +175,11 @@ impl Request {
                 Ok(record) => Some(record.get_canister_id()),
                 Err(_) => None,
             },
-            Ok(Method::DeleteChunks) => None,
+            Ok(Method::DeleteChunks)
+            | Ok(Method::TakeCanisterSnapshot)
+            | Ok(Method::LoadCanisterSnapshot)
+            | Ok(Method::ListCanisterSnapshots)
+            | Ok(Method::DeleteCanisterSnapshot) => None,
             Ok(Method::CreateCanister)
             | Ok(Method::SetupInitialDKG)
             | Ok(Method::HttpRequest)
@@ -332,7 +368,7 @@ impl From<Result<Option<WasmResult>, UserError>> for Payload {
 }
 
 /// Canister-to-canister response message.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ExhaustiveSet))]
 pub struct Response {
     pub originator: CanisterId,
@@ -340,12 +376,42 @@ pub struct Response {
     pub originator_reply_callback: CallbackId,
     pub refund: Cycles,
     pub response_payload: Payload,
+    /// If non-zero, this is a best-effort call.
+    pub deadline: CoarseTime,
 }
 
 impl Response {
     /// Returns the size in bytes of this `Response`'s payload.
     pub fn payload_size_bytes(&self) -> NumBytes {
         self.response_payload.size_bytes()
+    }
+}
+
+/// Custom hash implementation, ensuring consistency with previous version
+/// without a `deadline`.
+///
+/// This is a temporary workaround for Consensus integrity checks relying on
+/// hasning Rust structs. This can be dropped once those checks are removed.
+impl Hash for Response {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Response {
+            originator,
+            respondent,
+            originator_reply_callback,
+            refund,
+            response_payload,
+            deadline,
+        } = self;
+
+        originator.hash(state);
+        respondent.hash(state);
+        originator_reply_callback.hash(state);
+        refund.hash(state);
+        response_payload.hash(state);
+
+        if *deadline != NO_DEADLINE {
+            deadline.hash(state);
+        }
     }
 }
 
@@ -444,13 +510,11 @@ impl From<Response> for RequestOrResponse {
 impl From<&RequestMetadata> for pb_queues::RequestMetadata {
     fn from(metadata: &RequestMetadata) -> Self {
         Self {
-            call_tree_depth: metadata.call_tree_depth,
-            call_tree_start_time_nanos: metadata
-                .call_tree_start_time
-                .map(|call_tree_start_time| call_tree_start_time.as_nanos_since_unix_epoch()),
-            call_subtree_deadline_nanos: metadata
-                .call_subtree_deadline
-                .map(|deadline| deadline.as_nanos_since_unix_epoch()),
+            call_tree_depth: Some(metadata.call_tree_depth),
+            call_tree_start_time_nanos: Some(
+                metadata.call_tree_start_time.as_nanos_since_unix_epoch(),
+            ),
+            call_subtree_deadline_nanos: None,
         }
     }
 }
@@ -466,6 +530,7 @@ impl From<&Request> for pb_queues::Request {
             method_payload: req.method_payload.clone(),
             cycles_payment: Some((req.payment).into()),
             metadata: req.metadata.as_ref().map(From::from),
+            deadline_seconds: req.deadline.as_secs_since_unix_epoch(),
         }
     }
 }
@@ -473,15 +538,10 @@ impl From<&Request> for pb_queues::Request {
 impl From<pb_queues::RequestMetadata> for RequestMetadata {
     fn from(metadata: pb_queues::RequestMetadata) -> Self {
         Self {
-            call_tree_depth: metadata.call_tree_depth,
-            call_tree_start_time: metadata
-                .call_tree_start_time_nanos
-                .map(|call_tree_start_time| {
-                    Time::from_nanos_since_unix_epoch(call_tree_start_time)
-                }),
-            call_subtree_deadline: metadata
-                .call_subtree_deadline_nanos
-                .map(Time::from_nanos_since_unix_epoch),
+            call_tree_depth: metadata.call_tree_depth.unwrap_or(0),
+            call_tree_start_time: Time::from_nanos_since_unix_epoch(
+                metadata.call_tree_start_time_nanos.unwrap_or(0),
+            ),
         }
     }
 }
@@ -506,6 +566,7 @@ impl TryFrom<pb_queues::Request> for Request {
             method_name: req.method_name,
             method_payload: req.method_payload,
             metadata: req.metadata.map(From::from),
+            deadline: CoarseTime::from_secs_since_unix_epoch(req.deadline_seconds),
         })
     }
 }
@@ -548,6 +609,7 @@ impl From<&Response> for pb_queues::Response {
             refund: Some((&Funds::new(rep.refund)).into()),
             response_payload: Some(p),
             cycles_refund: Some((rep.refund).into()),
+            deadline_seconds: rep.deadline.as_secs_since_unix_epoch(),
         }
     }
 }
@@ -578,6 +640,7 @@ impl TryFrom<pb_queues::Response> for Response {
             originator_reply_callback: rep.originator_reply_callback.into(),
             refund,
             response_payload,
+            deadline: CoarseTime::from_secs_since_unix_epoch(rep.deadline_seconds),
         })
     }
 }

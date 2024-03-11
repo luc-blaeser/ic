@@ -1,40 +1,39 @@
-use candid::{candid_method, Nat};
 use ic_canister_log::log;
 use ic_canisters_http_types::{HttpRequest, HttpResponse, HttpResponseBuilder};
 use ic_cdk_macros::{init, post_upgrade, pre_upgrade, query, update};
-use ic_cketh_minter::address::{validate_address_as_destination, Address, AddressValidationError};
-use ic_cketh_minter::deposit::scrap_eth_logs;
+use ic_cketh_minter::address::{validate_address_as_destination, AddressValidationError};
+use ic_cketh_minter::deposit::scrape_logs;
 use ic_cketh_minter::endpoints::events::{
     Event as CandidEvent, EventSource as CandidEventSource, GetEventsArg, GetEventsResult,
 };
 use ic_cketh_minter::endpoints::{
-    Eip1559TransactionPrice, RetrieveEthRequest, RetrieveEthStatus, WithdrawalArg, WithdrawalError,
+    AddCkErc20Token, Eip1559TransactionPrice, GasFeeEstimate, MinterInfo, RetrieveEthRequest,
+    RetrieveEthStatus, WithdrawalArg, WithdrawalError,
 };
-use ic_cketh_minter::eth_logs::{EventSource, ReceivedEthEvent};
+use ic_cketh_minter::erc20::CkErc20Token;
+use ic_cketh_minter::eth_logs::{EventSource, ReceivedErc20Event, ReceivedEthEvent};
 use ic_cketh_minter::guard::retrieve_eth_guard;
+use ic_cketh_minter::ledger_client::LedgerClient;
 use ic_cketh_minter::lifecycle::MinterArg;
-use ic_cketh_minter::logs::{DEBUG, INFO};
+use ic_cketh_minter::logs::INFO;
 use ic_cketh_minter::memo::BurnMemo;
 use ic_cketh_minter::numeric::{LedgerBurnIndex, Wei};
 use ic_cketh_minter::state::audit::{process_event, Event, EventType};
 use ic_cketh_minter::state::transactions::{EthWithdrawalRequest, Reimbursed};
 use ic_cketh_minter::state::{lazy_call_ecdsa_public_key, mutate_state, read_state, State, STATE};
-use ic_cketh_minter::tx::estimate_transaction_price;
 use ic_cketh_minter::withdraw::{
-    eth_fee_history, process_reimbursement, process_retrieve_eth_requests,
+    process_reimbursement, process_retrieve_eth_requests, CKETH_WITHDRAWAL_TRANSACTION_GAS_LIMIT,
 };
 use ic_cketh_minter::{
     state, storage, PROCESS_ETH_RETRIEVE_TRANSACTIONS_INTERVAL, PROCESS_REIMBURSEMENT,
     SCRAPPING_ETH_LOGS_INTERVAL,
 };
-use icrc_ledger_client_cdk::{CdkRuntime, ICRC1Client};
-use icrc_ledger_types::icrc1::transfer::Memo;
-use icrc_ledger_types::icrc2::transfer_from::TransferFromArgs;
-use num_traits::cast::ToPrimitive;
+use ic_ethereum_types::Address;
 use std::str::FromStr;
 use std::time::Duration;
 
 mod dashboard;
+
 pub const SEPOLIA_TEST_CHAIN_ID: u64 = 11155111;
 
 fn validate_caller_not_anonymous() -> candid::Principal {
@@ -53,10 +52,8 @@ fn setup_timers() {
         })
     });
     // Start scraping logs immediately after the install, then repeat with the interval.
-    ic_cdk_timers::set_timer(Duration::from_secs(0), || ic_cdk::spawn(scrap_eth_logs()));
-    ic_cdk_timers::set_timer_interval(SCRAPPING_ETH_LOGS_INTERVAL, || {
-        ic_cdk::spawn(scrap_eth_logs())
-    });
+    ic_cdk_timers::set_timer(Duration::from_secs(0), || ic_cdk::spawn(scrape_logs()));
+    ic_cdk_timers::set_timer_interval(SCRAPPING_ETH_LOGS_INTERVAL, || ic_cdk::spawn(scrape_logs()));
     ic_cdk_timers::set_timer_interval(PROCESS_ETH_RETRIEVE_TRANSACTIONS_INTERVAL, || {
         ic_cdk::spawn(process_retrieve_eth_requests())
     });
@@ -66,7 +63,6 @@ fn setup_timers() {
 }
 
 #[init]
-#[candid_method(init)]
 fn init(arg: MinterArg) {
     match arg {
         MinterArg::InitArg(init_arg) => {
@@ -111,15 +107,13 @@ fn post_upgrade(minter_arg: Option<MinterArg>) {
 }
 
 #[update]
-#[candid_method(update)]
 async fn minter_address() -> String {
     state::minter_address().await.to_string()
 }
 
 #[query]
-#[candid_method(query)]
 async fn smart_contract_address() -> String {
-    read_state(|s| s.ethereum_contract_address)
+    read_state(|s| s.eth_helper_contract_address)
         .map(|a| a.to_string())
         .unwrap_or("N/A".to_string())
 }
@@ -127,20 +121,43 @@ async fn smart_contract_address() -> String {
 /// Estimate price of EIP-1559 transaction based on the
 /// `base_fee_per_gas` included in the last finalized block.
 /// See https://www.blocknative.com/blog/eip-1559-fees
-#[update]
-#[candid_method(update)]
+#[query]
 async fn eip_1559_transaction_price() -> Eip1559TransactionPrice {
-    let transaction_price = estimate_transaction_price(
-        &eth_fee_history()
-            .await
-            .expect("ERROR: failed to retrieve fee history"),
-    )
-    .expect("ERROR: failed to estimate transaction price");
-    Eip1559TransactionPrice::from(transaction_price)
+    match read_state(|s| s.last_transaction_price_estimate.clone()) {
+        Some((ts, estimate)) => {
+            let mut result = Eip1559TransactionPrice::from(
+                estimate.to_price(CKETH_WITHDRAWAL_TRANSACTION_GAS_LIMIT),
+            );
+            result.timestamp = Some(ts);
+            result
+        }
+        None => ic_cdk::trap("ERROR: last transaction price estimate is not available"),
+    }
+}
+
+/// Returns the current parameters used by the minter.
+/// This includes information that can be retrieved form other endpoints as well.
+/// To retain some flexibility in the API all fields in the return value are optional.
+#[query]
+async fn get_minter_info() -> MinterInfo {
+    read_state(|s| MinterInfo {
+        minter_address: s.minter_address().map(|a| a.to_string()),
+        smart_contract_address: s.eth_helper_contract_address.map(|a| a.to_string()),
+        minimum_withdrawal_amount: Some(s.minimum_withdrawal_amount.into()),
+        ethereum_block_height: Some(s.ethereum_block_height.into()),
+        last_observed_block_number: s.last_observed_block_number.map(|n| n.into()),
+        eth_balance: Some(s.eth_balance.eth_balance().into()),
+        last_gas_fee_estimate: s.last_transaction_price_estimate.as_ref().map(
+            |(timestamp, estimate)| GasFeeEstimate {
+                max_fee_per_gas: estimate.max_fee_per_gas.into(),
+                max_priority_fee_per_gas: estimate.max_priority_fee_per_gas.into(),
+                timestamp: *timestamp,
+            },
+        ),
+    })
 }
 
 #[update]
-#[candid_method(update)]
 async fn withdraw_eth(
     WithdrawalArg { amount, recipient }: WithdrawalArg,
 ) -> Result<RetrieveEthRequest, WithdrawalError> {
@@ -170,33 +187,20 @@ async fn withdraw_eth(
         });
     }
 
-    let ledger_canister_id = read_state(|s| s.ledger_id);
-    let client = ICRC1Client {
-        runtime: CdkRuntime,
-        ledger_canister_id,
-    };
-
+    let client = read_state(LedgerClient::cketh_ledger_from_state);
     let now = ic_cdk::api::time();
-
     log!(INFO, "[withdraw]: burning {:?}", amount);
     match client
-        .transfer_from(TransferFromArgs {
-            spender_subaccount: None,
-            from: caller.into(),
-            to: ic_cdk::id().into(),
-            amount: Nat::from(amount),
-            fee: None,
-            memo: Some(Memo::from(BurnMemo::Convert {
+        .burn(
+            caller.into(),
+            amount,
+            BurnMemo::Convert {
                 to_address: destination,
-            })),
-            created_at_time: None, // We don't set this field to disable transaction deduplication
-                                   // which is unnecessary in canister-to-canister calls.
-        })
+            },
+        )
         .await
     {
-        Ok(Ok(block_index)) => {
-            let ledger_burn_index =
-                LedgerBurnIndex::new(block_index.0.to_u64().expect("nat does not fit into u64"));
+        Ok(ledger_burn_index) => {
             let withdrawal_request = EthWithdrawalRequest {
                 withdrawal_amount: amount,
                 destination,
@@ -220,42 +224,38 @@ async fn withdraw_eth(
             });
             Ok(RetrieveEthRequest::from(withdrawal_request))
         }
-        Ok(Err(error)) => {
-            log!(
-                DEBUG,
-                "[withdraw]: failed to transfer_from with error: {error:?}"
-            );
-            Err(WithdrawalError::from(error))
-        }
-        Err((error_code, message)) => {
-            log!(
-                DEBUG,
-                "[withdraw]: failed to call ledger with error_code: {error_code} and message: {message}",
-            );
-            Err(WithdrawalError::TemporarilyUnavailable(
-                "failed to call ledger with error_code: {error_code} and message: {message}"
-                    .to_string(),
-            ))
-        }
+        Err(e) => Err(WithdrawalError::from(e)),
     }
 }
 
 #[update]
-#[candid_method(update)]
 async fn retrieve_eth_status(block_index: u64) -> RetrieveEthStatus {
     let ledger_burn_index = LedgerBurnIndex::new(block_index);
     read_state(|s| s.eth_transactions.transaction_status(&ledger_burn_index))
 }
 
-#[candid_method(query)]
 #[query]
 fn is_address_blocked(address_string: String) -> bool {
     let address = Address::from_str(&address_string)
         .unwrap_or_else(|e| ic_cdk::trap(&format!("invalid recipient address: {:?}", e)));
-    ic_cketh_minter::blocklist::is_blocked(address)
+    ic_cketh_minter::blocklist::is_blocked(&address)
 }
 
-#[candid_method(update)]
+#[update]
+async fn add_ckerc20_token(erc20_token: AddCkErc20Token) {
+    let orchestrator_id = read_state(|s| s.ledger_suite_orchestrator_id)
+        .unwrap_or_else(|| ic_cdk::trap("ERROR: ERC-20 feature is not activated"));
+    if orchestrator_id != ic_cdk::caller() {
+        ic_cdk::trap(&format!(
+            "ERROR: only the orchestrator {} can add ERC-20 tokens",
+            orchestrator_id
+        ));
+    }
+    let ckerc20_token = CkErc20Token::try_from(erc20_token)
+        .unwrap_or_else(|e| ic_cdk::trap(&format!("ERROR: {}", e)));
+    mutate_state(|s| process_event(s, EventType::AddedCkErc20Token(ckerc20_token)));
+}
+
 #[update]
 async fn get_canister_status() -> ic_cdk::api::management_canister::main::CanisterStatusResponse {
     ic_cdk::api::management_canister::main::canister_status(
@@ -269,7 +269,6 @@ async fn get_canister_status() -> ic_cdk::api::management_canister::main::Canist
 }
 
 #[query]
-#[candid_method(query)]
 fn get_events(arg: GetEventsArg) -> GetEventsResult {
     use ic_cketh_minter::endpoints::events::{
         AccessListItem, TransactionReceipt as CandidTransactionReceipt,
@@ -356,6 +355,23 @@ fn get_events(arg: GetEventsArg) -> GetEventsResult {
                     value: value.into(),
                     principal,
                 },
+                EventType::AcceptedErc20Deposit(ReceivedErc20Event {
+                    transaction_hash,
+                    block_number,
+                    log_index,
+                    from_address,
+                    value,
+                    principal,
+                    erc20_contract_address,
+                }) => EP::AcceptedErc20Deposit {
+                    transaction_hash: transaction_hash.to_string(),
+                    block_number: block_number.into(),
+                    log_index: log_index.into(),
+                    from_address: from_address.to_string(),
+                    value: value.into(),
+                    principal,
+                    erc20_contract_address: erc20_contract_address.to_string(),
+                },
                 EventType::InvalidDeposit {
                     event_source,
                     reason,
@@ -430,6 +446,12 @@ fn get_events(arg: GetEventsArg) -> GetEventsResult {
                 EventType::SkippedBlock(block_number) => EP::SkippedBlock {
                     block_number: block_number.into(),
                 },
+                EventType::AddedCkErc20Token(token) => EP::AddedCkErc20Token {
+                    chain_id: token.erc20_ethereum_network.chain_id().into(),
+                    address: token.erc20_contract_address.to_string(),
+                    ckerc20_token_symbol: token.ckerc20_token_symbol.to_string(),
+                    ckerc20_ledger_id: token.ckerc20_ledger_id,
+                },
             },
         }
     }
@@ -447,7 +469,7 @@ fn get_events(arg: GetEventsArg) -> GetEventsResult {
     }
 }
 
-#[query]
+#[query(hidden = true)]
 fn http_request(req: HttpRequest) -> HttpResponse {
     use ic_metrics_encoder::MetricsEncoder;
 
@@ -534,6 +556,15 @@ fn http_request(req: HttpRequest) -> HttpResponse {
                     "The age of the oldest incomplete ETH withdrawal request in seconds.",
                 )?;
 
+                w.encode_gauge(
+                    "cketh_minter_last_max_fee_per_gas",
+                    s.last_transaction_price_estimate
+                        .clone()
+                        .map(|(_, fee)| fee.max_fee_per_gas.as_f64())
+                        .unwrap_or_default(),
+                    "Last max fee per gas",
+                )?;
+
                 ic_cketh_minter::eth_rpc::encode_metrics(w)?;
 
                 Ok(())
@@ -567,7 +598,7 @@ fn http_request(req: HttpRequest) -> HttpResponse {
                 Err(_) => {
                     return HttpResponseBuilder::bad_request()
                         .with_body_and_content_length("failed to parse the 'time' parameter")
-                        .build()
+                        .build();
                 }
             },
             None => 0,
@@ -646,24 +677,24 @@ fn main() {}
 /// Checks the real candid interface against the one declared in the did file
 #[test]
 fn check_candid_interface_compatibility() {
-    fn source_to_str(source: &candid::utils::CandidSource) -> String {
+    fn source_to_str(source: &candid_parser::utils::CandidSource) -> String {
         match source {
-            candid::utils::CandidSource::File(f) => {
+            candid_parser::utils::CandidSource::File(f) => {
                 std::fs::read_to_string(f).unwrap_or_else(|_| "".to_string())
             }
-            candid::utils::CandidSource::Text(t) => t.to_string(),
+            candid_parser::utils::CandidSource::Text(t) => t.to_string(),
         }
     }
 
     fn check_service_equal(
         new_name: &str,
-        new: candid::utils::CandidSource,
+        new: candid_parser::utils::CandidSource,
         old_name: &str,
-        old: candid::utils::CandidSource,
+        old: candid_parser::utils::CandidSource,
     ) {
         let new_str = source_to_str(&new);
         let old_str = source_to_str(&old);
-        match candid::utils::service_equal(new, old) {
+        match candid_parser::utils::service_equal(new, old) {
             Ok(_) => {}
             Err(e) => {
                 eprintln!(
@@ -689,8 +720,8 @@ fn check_candid_interface_compatibility() {
 
     check_service_equal(
         "actual ledger candid interface",
-        candid::utils::CandidSource::Text(&new_interface),
+        candid_parser::utils::CandidSource::Text(&new_interface),
         "declared candid interface in cketh_minter.did file",
-        candid::utils::CandidSource::File(old_interface.as_path()),
+        candid_parser::utils::CandidSource::File(old_interface.as_path()),
     );
 }

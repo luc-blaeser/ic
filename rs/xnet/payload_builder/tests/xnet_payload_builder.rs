@@ -15,7 +15,6 @@ use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::metadata_state::Stream;
 use ic_state_manager::StateManagerImpl;
 use ic_test_utilities::{
-    mock_time,
     state::{arb_stream, arb_stream_slice},
     types::ids::{
         NODE_1, NODE_2, NODE_3, NODE_4, NODE_42, NODE_5, SUBNET_1, SUBNET_2, SUBNET_3, SUBNET_4,
@@ -29,6 +28,7 @@ use ic_test_utilities_metrics::{
 use ic_test_utilities_registry::SubnetRecordBuilder;
 use ic_types::{
     batch::ValidationContext,
+    time::UNIX_EPOCH,
     xnet::{CertifiedStreamSlice, StreamIndex, StreamIndexedQueue, StreamSlice},
     CountBytes, Height, NodeId, RegistryVersion, SubnetId,
 };
@@ -99,7 +99,7 @@ impl XNetPayloadBuilderFixture {
     /// Calls `get_xnet_payload()` on the wrapped `XNetPayloadBuilder` and
     /// decodes all slices in the payload.
     fn get_xnet_payload(&self, byte_limit: usize) -> (BTreeMap<SubnetId, StreamSlice>, NumBytes) {
-        let time = mock_time();
+        let time = UNIX_EPOCH;
         let validation_context = ValidationContext {
             registry_version: REGISTRY_VERSION,
             certified_height: self.certified_height,
@@ -308,9 +308,9 @@ proptest! {
             );
             // ...from SUBNET_2...
             if let Some(slice) = payload.get(&SUBNET_2) {
-                assert_eq!(stream.messages_begin(), slice.header().begin);
-                assert_eq!(stream.messages_end(), slice.header().end);
-                assert_eq!(stream.signals_end(), slice.header().signals_end);
+                assert_eq!(stream.messages_begin(), slice.header().begin());
+                assert_eq!(stream.messages_end(), slice.header().end());
+                assert_eq!(stream.signals_end(), slice.header().signals_end());
 
                 // ...with non-empty messages...
                 if let Some(messages) = slice.messages() {
@@ -448,7 +448,7 @@ proptest! {
         let from = out_stream.signals_end();
         let stream = Stream::new(
             StreamIndexedQueue::with_begin(from),
-            out_stream.header().begin,
+            out_stream.header().begin(),
         );
 
         with_test_replica_logger(|log| {
@@ -487,9 +487,9 @@ proptest! {
                 payload.len()
             );
             if let Some(slice) = payload.get(&REMOTE_SUBNET) {
-                assert_eq!(stream.messages_begin(), slice.header().begin);
-                assert_eq!(stream.messages_end(), slice.header().end);
-                assert_eq!(updated_stream.signals_end(), slice.header().signals_end);
+                assert_eq!(stream.messages_begin(), slice.header().begin());
+                assert_eq!(stream.messages_end(), slice.header().end());
+                assert_eq!(updated_stream.signals_end(), slice.header().signals_end());
                 assert!(slice.messages().is_none());
             } else {
                 panic!(
@@ -611,7 +611,7 @@ proptest! {
             slice_bytes_sum += fixture.pool_slice(SUBNET_1, &stream1, from1, msg_count1, &log);
             slice_bytes_sum += fixture.pool_slice(SUBNET_2, &stream2, from2, msg_count2, &log);
 
-            let time = mock_time();
+            let time = UNIX_EPOCH;
             let validation_context = ValidationContext {
                 registry_version: REGISTRY_VERSION,
                 certified_height: fixture.certified_height,

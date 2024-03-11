@@ -1,43 +1,57 @@
 //! Defines types used for threshold ECDSA key generation.
 
-use ic_protobuf::proxy::{try_from_option_field, ProxyDecodeError};
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
-use std::convert::{TryFrom, TryInto};
-use std::fmt::{self, Display, Formatter};
-use std::hash::Hash;
-use std::time::Duration;
-use strum_macros::EnumIter;
-
 pub use crate::consensus::ecdsa_refs::{
     unpack_reshare_of_unmasked_params, EcdsaBlockReader, IDkgTranscriptAttributes,
     IDkgTranscriptOperationRef, IDkgTranscriptParamsRef, MaskedTranscript,
     PreSignatureQuadrupleRef, PseudoRandomId, QuadrupleId, QuadrupleInCreation,
-    RandomTranscriptParams, RequestId, ReshareOfMaskedParams, ReshareOfUnmaskedParams,
-    ThresholdEcdsaSigInputsError, ThresholdEcdsaSigInputsRef, TranscriptAttributes,
-    TranscriptCastError, TranscriptLookupError, TranscriptParamsError, TranscriptRef,
-    UnmaskedTimesMaskedParams, UnmaskedTranscript,
+    RandomTranscriptParams, RandomUnmaskedTranscriptParams, RequestId, ReshareOfMaskedParams,
+    ReshareOfUnmaskedParams, ThresholdEcdsaSigInputsError, ThresholdEcdsaSigInputsRef,
+    TranscriptAttributes, TranscriptCastError, TranscriptLookupError, TranscriptParamsError,
+    TranscriptRef, UnmaskedTimesMaskedParams, UnmaskedTranscript,
 };
-use crate::consensus::BasicSignature;
-use crate::crypto::canister_threshold_sig::error::*;
-use crate::crypto::{
-    canister_threshold_sig::idkg::{
-        IDkgComplaint, IDkgDealingSupport, IDkgOpening, IDkgTranscript, IDkgTranscriptId,
-        IDkgTranscriptParams, InitialIDkgDealings, SignedIDkgDealing,
+use crate::{
+    consensus::BasicSignature,
+    crypto::{
+        canister_threshold_sig::{
+            error::*,
+            idkg::{
+                IDkgComplaint, IDkgDealingSupport, IDkgOpening, IDkgTranscript, IDkgTranscriptId,
+                IDkgTranscriptParams, InitialIDkgDealings, SignedIDkgDealing,
+            },
+            ThresholdEcdsaSigShare,
+        },
+        crypto_hash, AlgorithmId, CryptoHash, CryptoHashOf, CryptoHashable, Signed,
+        SignedBytesWithoutDomainSeparator,
     },
-    canister_threshold_sig::ThresholdEcdsaSigShare,
-    crypto_hash, AlgorithmId, CryptoHash, CryptoHashOf, CryptoHashable, Signed,
-    SignedBytesWithoutDomainSeparator,
+    node_id_into_protobuf, node_id_try_from_option, Height, NodeId, RegistryVersion, SubnetId,
 };
-use crate::{node_id_into_protobuf, node_id_try_from_option};
-use crate::{Height, NodeId, RegistryVersion, SubnetId};
 use ic_crypto_sha2::Sha256;
 #[cfg(test)]
 use ic_exhaustive_derive::ExhaustiveSet;
-use ic_ic00_types::EcdsaKeyId;
-use ic_protobuf::registry::subnet::v1 as subnet_pb;
-use ic_protobuf::types::v1 as pb;
+use ic_management_canister_types::EcdsaKeyId;
+use ic_protobuf::{
+    proxy::{try_from_option_field, ProxyDecodeError},
+    registry::{crypto::v1 as crypto_pb, subnet::v1 as subnet_pb},
+    types::v1 as pb,
+};
 use phantom_newtype::Id;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    convert::{TryFrom, TryInto},
+    fmt::{self, Display, Formatter},
+    hash::Hash,
+    time::Duration,
+};
+use strum_macros::EnumIter;
+
+/// This feature flag enables the reduced latency path through payload
+/// builder and signer components. Instead of matching pre-signatures
+/// with requests in the block payload, and generating signature shares
+/// once that block is finalized, the optimized path matches pre-signatures
+/// with requests in replicated state and generates signature shares as
+/// soon as that state is certified.
+pub const ECDSA_IMPROVED_LATENCY: bool = false;
 
 /// For completed signature requests, we differentiate between those
 /// that have already been reported and those that have not. This is
@@ -154,6 +168,7 @@ impl EcdsaPayload {
     pub fn unassigned_quadruple_ids(&self) -> Box<dyn Iterator<Item = QuadrupleId> + '_> {
         let assigned = self
             .iter_request_ids()
+            .cloned()
             .map(|id| id.quadruple_id)
             .collect::<BTreeSet<_>>();
         Box::new(
@@ -429,6 +444,60 @@ impl Display for EcdsaKeyTranscript {
     }
 }
 
+impl From<EcdsaKeyTranscript> for pb::EcdsaKeyTranscript {
+    fn from(transcript: EcdsaKeyTranscript) -> Self {
+        Self {
+            current: transcript
+                .current
+                .as_ref()
+                .map(pb::UnmaskedTranscriptWithAttributes::from),
+            next_in_creation: Some(pb::KeyTranscriptCreation::from(
+                &transcript.next_in_creation,
+            )),
+            key_id: Some(crypto_pb::EcdsaKeyId::from(&transcript.key_id)),
+        }
+    }
+}
+
+impl From<&EcdsaKeyTranscript> for pb::EcdsaKeyTranscript {
+    fn from(transcript: &EcdsaKeyTranscript) -> Self {
+        Self::from(transcript.clone())
+    }
+}
+
+impl TryFrom<pb::EcdsaKeyTranscript> for EcdsaKeyTranscript {
+    type Error = ProxyDecodeError;
+
+    fn try_from(proto: pb::EcdsaKeyTranscript) -> Result<Self, Self::Error> {
+        let key_id = try_from_option_field(proto.key_id, "KeyTranscript::key_id")?;
+
+        let current = proto
+            .current
+            .as_ref()
+            .map(UnmaskedTranscriptWithAttributes::try_from)
+            .transpose()?;
+
+        let next_in_creation = try_from_option_field(
+            proto.next_in_creation.as_ref(),
+            "KeyTranscript::next_in_creation",
+        )?;
+
+        Ok(Self {
+            key_id,
+            current,
+            next_in_creation,
+        })
+    }
+}
+
+impl TryFrom<&pb::EcdsaKeyTranscript> for EcdsaKeyTranscript {
+    type Error = ProxyDecodeError;
+
+    fn try_from(transcript: &pb::EcdsaKeyTranscript) -> Result<Self, Self::Error> {
+        Self::try_from(transcript.clone())
+    }
+}
+
 /// The creation of an ecdsa key transcript goes through one of the three paths below:
 /// 1. Begin -> RandomTranscript -> ReshareOfMasked -> Created
 /// 2. Begin -> ReshareOfUnmasked -> Created
@@ -607,14 +676,14 @@ pub enum CompletedReshareRequest {
 #[cfg_attr(test, derive(ExhaustiveSet))]
 pub struct EcdsaUIDGenerator {
     next_unused_transcript_id: IDkgTranscriptId,
-    next_unused_quadruple_id: QuadrupleId,
+    next_unused_quadruple_id: u64,
 }
 
 impl EcdsaUIDGenerator {
     pub fn new(subnet_id: SubnetId, height: Height) -> Self {
         Self {
             next_unused_transcript_id: IDkgTranscriptId::new(subnet_id, 0, height),
-            next_unused_quadruple_id: QuadrupleId(0),
+            next_unused_quadruple_id: 0,
         }
     }
     pub fn update_height(&mut self, height: Height) -> Result<(), IDkgTranscriptIdError> {
@@ -629,10 +698,11 @@ impl EcdsaUIDGenerator {
         id
     }
 
-    pub fn next_quadruple_id(&mut self) -> QuadrupleId {
+    pub fn next_quadruple_id(&mut self, key_id: EcdsaKeyId) -> QuadrupleId {
         let id = self.next_unused_quadruple_id;
-        self.next_unused_quadruple_id = QuadrupleId(id.0 + 1);
-        id
+        self.next_unused_quadruple_id += 1;
+
+        QuadrupleId(id, Some(key_id))
     }
 }
 
@@ -795,7 +865,10 @@ pub fn sig_share_prefix(
     let mut hasher = Sha256::new();
     sig_share_node_id.hash(&mut hasher);
 
-    EcdsaPrefixOf::new(EcdsaPrefix::new(request_id.quadruple_id.0, hasher.finish()))
+    EcdsaPrefixOf::new(EcdsaPrefix::new(
+        request_id.quadruple_id.id(),
+        hasher.finish(),
+    ))
 }
 
 pub fn complaint_prefix(
@@ -1032,7 +1105,7 @@ impl From<&EcdsaSigShare> for pb::EcdsaSigShare {
     fn from(value: &EcdsaSigShare) -> Self {
         Self {
             signer_id: Some(node_id_into_protobuf(value.signer_id)),
-            request_id: Some(pb::RequestId::from(value.request_id)),
+            request_id: Some(pb::RequestId::from(value.request_id.clone())),
             sig_share_raw: value.share.sig_share_raw.clone(),
         }
     }
@@ -1273,7 +1346,7 @@ impl From<&EcdsaMessage> for EcdsaMessageAttribute {
                 EcdsaMessageAttribute::EcdsaDealingSupport(support.transcript_id)
             }
             EcdsaMessage::EcdsaSigShare(share) => {
-                EcdsaMessageAttribute::EcdsaSigShare(share.request_id)
+                EcdsaMessageAttribute::EcdsaSigShare(share.request_id.clone())
             }
             EcdsaMessage::EcdsaComplaint(complaint) => EcdsaMessageAttribute::EcdsaComplaint(
                 complaint.content.idkg_complaint.transcript_id,
@@ -1370,7 +1443,7 @@ impl From<&EcdsaPayload> for pb::EcdsaPayload {
         let mut ongoing_signatures = Vec::new();
         for (request_id, ongoing) in &payload.ongoing_signatures {
             ongoing_signatures.push(pb::OngoingSignature {
-                request_id: Some((*request_id).into()),
+                request_id: Some(request_id.clone().into()),
                 sig_inputs: Some(ongoing.into()),
             })
         }
@@ -1379,7 +1452,8 @@ impl From<&EcdsaPayload> for pb::EcdsaPayload {
         let mut available_quadruples = Vec::new();
         for (quadruple_id, quadruple) in &payload.available_quadruples {
             available_quadruples.push(pb::AvailableQuadruple {
-                quadruple_id: quadruple_id.0,
+                quadruple_id: quadruple_id.id(),
+                key_id: quadruple_id.key_id().map(Into::into),
                 quadruple: Some(quadruple.into()),
             });
         }
@@ -1388,15 +1462,14 @@ impl From<&EcdsaPayload> for pb::EcdsaPayload {
         let mut quadruples_in_creation = Vec::new();
         for (quadruple_id, quadruple) in &payload.quadruples_in_creation {
             quadruples_in_creation.push(pb::QuadrupleInProgress {
-                quadruple_id: quadruple_id.0,
+                quadruple_id: quadruple_id.id(),
+                key_id: quadruple_id.key_id().map(Into::into),
                 quadruple: Some(quadruple.into()),
             });
         }
 
         let next_unused_transcript_id: Option<subnet_pb::IDkgTranscriptId> =
             Some((&payload.uid_generator.next_unused_transcript_id).into());
-
-        let next_unused_quadruple_id = payload.uid_generator.next_unused_quadruple_id.0;
 
         // idkg_transcripts
         let mut idkg_transcripts = Vec::new();
@@ -1429,13 +1502,11 @@ impl From<&EcdsaPayload> for pb::EcdsaPayload {
             });
         }
 
-        let current_key_transcript = payload
-            .key_transcript
-            .current
-            .as_ref()
-            .map(|transcript| transcript.into());
-        let next_key_in_creation = Some((&payload.key_transcript.next_in_creation).into());
-        let key_id = Some((&payload.key_transcript.key_id).into());
+        let pb::EcdsaKeyTranscript {
+            key_id,
+            current: current_key_transcript,
+            next_in_creation: next_key_in_creation,
+        } = pb::EcdsaKeyTranscript::from(payload.key_transcript.clone());
 
         Self {
             signature_agreements,
@@ -1443,10 +1514,12 @@ impl From<&EcdsaPayload> for pb::EcdsaPayload {
             available_quadruples,
             quadruples_in_creation,
             next_unused_transcript_id,
-            next_unused_quadruple_id,
+            next_unused_quadruple_id: payload.uid_generator.next_unused_quadruple_id,
             idkg_transcripts,
             ongoing_xnet_reshares,
             xnet_reshare_agreements,
+            // TODO(kpop): start populating this field
+            key_transcripts: vec![],
             current_key_transcript,
             next_key_in_creation,
             key_id,
@@ -1466,7 +1539,20 @@ impl TryFrom<(&pb::EcdsaPayload, Height)> for EcdsaPayload {
 impl TryFrom<&pb::EcdsaPayload> for EcdsaPayload {
     type Error = ProxyDecodeError;
     fn try_from(payload: &pb::EcdsaPayload) -> Result<Self, Self::Error> {
-        let key_id = try_from_option_field(payload.key_id.clone(), "EcdsaPayload::key_id")?;
+        let key_transcript_proto =
+            // TODO(kpop): support multiple key_transcripts
+            if let [first_key_transcript, ..] = payload.key_transcripts.as_slice() {
+                first_key_transcript.clone()
+            } else {
+                pb::EcdsaKeyTranscript {
+                    key_id: payload.key_id.clone(),
+                    current: payload.current_key_transcript.clone(),
+                    next_in_creation: payload.next_key_in_creation.clone(),
+                }
+            };
+
+        let key_transcript = key_transcript_proto.try_into()?;
+
         let mut signature_agreements = BTreeMap::new();
         for completed_signature in &payload.signature_agreements {
             let pseudo_random_id = {
@@ -1475,16 +1561,19 @@ impl TryFrom<&pb::EcdsaPayload> for EcdsaPayload {
                         "Expects 32 bytes of pseudo_random_id".to_string(),
                     ));
                 }
+
                 let mut x = [0; 32];
                 x.copy_from_slice(&completed_signature.pseudo_random_id);
                 x
             };
+
             let signature = if let Some(unreported) = &completed_signature.unreported {
                 let response = crate::messages::Response::try_from(unreported.clone())?;
                 CompletedSignature::Unreported(response)
             } else {
                 CompletedSignature::ReportedToExecution
             };
+
             signature_agreements.insert(pseudo_random_id, signature);
         }
 
@@ -1495,6 +1584,7 @@ impl TryFrom<&pb::EcdsaPayload> for EcdsaPayload {
                 ongoing_signature.request_id.as_ref(),
                 "EcdsaPayload::ongoing_signature::request_id",
             )?;
+
             let sig_inputs = try_from_option_field(
                 ongoing_signature.sig_inputs.as_ref(),
                 "EcdsaPayload::ongoing_signature::sig_inputs",
@@ -1505,7 +1595,12 @@ impl TryFrom<&pb::EcdsaPayload> for EcdsaPayload {
         // available_quadruples
         let mut available_quadruples = BTreeMap::new();
         for available_quadruple in &payload.available_quadruples {
-            let quadruple_id = QuadrupleId(available_quadruple.quadruple_id);
+            let key_id = available_quadruple
+                .key_id
+                .clone()
+                .map(TryInto::try_into)
+                .transpose()?;
+            let quadruple_id = QuadrupleId(available_quadruple.quadruple_id, key_id);
             let quadruple: PreSignatureQuadrupleRef = try_from_option_field(
                 available_quadruple.quadruple.as_ref(),
                 "EcdsaPayload::available_quadruple::quadruple",
@@ -1516,7 +1611,12 @@ impl TryFrom<&pb::EcdsaPayload> for EcdsaPayload {
         // quadruples_in_creation
         let mut quadruples_in_creation = BTreeMap::new();
         for quadruple_in_creation in &payload.quadruples_in_creation {
-            let quadruple_id = QuadrupleId(quadruple_in_creation.quadruple_id);
+            let key_id = quadruple_in_creation
+                .key_id
+                .clone()
+                .map(TryInto::try_into)
+                .transpose()?;
+            let quadruple_id = QuadrupleId(quadruple_in_creation.quadruple_id, key_id);
             let quadruple: QuadrupleInCreation = try_from_option_field(
                 quadruple_in_creation.quadruple.as_ref(),
                 "EcdsaPayload::quadruple_in_creation::quadruple",
@@ -1529,11 +1629,9 @@ impl TryFrom<&pb::EcdsaPayload> for EcdsaPayload {
             "EcdsaPayload::next_unused_transcript_id",
         )?;
 
-        let next_unused_quadruple_id: QuadrupleId = QuadrupleId(payload.next_unused_quadruple_id);
-
         let uid_generator = EcdsaUIDGenerator {
             next_unused_transcript_id,
-            next_unused_quadruple_id,
+            next_unused_quadruple_id: payload.next_unused_quadruple_id,
         };
 
         // idkg_transcripts
@@ -1585,17 +1683,6 @@ impl TryFrom<&pb::EcdsaPayload> for EcdsaPayload {
             xnet_reshare_agreements.insert(request, completed);
         }
 
-        // Key transcript state
-        let current_key_transcript = if let Some(proto) = &payload.current_key_transcript {
-            Some(UnmaskedTranscriptWithAttributes::try_from(proto)?)
-        } else {
-            None
-        };
-        let next_key_in_creation: KeyTranscriptCreation = try_from_option_field(
-            payload.next_key_in_creation.as_ref(),
-            "EcdsaPayload:: Missing next_key_in_creation",
-        )?;
-
         Ok(Self {
             signature_agreements,
             ongoing_signatures,
@@ -1605,11 +1692,7 @@ impl TryFrom<&pb::EcdsaPayload> for EcdsaPayload {
             ongoing_xnet_reshares,
             xnet_reshare_agreements,
             uid_generator,
-            key_transcript: EcdsaKeyTranscript {
-                current: current_key_transcript,
-                next_in_creation: next_key_in_creation,
-                key_id,
-            },
+            key_transcript,
         })
     }
 }
@@ -1652,37 +1735,13 @@ pub trait EcdsaStats: Send + Sync {
     );
 
     /// Updates the set of signature requests being tracked currently.
-    fn update_active_signature_requests(&self, block_reader: &dyn EcdsaBlockReader);
+    fn update_active_signature_requests(&self, requests: Vec<RequestId>);
 
     /// Records the time taken to verify the signature share received for a request.
     fn record_sig_share_validation(&self, request_id: &RequestId, duration: Duration);
 
     /// Records the time taken to aggregate the signature shares for a request.
     fn record_sig_share_aggregation(&self, request_id: &RequestId, duration: Duration);
-}
-
-/// For testing
-pub struct EcdsaStatsNoOp {}
-impl EcdsaStats for EcdsaStatsNoOp {
-    fn update_active_transcripts(&self, _block_reader: &dyn EcdsaBlockReader) {}
-    fn update_active_quadruples(&self, _block_reader: &dyn EcdsaBlockReader) {}
-    fn record_support_validation(&self, _support: &IDkgDealingSupport, _duration: Duration) {}
-    fn record_support_aggregation(
-        &self,
-        _transcript_params: &IDkgTranscriptParams,
-        _support_shares: &[IDkgDealingSupport],
-        _duration: Duration,
-    ) {
-    }
-    fn record_transcript_creation(
-        &self,
-        _transcript_params: &IDkgTranscriptParams,
-        _duration: Duration,
-    ) {
-    }
-    fn update_active_signature_requests(&self, _block_reader: &dyn EcdsaBlockReader) {}
-    fn record_sig_share_validation(&self, _request_id: &RequestId, _duration: Duration) {}
-    fn record_sig_share_aggregation(&self, _request_id: &RequestId, _duration: Duration) {}
 }
 
 /// EcdsaObject should be implemented by the ECDSA message types
@@ -1761,6 +1820,88 @@ impl From<&EcdsaMessage> for EcdsaArtifactId {
             EcdsaMessage::EcdsaSigShare(object) => object.message_id(),
             EcdsaMessage::EcdsaComplaint(object) => object.message_id(),
             EcdsaMessage::EcdsaOpening(object) => object.message_id(),
+        }
+    }
+}
+
+pub trait HasEcdsaKeyId {
+    /// Returns a reference to the [`EcdsaKeyId`] associated with the object.
+    // TODO(kpop): remove the Option once it's safe
+    fn key_id(&self) -> Option<&EcdsaKeyId>;
+}
+
+impl HasEcdsaKeyId for QuadrupleId {
+    fn key_id(&self) -> Option<&EcdsaKeyId> {
+        self.key_id()
+    }
+}
+
+impl HasEcdsaKeyId for EcdsaReshareRequest {
+    fn key_id(&self) -> Option<&EcdsaKeyId> {
+        Some(&self.key_id)
+    }
+}
+
+impl HasEcdsaKeyId for RequestId {
+    fn key_id(&self) -> Option<&EcdsaKeyId> {
+        self.quadruple_id.key_id()
+    }
+}
+
+impl HasEcdsaKeyId for EcdsaKeyTranscript {
+    fn key_id(&self) -> Option<&EcdsaKeyId> {
+        Some(&self.key_id)
+    }
+}
+
+impl<T: HasEcdsaKeyId, U> HasEcdsaKeyId for (T, U) {
+    fn key_id(&self) -> Option<&EcdsaKeyId> {
+        self.0.key_id()
+    }
+}
+
+impl<T: HasEcdsaKeyId> HasEcdsaKeyId for &T {
+    fn key_id(&self) -> Option<&EcdsaKeyId> {
+        (*self).key_id()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uid_generator_quadruple_ids_are_globally_unique_test() {
+        let mut uid_generator =
+            EcdsaUIDGenerator::new(ic_types_test_utils::ids::SUBNET_0, Height::new(100));
+
+        let quadruple_id_0 = uid_generator.next_quadruple_id(fake_ecdsa_key_id("key_id_0"));
+        let quadruple_id_1 = uid_generator.next_quadruple_id(fake_ecdsa_key_id("key_id_1"));
+        let quadruple_id_2 = uid_generator.next_quadruple_id(fake_ecdsa_key_id("key_id_2"));
+
+        assert_eq!(quadruple_id_0.id(), 0);
+        assert_eq!(quadruple_id_1.id(), 1);
+        assert_eq!(quadruple_id_2.id(), 2);
+    }
+
+    #[test]
+    fn uid_generator_quadruple_id_test() {
+        let key_id_1 = fake_ecdsa_key_id("key_id_1");
+        let key_id_2 = fake_ecdsa_key_id("key_id_2");
+        let mut uid_generator =
+            EcdsaUIDGenerator::new(ic_types_test_utils::ids::SUBNET_0, Height::new(100));
+
+        let quadruple_id_0 = uid_generator.next_quadruple_id(key_id_1.clone());
+        let quadruple_id_1 = uid_generator.next_quadruple_id(key_id_2.clone());
+
+        assert_eq!(quadruple_id_0.key_id(), Some(&key_id_1));
+        assert_eq!(quadruple_id_1.key_id(), Some(&key_id_2));
+    }
+
+    fn fake_ecdsa_key_id(name: &str) -> EcdsaKeyId {
+        EcdsaKeyId {
+            curve: ic_management_canister_types::EcdsaCurve::Secp256k1,
+            name: name.to_string(),
         }
     }
 }

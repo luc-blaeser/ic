@@ -1,21 +1,22 @@
 use super::*;
 
-use ic_ic00_types::{
-    CanisterChange, CanisterChangeDetails, CanisterChangeOrigin, CanisterInstallMode, IC_00,
+use ic_management_canister_types::{
+    CanisterChange, CanisterChangeDetails, CanisterChangeOrigin, CanisterInstallMode,
+    LogVisibility, IC_00,
 };
-use ic_replicated_state::canister_state::system_state::CanisterHistory;
-use ic_replicated_state::metadata_state::subnet_call_context_manager::InstallCodeCallId;
+use ic_replicated_state::{
+    canister_state::system_state::CanisterHistory,
+    metadata_state::subnet_call_context_manager::InstallCodeCallId, page_map::Shard, NumWasmPages,
+};
 use ic_test_utilities::types::ids::user_test_id;
-use ic_test_utilities::{
-    mock_time,
-    types::{
-        ids::canister_test_id,
-        messages::{IngressBuilder, RequestBuilder, ResponseBuilder},
-    },
+use ic_test_utilities::types::{
+    ids::canister_test_id,
+    messages::{IngressBuilder, RequestBuilder, ResponseBuilder},
 };
 use ic_test_utilities_logger::with_test_replica_logger;
 use ic_test_utilities_tmpdir::tmpdir;
 use ic_types::messages::{CanisterCall, CanisterMessage, CanisterMessageOrTask};
+use ic_types::time::UNIX_EPOCH;
 use itertools::Itertools;
 use proptest::prelude::*;
 use std::fs::File;
@@ -45,7 +46,7 @@ fn default_canister_state_bits() -> CanisterStateBits {
         stable_memory_size: NumWasmPages::from(0),
         heap_delta_debit: NumBytes::from(0),
         install_code_debit: NumInstructions::from(0),
-        time_of_last_allocation_charge_nanos: mock_time().as_nanos_since_unix_epoch(),
+        time_of_last_allocation_charge_nanos: 0,
         task_queue: vec![],
         global_timer_nanos: None,
         canister_version: 0,
@@ -53,6 +54,8 @@ fn default_canister_state_bits() -> CanisterStateBits {
         canister_history: CanisterHistory::default(),
         wasm_chunk_store_metadata: WasmChunkStoreMetadata::default(),
         total_query_stats: TotalQueryStats::default(),
+        log_visibility: LogVisibility::default(),
+        canister_log: Default::default(),
     }
 }
 
@@ -191,6 +194,26 @@ fn test_encode_decode_non_empty_history() {
     let canister_state_bits = CanisterStateBits::try_from(pb_bits).unwrap();
 
     assert_eq!(canister_state_bits.canister_history, canister_history);
+}
+
+#[test]
+fn test_canister_snapshots_decode() {
+    let canister_snapshot_bits = CanisterSnapshotBits {
+        snapshot_id: SnapshotId::new(5),
+        canister_id: canister_test_id(7),
+        taken_at_timestamp: UNIX_EPOCH,
+        canister_version: 3,
+        binary_hash: Some(WasmHash::from(&CanisterModule::new(vec![2, 3, 4]))),
+        certified_data: vec![3, 4, 7],
+        wasm_chunk_store_metadata: WasmChunkStoreMetadata::default(),
+        stable_memory_size: NumWasmPages::new(10),
+        wasm_memory_size: NumWasmPages::new(10),
+    };
+
+    let pb_bits = pb_canister_snapshot_bits::CanisterSnapshotBits::from(&canister_snapshot_bits);
+    let new_canister_snapshot_bits = CanisterSnapshotBits::try_from(pb_bits).unwrap();
+
+    assert_eq!(canister_snapshot_bits, new_canister_snapshot_bits);
 }
 
 #[test]
@@ -364,6 +387,51 @@ fn random_sorted_unique_heights(max_length: usize) -> impl Strategy<Value = Vec<
     })
 }
 
+#[test]
+fn overlay_height_test() {
+    assert_eq!(
+        overlay_height(&PathBuf::from(
+            "/a/b/c/0000000000001000_0000_vmemory.overlay"
+        ))
+        .unwrap(),
+        Height::new(4096)
+    );
+    assert!(overlay_height(&PathBuf::from("/a/b/c/vmemory.overlay")).is_err());
+    // Test that parsing is consistent with encoding.
+    let tmp = tmpdir("canister");
+    let canister_layout: CanisterLayout<WriteOnly> =
+        CanisterLayout::new(tmp.path().to_owned()).unwrap();
+    assert_eq!(
+        overlay_height(&canister_layout.stable_memory_overlay(Height::new(100), Shard::new(3)))
+            .unwrap(),
+        Height::new(100)
+    );
+}
+
+#[test]
+fn overlay_shard_test() {
+    assert_eq!(
+        overlay_shard(&PathBuf::from(
+            "/a/b/c/0000000000001000_0010_vmemory.overlay"
+        ))
+        .unwrap(),
+        Shard::new(16)
+    );
+    assert!(overlay_shard(&PathBuf::from(
+        "/a/b/c/0000000000001000_0Q10_vmemory.overlay"
+    ))
+    .is_err());
+    // Test that parsing is consistent with encoding.
+    let tmp = tmpdir("canister");
+    let canister_layout: CanisterLayout<WriteOnly> =
+        CanisterLayout::new(tmp.path().to_owned()).unwrap();
+    assert_eq!(
+        overlay_shard(&canister_layout.stable_memory_overlay(Height::new(100), Shard::new(30)))
+            .unwrap(),
+        Shard::new(30)
+    );
+}
+
 proptest! {
 #[test]
 fn read_back_wasm_memory_overlay_file_names(heights in random_sorted_unique_heights(10)) {
@@ -372,7 +440,7 @@ fn read_back_wasm_memory_overlay_file_names(heights in random_sorted_unique_heig
         CanisterLayout::new(tmp.path().to_owned()).unwrap();
     let overlay_names: Vec<PathBuf> = heights
         .iter()
-        .map(|h| canister_layout.vmemory_0_overlay(*h))
+        .map(|h| canister_layout.vmemory_0_overlay(*h, Shard::new(0)))
         .collect();
 
     // Create the overlay files in the directory.
@@ -382,8 +450,8 @@ fn read_back_wasm_memory_overlay_file_names(heights in random_sorted_unique_heig
 
     // Create some other files that should be ignored.
     File::create(canister_layout.raw_path().join("otherfile")).unwrap();
-    File::create(canister_layout.stable_memory_overlay(Height::new(42))).unwrap();
-    File::create(canister_layout.wasm_chunk_store_overlay(Height::new(42))).unwrap();
+    File::create(canister_layout.stable_memory_overlay(Height::new(42), Shard::new(0))).unwrap();
+    File::create(canister_layout.wasm_chunk_store_overlay(Height::new(42), Shard::new(0))).unwrap();
     File::create(canister_layout.vmemory_0()).unwrap();
 
     let existing_overlays = canister_layout.vmemory_0_overlays().unwrap();
@@ -399,7 +467,7 @@ fn read_back_stable_memory_overlay_file_names(heights in random_sorted_unique_he
         CanisterLayout::new(tmp.path().to_owned()).unwrap();
     let overlay_names: Vec<PathBuf> = heights
         .iter()
-        .map(|h| canister_layout.stable_memory_overlay(*h))
+        .map(|h| canister_layout.stable_memory_overlay(*h, Shard::new(0)))
         .collect();
 
     // Create the overlay files in the directory.
@@ -409,8 +477,8 @@ fn read_back_stable_memory_overlay_file_names(heights in random_sorted_unique_he
 
     // Create some other files that should be ignored.
     File::create(canister_layout.raw_path().join("otherfile")).unwrap();
-    File::create(canister_layout.vmemory_0_overlay(Height::new(42))).unwrap();
-    File::create(canister_layout.wasm_chunk_store_overlay(Height::new(42))).unwrap();
+    File::create(canister_layout.vmemory_0_overlay(Height::new(42), Shard::new(0))).unwrap();
+    File::create(canister_layout.wasm_chunk_store_overlay(Height::new(42), Shard::new(0))).unwrap();
     File::create(canister_layout.stable_memory_blob()).unwrap();
 
     let existing_overlays = canister_layout.stable_memory_overlays().unwrap();
@@ -426,7 +494,7 @@ fn read_back_wasm_chunk_store_overlay_file_names(heights in random_sorted_unique
         CanisterLayout::new(tmp.path().to_owned()).unwrap();
     let overlay_names: Vec<PathBuf> = heights
         .iter()
-        .map(|h| canister_layout.wasm_chunk_store_overlay(*h))
+        .map(|h| canister_layout.wasm_chunk_store_overlay(*h, Shard::new(0)))
         .collect();
 
     // Create the overlay files in the directory.
@@ -436,8 +504,8 @@ fn read_back_wasm_chunk_store_overlay_file_names(heights in random_sorted_unique
 
     // Create some other files that should be ignored.
     File::create(canister_layout.raw_path().join("otherfile")).unwrap();
-    File::create(canister_layout.vmemory_0_overlay(Height::new(42))).unwrap();
-    File::create(canister_layout.stable_memory_overlay(Height::new(42))).unwrap();
+    File::create(canister_layout.vmemory_0_overlay(Height::new(42), Shard::new(0))).unwrap();
+    File::create(canister_layout.stable_memory_overlay(Height::new(42), Shard::new(0))).unwrap();
     File::create(canister_layout.wasm_chunk_store()).unwrap();
 
     let existing_overlays = canister_layout.wasm_chunk_store_overlays().unwrap();

@@ -3,9 +3,9 @@ use proptest::strategy::Strategy;
 
 mod estimate_transaction_price {
     use crate::eth_rpc::FeeHistory;
-    use crate::numeric::{BlockNumber, GasAmount, WeiPerGas};
+    use crate::numeric::{BlockNumber, WeiPerGas};
     use crate::tx::{
-        estimate_transaction_price, TransactionPrice, TransactionPriceEstimationError,
+        estimate_transaction_price, TransactionPriceEstimate, TransactionPriceEstimationError,
     };
     use assert_matches::assert_matches;
     use proptest::collection::vec;
@@ -34,8 +34,7 @@ mod estimate_transaction_price {
 
             prop_assert_eq!(
                 result,
-                Ok(TransactionPrice {
-                    gas_limit: GasAmount::from(21_000_u64),
+                Ok(TransactionPriceEstimate {
                     max_fee_per_gas: WeiPerGas::from(expected_max_fee_per_gas),
                     max_priority_fee_per_gas: WeiPerGas::from(expected_max_priority_fee_per_gas),
                 })
@@ -129,12 +128,12 @@ mod transaction_price {
 
 #[test]
 fn should_cbor_encoding_be_stable() {
-    use crate::address::Address;
     use crate::numeric::{GasAmount, TransactionNonce, Wei, WeiPerGas};
     use crate::tx::{
         AccessList, Eip1559Signature, Eip1559TransactionRequest, SignedEip1559TransactionRequest,
     };
     use ethnum::u256;
+    use ic_ethereum_types::Address;
     use std::str::FromStr;
 
     // see https://sepolia.etherscan.io/getRawTx?tx=0x66a9a218ea720ac6d2c9e56f7e44836c1541c186b7627bda220857ce34e2df7f

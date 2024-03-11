@@ -54,9 +54,9 @@ use ic_nns_governance::{
         Neuron, NeuronInfo, NnsFunction, NodeProvider, Proposal, ProposalInfo, RewardEvent,
         RewardNodeProviders, SettleCommunityFundParticipation,
         SettleNeuronsFundParticipationRequest, SettleNeuronsFundParticipationResponse,
-        UpdateNodeProvider, Vote,
+        UpdateNodeProvider, Vote, XdrConversionRate as XdrConversionRatePb,
     },
-    storage::{grow_upgrades_memory_to, with_upgrades_memory},
+    storage::{grow_upgrades_memory_to, validate_stable_storage, with_upgrades_memory},
 };
 use prost::Message;
 use rand::{RngCore, SeedableRng};
@@ -347,7 +347,7 @@ fn canister_post_upgrade() {
     dfn_core::printer::hook();
     println!("{}Executing post upgrade", LOG_PREFIX);
 
-    let restored_state = with_upgrades_memory(|memory| {
+    let mut restored_state = with_upgrades_memory(|memory| {
         let result: Result<GovernanceProto, _> = load_protobuf(memory);
         result
     })
@@ -356,15 +356,29 @@ fn canister_post_upgrade() {
              CANISTER MIGHT HAVE BROKEN STATE!!!!.",
     );
 
+    // The following mutation migrates the Governance canister to a state starting from which
+    // the field `xdr_conversion_rate` should alwasys be specified.
+    //
+    // TODO[NNS1-2925]: Remove this statement.
+    if restored_state.xdr_conversion_rate.is_none() {
+        let xdr_conversion_rate = XdrConversionRatePb::with_default_values();
+        println!(
+            "{}canister_post_upgrade: Initializing xdr_conversion_rate for the first time as {:?}",
+            LOG_PREFIX, xdr_conversion_rate,
+        );
+        restored_state.xdr_conversion_rate = Some(xdr_conversion_rate);
+    }
+
     grow_upgrades_memory_to(WASM_PAGES_RESERVED_FOR_UPGRADES_MEMORY);
 
     println!(
         "{}canister_post_upgrade: Initializing with: economics: \
-          {:?}, genesis_timestamp_seconds: {}, neuron count: {}",
+          {:?}, genesis_timestamp_seconds: {}, neuron count: {}, xdr_conversion_rate: {:?}",
         LOG_PREFIX,
         restored_state.economics,
         restored_state.genesis_timestamp_seconds,
-        restored_state.neurons.len()
+        restored_state.neurons.len(),
+        restored_state.xdr_conversion_rate,
     );
     set_governance(Governance::new_restored(
         restored_state,
@@ -372,6 +386,8 @@ fn canister_post_upgrade() {
         Box::new(IcpLedgerCanister::new(LEDGER_CANISTER_ID)),
         Box::new(CMCCanister::<DfnRuntime>::new()),
     ));
+
+    validate_stable_storage();
 }
 
 #[cfg(feature = "test")]
@@ -816,21 +832,24 @@ fn update_node_provider_(req: UpdateNodeProvider) -> Result<(), GovernanceError>
     governance_mut().update_node_provider(&caller(), req)
 }
 
-/// TODO[NNS1-2617]: Deprecate this function.
 #[export_name = "canister_update settle_community_fund_participation"]
 fn settle_community_fund_participation() {
     debug_log("settle_community_fund_participation");
     over_async(candid_one, settle_community_fund_participation_)
 }
 
-/// TODO[NNS1-2617]: Deprecate this function.
+/// Obsolete, so always returns an error. Please use `settle_neurons_fund_participation`
+/// instead.
 #[candid_method(update, rename = "settle_community_fund_participation")]
 async fn settle_community_fund_participation_(
-    request: SettleCommunityFundParticipation,
+    _request: SettleCommunityFundParticipation,
 ) -> Result<(), GovernanceError> {
-    governance_mut()
-        .settle_community_fund_participation(caller(), &request)
-        .await
+    Err(GovernanceError::new_with_message(
+        ErrorType::Unavailable,
+        "settle_community_fund_participation is obsolete; please \
+        use settle_neurons_fund_participation instead."
+            .to_string(),
+    ))
 }
 
 #[export_name = "canister_update settle_neurons_fund_participation"]
@@ -1001,7 +1020,6 @@ fn get_effective_payload(mt: NnsFunction, payload: &[u8]) -> Cow<[u8]> {
         | NnsFunction::InsertSnsWasmUpgradePathEntries
         | NnsFunction::AddApiBoundaryNode
         | NnsFunction::RemoveApiBoundaryNodes
-        | NnsFunction::UpdateApiBoundaryNodeDomain
         | NnsFunction::UpdateApiBoundaryNodesVersion => Cow::Borrowed(payload),
     }
 }

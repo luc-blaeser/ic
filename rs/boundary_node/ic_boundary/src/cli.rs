@@ -67,31 +67,45 @@ pub struct RegistryConfig {
 
 #[derive(Args)]
 pub struct ListenConfig {
-    /// Port to listen for HTTP
-    #[clap(long, default_value = "80")]
-    pub http_port: u16,
+    /// Port to listen on for HTTP (listens on IPv6 wildcard "::")
+    #[clap(long)]
+    pub http_port: Option<u16>,
+
+    /// Unix socket to listen on for HTTP
+    #[cfg(not(feature = "tls"))]
+    #[clap(long)]
+    pub http_unix_socket: Option<PathBuf>,
 
     /// Port to listen for HTTPS
     #[cfg(feature = "tls")]
     #[clap(long, default_value = "443")]
     pub https_port: u16,
 
-    /// Timeout for the whole HTTP request in seconds
-    #[clap(long, default_value = "600")]
+    /// Timeout for the whole HTTP request in milliseconds.
+    /// From when it starts connecting until the response body is finished.
+    #[clap(long, default_value = "120000")]
     pub http_timeout: u64,
 
-    /// Timeout for the whole HTTP request in seconds when doing health checks
-    #[clap(long, default_value = "3")]
-    pub http_timeout_check: u64,
-
-    /// Timeout for the HTTP connect phase in seconds
-    #[clap(long, default_value = "2")]
+    /// Timeout for the HTTP connect phase in milliseconds.
+    /// This is applied to both normal and health check requests.
+    #[clap(long, default_value = "1500")]
     pub http_timeout_connect: u64,
 
-    /// Max number of in-flight requests that can be served in parallel
-    /// If this is exceeded - new requests would be throttled
-    #[clap(long, default_value = "512")]
-    pub max_concurrency: usize,
+    /// Max number of in-flight requests that can be served in parallel.
+    /// If this is exceeded - new requests would be throttled.
+    #[clap(long)]
+    pub max_concurrency: Option<usize>,
+
+    /// Exponential Weighted Moving Average parameter for load shedding algorithm.
+    /// Value of 0.1 means that the next measurement would account for 10% of moving average.
+    /// Should be in range 0..1.
+    #[clap(long)]
+    pub shed_ewma_param: Option<f64>,
+
+    /// Target latency for load shedding algorithm in milliseconds.
+    /// It tries to keep the request latency less than this.
+    #[clap(long, default_value = "1200", value_parser = clap::value_parser!(u64).range(10..))]
+    pub shed_target_latency: u64,
 
     /// How frequently to send TCP/HTTP2 keepalives, in seconds
     #[clap(long, default_value = "15")]
@@ -101,28 +115,29 @@ pub struct ListenConfig {
     #[clap(long, default_value = "3")]
     pub http_keepalive_timeout: u64,
 
-    /// How long to keep idle outgoing connections open
-    #[clap(long, default_value = "10")]
+    /// How long to keep idle outgoing connections open, in seconds
+    #[clap(long, default_value = "60")]
     pub http_idle_timeout: u64,
 }
 
 #[derive(Args)]
 pub struct HealthChecksConfig {
-    /// How frequently to run node checks in seconds
-    #[clap(long, default_value = "10")]
+    /// How frequently to run node checks in milliseconds
+    #[clap(long, default_value = "1000")]
     pub check_interval: u64,
 
-    /// How many attempts to do when checking a node
-    #[clap(long, default_value = "3")]
-    pub check_retries: u32,
+    /// How frequently to recalculate healthy nodes set (per-subnet) e.g. based on height lagging
+    #[clap(long, default_value = "5000")]
+    pub update_interval: u64,
 
-    /// Minimum required OK health checks
-    /// for a replica to be included in the routing table
-    #[clap(long, default_value = "1")]
-    pub min_ok_count: u8,
+    /// Timeout for the check request in milliseconds.
+    /// This includes connection phase and the actual HTTP request.
+    /// Should be longer than --http-timeout-connect
+    #[clap(long, default_value = "3000")]
+    pub check_timeout: u64,
 
     /// Maximum block height lag for a replica to be included in the routing table
-    #[clap(long, default_value = "1000")]
+    #[clap(long, default_value = "50")]
     pub max_height_lag: u64,
 }
 
@@ -141,22 +156,26 @@ pub struct FirewallConfig {
 #[derive(Args)]
 pub struct TlsConfig {
     /// Hostname to request TLS certificate for
-    #[clap(long)]
+    #[clap(long, default_value = "")]
     pub hostname: String,
 
     /// How many days before certificate expires to start renewing it
     #[clap(long, default_value = "30", value_parser = clap::value_parser!(u32).range(1..90))]
     pub renew_days_before: u32,
 
-    /// The path to the ACME credentials file
-    #[clap(long, default_value = "acme.json")]
-    pub acme_credentials_path: PathBuf,
+    /// Path to the ACME credentials file. If file does not exist - new account will be created & saved to it, so the folder needs to be writeable.
+    /// If this argument is not specified or the file is empty then ACME client will not be created and only certificate specified by
+    /// --tls-*-path options will be used (this is useful mostly for testing).
+    #[clap(long)]
+    pub acme_credentials_path: Option<PathBuf>,
 
-    /// The path to the ingress TLS cert
+    /// The path to the ingress TLS cert.
+    /// If ACME client is used (see above) - the file needs to be writeable.
     #[clap(long, default_value = "cert.pem")]
     pub tls_cert_path: PathBuf,
 
-    /// The path to the ingress TLS private-key
+    /// The path to the ingress TLS private-key.
+    /// If ACME client is used (see above) - the file needs to be writeable.
     #[clap(long, default_value = "pkey.pem")]
     pub tls_pkey_path: PathBuf,
 }
@@ -169,6 +188,15 @@ pub struct MonitoringConfig {
     /// Maximum logging level
     #[clap(long, default_value = "info")]
     pub max_logging_level: tracing::Level,
+    /// Disable per-request logging and metrics recording
+    #[clap(long)]
+    pub disable_request_logging: bool,
+    /// Log only failed (non-2xx status code or other problems) requests
+    #[clap(long)]
+    pub log_failed_requests_only: bool,
+    /// Path to a GeoIP country database file
+    #[clap(long)]
+    pub geoip_db: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -179,6 +207,9 @@ pub struct RateLimitingConfig {
     /// Allowed number of update calls per second per ip per boundary node. Panics if 0 is passed!
     #[clap(long)]
     pub rate_limit_per_second_per_ip: Option<u32>,
+    /// Allowed number of ledger transfer calls per second
+    #[clap(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub rate_limit_ledger_transfer: Option<u32>,
 }
 
 #[derive(Args)]

@@ -134,12 +134,14 @@
 use super::config::NODES_INFO;
 use super::driver_setup::SSH_AUTHORIZED_PRIV_KEYS_DIR;
 use super::farm::{DnsRecord, PlaynetCertificate};
-use super::test_setup::GroupSetup;
+use super::test_setup::{GroupSetup, InfraProvider};
 use crate::driver::boundary_node::BoundaryNodeVm;
 use crate::driver::constants::{self, kibana_link, SSH_USERNAME};
 use crate::driver::farm::{Farm, GroupSpec};
 use crate::driver::log_events;
 use crate::driver::test_env::{HasIcPrepDir, SshKeyGen, TestEnv, TestEnvAttribute};
+use crate::k8s::tnet::TNet;
+use crate::k8s::virtualmachine::{delete_vm, restart_vm, start_vm};
 use crate::util::{block_on, create_agent};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -173,7 +175,7 @@ use ic_utils::interfaces::ManagementCanister;
 use icp_ledger::{AccountIdentifier, LedgerCanisterInitPayload, Tokens};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use slog::{info, warn, Logger};
+use slog::{error, info, warn, Logger};
 use ssh2::Session;
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
@@ -384,7 +386,7 @@ impl TopologySnapshot {
         Box::new(
             self.local_registry
                 .get_subnet_ids(registry_version)
-                .unwrap_result()
+                .unwrap_result(registry_version, "subnet_ids")
                 .into_iter()
                 .map(|subnet_id| SubnetSnapshot {
                     subnet_id,
@@ -411,12 +413,15 @@ impl TopologySnapshot {
         let assigned_nodes: HashSet<_> = self
             .local_registry
             .get_subnet_ids(registry_version)
-            .unwrap_result()
+            .unwrap_result(registry_version, "subnet_ids")
             .into_iter()
             .flat_map(|subnet_id| {
                 self.local_registry
                     .get_node_ids_on_subnet(subnet_id, registry_version)
-                    .unwrap_result()
+                    .unwrap_result(
+                        registry_version,
+                        &format!("node_ids_on_subnet(subnet_id={})", subnet_id),
+                    )
             })
             .collect();
 
@@ -480,6 +485,22 @@ impl TopologySnapshot {
         result
     }
 
+    /// Like `block_for_newer_registry_version` but with a custom `duration` and `backoff`.
+    pub async fn block_for_newer_registry_version_within_duration(
+        &self,
+        duration: Duration,
+        backoff: Duration,
+    ) -> Result<TopologySnapshot> {
+        let minimum_version = self.local_registry.get_latest_version() + RegistryVersion::from(1);
+        let result = self
+            .block_for_min_registry_version_within_duration(minimum_version, duration, backoff)
+            .await;
+        if let Ok(ref topology) = result {
+            info!(self.env.logger(), "{}", topology);
+        }
+        result
+    }
+
     /// This method blocks and repeatedly fetches updates from the registry
     /// canister until the latest available registry version is higher or equal
     /// to `min_version`.
@@ -500,6 +521,17 @@ impl TopologySnapshot {
     ) -> Result<TopologySnapshot> {
         let duration = Duration::from_secs(180);
         let backoff = Duration::from_secs(2);
+        self.block_for_min_registry_version_within_duration(min_version, duration, backoff)
+            .await
+    }
+
+    /// Like `block_for_min_registry_version` but with a custom `duration` and `backoff`.
+    pub async fn block_for_min_registry_version_within_duration(
+        &self,
+        min_version: RegistryVersion,
+        duration: Duration,
+        backoff: Duration,
+    ) -> Result<TopologySnapshot> {
         let mut latest_version = self.local_registry.get_latest_version();
         if min_version > latest_version {
             latest_version = retry_async(&self.env.logger(), duration, backoff, || async move {
@@ -605,7 +637,10 @@ impl SubnetSnapshot {
     pub fn raw_subnet_record(&self) -> pb_subnet::SubnetRecord {
         self.local_registry
             .get_subnet_record(self.subnet_id, self.registry_version)
-            .unwrap_result()
+            .unwrap_result(
+                self.registry_version,
+                &format!("subnet_record(subnet_id={})", self.subnet_id),
+            )
     }
 }
 
@@ -642,7 +677,10 @@ impl IcNodeSnapshot {
     fn raw_node_record(&self) -> pb_node::NodeRecord {
         self.local_registry
             .get_node_record(self.node_id, self.registry_version)
-            .unwrap_result()
+            .unwrap_result(
+                self.registry_version,
+                &format!("node_record(node_id={})", self.node_id),
+            )
     }
 
     fn http_endpoint_to_url(http: &pb_node::ConnectionEndpoint) -> Url {
@@ -667,6 +705,11 @@ impl IcNodeSnapshot {
         node_record.public_ipv4_config
     }
 
+    pub fn get_domain(&self) -> Option<String> {
+        let node_record = self.raw_node_record();
+        node_record.domain
+    }
+
     /// Is it accessible via ssh with the `admin` user.
     /// Waits until connection is ready.
     pub fn await_can_login_as_admin_via_ssh(&self) -> Result<()> {
@@ -686,12 +729,15 @@ impl IcNodeSnapshot {
         let registry_version = self.registry_version;
         self.local_registry
             .get_subnet_ids(registry_version)
-            .unwrap_result()
+            .unwrap_result(registry_version, "subnet_ids")
             .into_iter()
             .find(|subnet_id| {
                 self.local_registry
                     .get_node_ids_on_subnet(*subnet_id, registry_version)
-                    .unwrap_result()
+                    .unwrap_result(
+                        registry_version,
+                        &format!("node_ids_on_subnet(subnet_id={})", subnet_id),
+                    )
                     .contains(&self.node_id)
             })
     }
@@ -704,7 +750,7 @@ impl IcNodeSnapshot {
                     .get_subnet_canister_ranges(self.registry_version, subnet_id)
                     .expect("Could not deserialize optional routing table from local registry.")
                     .expect("Optional routing table is None in local registry.");
-                match canister_ranges.get(0) {
+                match canister_ranges.first() {
                     Some(range) => range.start.get(),
                     None => PrincipalId::default(),
                 }
@@ -899,7 +945,7 @@ fn get_root_subnet_id_from_snapshot<T: HasTopologySnapshot>(env: &T) -> SubnetId
     let ts = env.topology_snapshot();
     ts.local_registry
         .get_root_subnet_id(ts.registry_version)
-        .unwrap_result()
+        .unwrap_result(ts.registry_version, "root_subnet_id")
 }
 pub trait HasRegistryLocalStore {
     fn registry_local_store_path(&self, name: &str) -> Option<PathBuf>;
@@ -934,8 +980,6 @@ pub trait HasIcDependencies {
     fn get_mainnet_ic_os_img_sha256(&self) -> Result<String>;
     fn get_mainnet_ic_os_update_img_url(&self) -> Result<Url>;
     fn get_mainnet_ic_os_update_img_sha256(&self) -> Result<String>;
-    fn get_api_boundary_node_img_url(&self) -> Result<Url>;
-    fn get_api_boundary_node_img_sha256(&self) -> Result<String>;
     fn get_canister_http_test_ca_cert(&self) -> Result<String>;
     fn get_canister_http_test_ca_key(&self) -> Result<String>;
     fn get_hostos_update_img_test_url(&self) -> Result<Url>;
@@ -972,13 +1016,24 @@ impl<T: HasDependencies + HasTestEnv> HasIcDependencies for T {
 
     fn get_ic_os_img_url(&self) -> Result<Url> {
         let url =
-            self.read_dependency_from_env_to_string("ENV_DEPS__DEV_DISK_IMG_TAR_ZST_CAS_URL")?;
+            match InfraProvider::read_attribute(&self.test_env()) {
+                InfraProvider::Farm => self
+                    .read_dependency_from_env_to_string("ENV_DEPS__DEV_DISK_IMG_TAR_ZST_CAS_URL")?,
+                InfraProvider::K8s => self
+                    .read_dependency_from_env_to_string("ENV_DEPS__DEV_DISK_IMG_TAR_GZ_CAS_URL")?,
+            };
         Ok(Url::parse(&url)?)
     }
 
     fn get_ic_os_img_sha256(&self) -> Result<String> {
-        let sha256 =
-            self.read_dependency_from_env_to_string("ENV_DEPS__DEV_DISK_IMG_TAR_ZST_SHA256")?;
+        let sha256 = match InfraProvider::read_attribute(&self.test_env()) {
+            InfraProvider::Farm => {
+                self.read_dependency_from_env_to_string("ENV_DEPS__DEV_DISK_IMG_TAR_ZST_SHA256")?
+            }
+            InfraProvider::K8s => {
+                self.read_dependency_from_env_to_string("ENV_DEPS__DEV_DISK_IMG_TAR_GZ_SHA256")?
+            }
+        };
         bail_if_sha256_invalid(&sha256, "ic_os_img_sha256")?;
         Ok(sha256)
     }
@@ -1065,19 +1120,6 @@ impl<T: HasDependencies + HasTestEnv> HasIcDependencies for T {
         Ok(sha256)
     }
 
-    fn get_api_boundary_node_img_url(&self) -> Result<Url> {
-        let dep_rel_path = "ic-os/boundary-api-guestos/envs/dev/disk-img.tar.zst.cas-url";
-        let url = self.read_dependency_to_string(dep_rel_path)?;
-        Ok(Url::parse(&url)?)
-    }
-
-    fn get_api_boundary_node_img_sha256(&self) -> Result<String> {
-        let dep_rel_path = "ic-os/boundary-api-guestos/envs/dev/disk-img.tar.zst.sha256";
-        let sha256 = self.read_dependency_to_string(dep_rel_path)?;
-        bail_if_sha256_invalid(&sha256, "api_boundary_node_img_sha256")?;
-        Ok(sha256)
-    }
-
     fn get_mainnet_ic_os_img_url(&self) -> Result<Url> {
         let mainnet_version: String =
             self.read_dependency_to_string("testnet/mainnet_nns_revision.txt")?;
@@ -1088,7 +1130,7 @@ impl<T: HasDependencies + HasTestEnv> HasIcDependencies for T {
     fn get_mainnet_ic_os_img_sha256(&self) -> Result<String> {
         let mainnet_version: String =
             self.read_dependency_to_string("testnet/mainnet_nns_revision.txt")?;
-        fetch_sha256(format!("http://download.proxy-global.dfinity.network:8080/ic/{mainnet_version}/guest-os/disk-img"), "disk-img.tar.zst")
+        fetch_sha256(format!("http://download.proxy-global.dfinity.network:8080/ic/{mainnet_version}/guest-os/disk-img"), "disk-img.tar.zst", self.test_env().logger())
     }
 
     fn get_mainnet_ic_os_update_img_url(&self) -> Result<Url> {
@@ -1100,7 +1142,7 @@ impl<T: HasDependencies + HasTestEnv> HasIcDependencies for T {
     fn get_mainnet_ic_os_update_img_sha256(&self) -> Result<String> {
         let mainnet_version: String =
             self.read_dependency_to_string("testnet/mainnet_nns_revision.txt")?;
-        fetch_sha256(format!("http://download.proxy-global.dfinity.network:8080/ic/{mainnet_version}/guest-os/update-img"), "update-img.tar.zst")
+        fetch_sha256(format!("http://download.proxy-global.dfinity.network:8080/ic/{mainnet_version}/guest-os/update-img"), "update-img.tar.zst", self.test_env().logger())
     }
 
     fn get_canister_http_test_ca_cert(&self) -> Result<String> {
@@ -1128,10 +1170,27 @@ impl<T: HasDependencies + HasTestEnv> HasIcDependencies for T {
     }
 }
 
-fn fetch_sha256(base_url: String, file: &str) -> Result<String> {
-    let sha256sums_url = format!("{base_url}/SHA256SUMS");
+pub const FETCH_SHA256SUMS_RETRY_TIMEOUT: Duration = Duration::from_secs(120);
+pub const FETCH_SHA256SUMS_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
-    let body = reqwest::blocking::get(sha256sums_url)?.text()?;
+fn fetch_sha256(base_url: String, file: &str, logger: Logger) -> Result<String> {
+    let response = retry(
+        logger.clone(),
+        FETCH_SHA256SUMS_RETRY_TIMEOUT,
+        FETCH_SHA256SUMS_RETRY_BACKOFF,
+        || reqwest::blocking::get(format!("{base_url}/SHA256SUMS")).map_err(|e| anyhow!("{:?}", e)),
+    )?;
+
+    if !response.status().is_success() {
+        error!(
+            logger,
+            "Failed to fetch sha256. Remote address: {:?}, Headers: {:?}",
+            response.remote_addr(),
+            response.headers()
+        );
+        return Err(anyhow!("Failed to fetch sha256"));
+    }
+    let body = response.text()?;
 
     // body should look like:
     // eb2bd3cc9db26427dcee039b0e696a4127c2466e2e487d8628c4a7b2d3ecdbd3 *disk-img.tar.gz
@@ -1162,23 +1221,33 @@ impl HasGroupSetup for TestEnv {
                 "Group {} already set up.", group_setup.infra_group_name
             );
         } else {
-            let group_setup = GroupSetup::new(group_base_name);
-            let farm_base_url = FarmBaseUrl::read_attribute(self);
-            let farm = Farm::new(farm_base_url.into(), self.logger());
-            let group_spec = GroupSpec {
-                vm_allocation: None,
-                required_host_features: vec![],
-                preferred_network: None,
-                metadata: None,
+            let group_setup = GroupSetup::new(group_base_name.clone());
+            match InfraProvider::read_attribute(self) {
+                InfraProvider::Farm => {
+                    let farm_base_url = FarmBaseUrl::read_attribute(self);
+                    let farm = Farm::new(farm_base_url.into(), self.logger());
+                    let group_spec = GroupSpec {
+                        vm_allocation: None,
+                        required_host_features: vec![],
+                        preferred_network: None,
+                        metadata: None,
+                    };
+                    farm.create_group(
+                        &group_setup.group_base_name,
+                        &group_setup.infra_group_name,
+                        group_setup.group_timeout,
+                        group_spec,
+                        self,
+                    )
+                    .unwrap();
+                }
+                InfraProvider::K8s => {
+                    let mut tnet =
+                        TNet::new(&group_base_name.replace('_', "-")).expect("new tnet failed");
+                    block_on(tnet.create()).expect("failed creating tnet");
+                    tnet.write_attribute(self);
+                }
             };
-            farm.create_group(
-                &group_setup.group_base_name,
-                &group_setup.infra_group_name,
-                group_setup.group_timeout,
-                group_spec,
-                self,
-            )
-            .unwrap();
             group_setup.write_attribute(self);
             self.ssh_keygen().expect("ssh key generation failed");
             emit_group_event(&log, &group_setup.infra_group_name);
@@ -1294,6 +1363,10 @@ impl<T: HasDependencies> HasWasm for T {
             wasm_bytes = wat::parse_bytes(&wasm_bytes)
                 .expect("Could not compile wat to wasm")
                 .to_vec();
+        }
+
+        if wasm_bytes.is_empty() {
+            panic!("WASM read from {:?} was empty", p.as_ref());
         }
 
         if !(wasm_bytes.starts_with(WASM_MAGIC_BYTES)
@@ -1791,7 +1864,10 @@ impl IcNodeContainer for SubnetSnapshot {
         let node_ids = self
             .local_registry
             .get_node_ids_on_subnet(self.subnet_id, registry_version)
-            .unwrap_result();
+            .unwrap_result(
+                registry_version,
+                &format!("node_ids_on_subnet(subnet_id={})", self.subnet_id),
+            );
 
         Box::new(
             node_ids
@@ -1827,32 +1903,45 @@ pub trait VmControl {
     fn start(&self);
 }
 
-pub struct FarmHostedVm {
+pub struct HostedVm {
     farm: Farm,
     group_name: String,
     vm_name: String,
+    k8s: bool,
 }
 
 /// VmControl enables a user to interact with VMs, i.e. change their state.
 /// All functions belonging to this trait crash if a respective operation is for any reason
 /// unsuccessful.
-impl VmControl for FarmHostedVm {
+impl VmControl for HostedVm {
     fn kill(&self) {
-        self.farm
-            .destroy_vm(&self.group_name, &self.vm_name)
-            .expect("could not kill VM")
+        if self.k8s {
+            block_on(delete_vm(&self.vm_name)).expect("could not kill VM");
+        } else {
+            self.farm
+                .destroy_vm(&self.group_name, &self.vm_name)
+                .expect("could not kill VM");
+        }
     }
 
     fn reboot(&self) {
-        self.farm
-            .reboot_vm(&self.group_name, &self.vm_name)
-            .expect("could not reboot VM")
+        if self.k8s {
+            block_on(restart_vm(&self.vm_name)).expect("could not reboot VM");
+        } else {
+            self.farm
+                .reboot_vm(&self.group_name, &self.vm_name)
+                .expect("could not reboot VM");
+        }
     }
 
     fn start(&self) {
-        self.farm
-            .start_vm(&self.group_name, &self.vm_name)
-            .expect("could not start VM")
+        if self.k8s {
+            block_on(start_vm(&self.vm_name)).expect("could not start VM");
+        } else {
+            self.farm
+                .start_vm(&self.group_name, &self.vm_name)
+                .expect("could not start VM");
+        }
     }
 }
 
@@ -1871,10 +1960,26 @@ where
         let pot_setup = GroupSetup::read_attribute(&env);
         let farm_base_url = env.get_farm_url().unwrap();
         let farm = Farm::new(farm_base_url, env.logger());
-        Box::new(FarmHostedVm {
+
+        let mut vm_name = self.vm_name();
+        let mut k8s = false;
+        if InfraProvider::read_attribute(&env) == InfraProvider::K8s {
+            k8s = true;
+            let tnet = TNet::read_attribute(&env);
+            let tnet_node = tnet
+                .nodes
+                .iter()
+                .find(|n| n.node_id.clone().expect("node_id missing") == vm_name.clone())
+                .expect("tnet doesn't have this node")
+                .clone();
+            vm_name = tnet_node.name.expect("nameless node");
+        }
+
+        Box::new(HostedVm {
             farm,
             group_name: pot_setup.infra_group_name,
-            vm_name: self.vm_name(),
+            vm_name,
+            k8s,
         })
     }
 }
@@ -1983,14 +2088,23 @@ pub fn secs(sec: u64) -> Duration {
 }
 
 impl<T> RegistryResultHelper<T> for RegistryClientResult<T> {
-    fn unwrap_result(self) -> T {
-        self.expect("registry error!")
-            .expect("registry value not present")
+    fn unwrap_result(self, registry_version: RegistryVersion, key_name: &str) -> T {
+        match self {
+            Ok(value) => value.unwrap_or_else(|| {
+                panic!(
+                    "registry (v.{}) does not have value for key `{}`",
+                    registry_version, key_name
+                )
+            }),
+            Err(err) => {
+                panic!("registry (v.{}) error: {}", registry_version, err)
+            }
+        }
     }
 }
 
 trait RegistryResultHelper<T> {
-    fn unwrap_result(self) -> T;
+    fn unwrap_result(self, registry_version: RegistryVersion, key_name: &str) -> T;
 }
 
 /// How many ICP should TEST_USER1 have after ICP ledger initialization.
@@ -2217,7 +2331,7 @@ pub fn emit_group_event(log: &slog::Logger, group: &str) {
     let event = log_events::LogEvent::new(
         INFRA_GROUP_CREATED_EVENT_NAME.to_string(),
         GroupName {
-            message: "Created new Farm group".to_string(),
+            message: "Created new InfraProvider group".to_string(),
             group: group.to_string(),
         },
     );

@@ -13,16 +13,16 @@ use ic_nns_constants::GOVERNANCE_CANISTER_ID;
 use ic_nns_governance::pb::v1::neuron::DissolveState;
 use ic_nns_governance::pb::v1::Neuron;
 use ic_rosetta_api::convert::{
-    from_hex, from_model_account_identifier, operations_to_requests, principal_id_from_public_key,
-    to_hex, to_model_account_identifier,
+    from_hex, from_model_account_identifier, operations_to_requests, to_hex,
+    to_model_account_identifier,
 };
 use ic_rosetta_api::errors::ApiError;
 use ic_rosetta_api::models::amount::{signed_amount, tokens_to_amount};
 use ic_rosetta_api::models::operation::OperationType;
+use ic_rosetta_api::models::SignedTransaction;
 use ic_rosetta_api::models::{
     ConstructionCombineResponse, ConstructionParseResponse, ConstructionPayloadsRequestMetadata,
-    ConstructionPayloadsResponse, CurveType, Error, PublicKey, RosettaSupportedKeyPair, Signature,
-    SignatureType,
+    ConstructionPayloadsResponse, CurveType, Error, PublicKey, Signature, SignatureType,
 };
 use ic_rosetta_api::models::{ConstructionSubmitResponse, Error as RosettaError};
 use ic_rosetta_api::request::request_result::RequestResult;
@@ -32,8 +32,8 @@ use ic_rosetta_api::request::Request;
 use ic_rosetta_api::request_types::ChangeAutoStakeMaturity;
 use ic_rosetta_api::request_types::RegisterVote;
 use ic_rosetta_api::request_types::{
-    AddHotKey, Disburse, Follow, MergeMaturity, NeuronInfo, RemoveHotKey, SetDissolveTimestamp,
-    Spawn, Stake, StakeMaturity, StartDissolve, StopDissolve,
+    AddHotKey, Disburse, Follow, ListNeurons, MergeMaturity, NeuronInfo, RemoveHotKey,
+    SetDissolveTimestamp, Spawn, Stake, StakeMaturity, StartDissolve, StopDissolve,
 };
 use ic_rosetta_api::transaction_id::TransactionIdentifier;
 use ic_rosetta_api::{convert, errors, DEFAULT_TOKEN_SYMBOL};
@@ -43,9 +43,12 @@ use icp_ledger::{AccountIdentifier, Operation};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{thread_rng, SeedableRng};
+use rosetta_core::convert::principal_id_from_public_key;
+use rosetta_core::models::RosettaSupportedKeyPair;
 use rosetta_core::objects::ObjectMap;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -150,7 +153,7 @@ where
     {
         Ok((submit_res, charged_fee)) => {
             let results = convert::from_transaction_operation_results(
-                submit_res.metadata,
+                submit_res.metadata.try_into().unwrap(),
                 DEFAULT_TOKEN_SYMBOL,
             )
             .expect("Couldn't convert metadata to TransactionResults");
@@ -204,7 +207,7 @@ where
     {
         Ok((submit_res, charged_fee)) => Ok((
             submit_res.transaction_identifier.into(),
-            submit_res.metadata,
+            submit_res.metadata.try_into().unwrap(),
             charged_fee,
         )),
         Err(e) => Err(e),
@@ -284,7 +287,7 @@ where
         .unwrap()?;
 
     let submit_res = ros
-        .construction_submit(signed.signed_transaction().unwrap())
+        .construction_submit(SignedTransaction::from_str(&signed.signed_transaction).unwrap())
         .await
         .unwrap()?;
 
@@ -295,18 +298,18 @@ where
 
     // check idempotency
     let submit_res2 = ros
-        .construction_submit(signed.signed_transaction().unwrap())
+        .construction_submit(SignedTransaction::from_str(&signed.signed_transaction).unwrap())
         .await
         .unwrap()?;
     assert_eq!(submit_res, submit_res2);
 
-    let mut txn = signed.signed_transaction().unwrap();
-    for (_, request) in txn.iter_mut() {
+    let mut txn = SignedTransaction::from_str(&signed.signed_transaction).unwrap();
+    for (_, request) in txn.requests.iter_mut() {
         *request = vec![request.last().unwrap().clone()];
     }
 
     let submit_res3 = ros
-        .construction_submit(signed.signed_transaction().unwrap())
+        .construction_submit(SignedTransaction::from_str(&signed.signed_transaction).unwrap())
         .await
         .unwrap()?;
     assert_eq!(submit_res, submit_res3);
@@ -335,7 +338,7 @@ where
         // first ask for the fee
         let mut fee_found = false;
         for o in Request::requests_to_operations(&[request.request.clone()], token_name).unwrap() {
-            if o._type.parse::<OperationType>().unwrap() == OperationType::Fee {
+            if o.type_.parse::<OperationType>().unwrap() == OperationType::Fee {
                 fee_found = true;
             } else {
                 dry_run_ops.push(o.clone());
@@ -370,6 +373,7 @@ where
             | Request::MergeMaturity(MergeMaturity { account, .. })
             | Request::StakeMaturity(StakeMaturity { account, .. })
             | Request::NeuronInfo(NeuronInfo { account, .. })
+            | Request::ListNeurons(ListNeurons { account, .. })
             | Request::Follow(Follow { account, .. }) => {
                 all_sender_account_ids.push(to_model_account_identifier(&account));
             }
@@ -402,7 +406,10 @@ where
     );
 
     let metadata_res = ros
-        .construction_metadata(pre_res.options, Some(all_sender_pks.clone()))
+        .construction_metadata(
+            Some(pre_res.options.try_into().unwrap()),
+            Some(all_sender_pks.clone()),
+        )
         .await
         .unwrap()?;
     let dry_run_suggested_fee = metadata_res.suggested_fee.map(|mut suggested_fee| {
@@ -420,7 +427,7 @@ where
 
     if accept_suggested_fee {
         for o in &mut all_ops {
-            if o._type.parse::<OperationType>().unwrap() == OperationType::Fee {
+            if o.type_.parse::<OperationType>().unwrap() == OperationType::Fee {
                 o.amount = Some(signed_amount(-(fee_icpts.get_e8s() as i128), token_name));
             }
         }
@@ -443,7 +450,10 @@ where
         "Preprocess should report that sender's pk is required"
     );
     let metadata_res = ros
-        .construction_metadata(pre_res.options, Some(all_sender_pks.clone()))
+        .construction_metadata(
+            Some(pre_res.options.try_into().unwrap()),
+            Some(all_sender_pks.clone()),
+        )
         .await
         .unwrap()?;
     let suggested_fee = metadata_res.suggested_fee.clone().map(|mut suggested_fee| {
@@ -453,13 +463,13 @@ where
 
     // The fee reported here should be the same as the one we got from dry run
     assert_eq!(suggested_fee, dry_run_suggested_fee);
-
+    let metadata = ConstructionPayloadsRequestMetadata::try_from(metadata_res.metadata)?;
     ros.construction_payloads(
         Some(ConstructionPayloadsRequestMetadata {
             memo: Some(0),
             ingress_end,
             created_at_time,
-            ..metadata_res.metadata
+            ..metadata
         }),
         all_ops,
         Some(all_sender_pks),
@@ -700,7 +710,7 @@ pub fn create_neuron(
 }
 
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NeuronDetails {
     pub(crate) account_id: AccountIdentifier,
     pub(crate) key_pair: EdKeypair,

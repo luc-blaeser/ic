@@ -23,49 +23,46 @@ use ic_registry_subnet_type::SubnetType;
 use ic_sns_wasm::pb::v1::{
     GetSnsSubnetIdsRequest, GetSnsSubnetIdsResponse, UpdateSnsSubnetListRequest,
 };
-use ic_tests::driver::boundary_node::BoundaryNodeVm;
-use ic_tests::driver::constants::SSH_USERNAME;
-use ic_tests::driver::driver_setup::SSH_AUTHORIZED_PRIV_KEYS_DIR;
-use ic_tests::driver::universal_vm::DeployedUniversalVm;
-use ic_tests::driver::universal_vm::UniversalVm;
-use ic_tests::driver::{
-    boundary_node::BoundaryNode,
-    ic::{AmountOfMemoryKiB, ImageSizeGiB, InternetComputer, NrOfVCPUs, Subnet, VmResources},
-    prometheus_vm::{HasPrometheus, PrometheusVm},
-    test_env::{HasIcPrepDir, TestEnv, TestEnvAttribute},
-    test_env_api::{
-        retry, HasDependencies, HasIcDependencies, HasPublicApiUrl, HasTopologySnapshot,
-        IcNodeContainer, IcNodeSnapshot, NnsCanisterWasmStrategy, NnsCustomizations, SshSession,
-        TopologySnapshot,
+use ic_tests::{
+    driver::{
+        boundary_node::{BoundaryNode, BoundaryNodeVm},
+        constants::SSH_USERNAME,
+        driver_setup::SSH_AUTHORIZED_PRIV_KEYS_DIR,
+        ic::{AmountOfMemoryKiB, ImageSizeGiB, InternetComputer, NrOfVCPUs, Subnet, VmResources},
+        prometheus_vm::{HasPrometheus, PrometheusVm},
+        test_env::{HasIcPrepDir, TestEnv, TestEnvAttribute},
+        test_env_api::{
+            retry, HasDependencies, HasIcDependencies, HasPublicApiUrl, HasTopologySnapshot,
+            IcNodeContainer, IcNodeSnapshot, NnsCanisterWasmStrategy, NnsCustomizations,
+            SshSession, TopologySnapshot,
+        },
+        universal_vm::{DeployedUniversalVm, UniversalVm, UniversalVms},
     },
-    universal_vm::UniversalVms,
+    nns::{
+        await_proposal_execution, get_canister, get_governance_canister,
+        submit_update_elected_replica_versions_proposal, vote_execute_proposal_assert_executed,
+    },
+    orchestrator::utils::{
+        rw_message::install_nns_with_customizations_and_check_progress,
+        subnet_recovery::set_sandbox_env_vars,
+    },
+    util::{block_on, runtime_from_url},
 };
-use ic_tests::nns::{await_proposal_execution, get_canister};
-use ic_tests::nns::{
-    get_governance_canister, submit_update_elected_replica_versions_proposal,
-    vote_execute_proposal_assert_executed,
-};
-use ic_tests::orchestrator::utils::rw_message::install_nns_with_customizations_and_check_progress;
-use ic_tests::orchestrator::utils::subnet_recovery::set_sandbox_env_vars;
-use ic_tests::util::{block_on, runtime_from_url};
 use ic_types::{CanisterId, NodeId, PrincipalId, ReplicaVersion, SubnetId};
 use icp_ledger::AccountIdentifier;
 use serde::{Deserialize, Serialize};
 use slog::{info, Logger};
-use std::fs;
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::Cursor;
-use std::io::Read;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
-use std::path::PathBuf;
-use std::process::{Command, Output};
-use std::str::FromStr;
-use std::sync::mpsc;
-use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::{
+    fs,
+    fs::{File, OpenOptions},
+    io::{Cursor, Read, Write},
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+    process::{Command, Output},
+    str::FromStr,
+    sync::{mpsc, mpsc::Receiver},
+    time::Duration,
+};
 use url::Url;
 
 pub const OVERALL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -195,7 +192,7 @@ pub fn setup(env: TestEnv) {
         .unwrap_or_else(|e| std::panic::resume_unwind(e));
 
     prometheus_thread.join().unwrap();
-    env.sync_with_prometheus_by_name(RECOVERED_NNS);
+    env.sync_with_prometheus_by_name(RECOVERED_NNS, None);
 }
 
 fn setup_recovered_nns(
@@ -1306,7 +1303,7 @@ fn create_cycles_wallet(
 ) -> CanisterId {
     let logger = env.logger();
     let wallet_canister_id =
-        create_canister_from_icp(env.clone(), recovered_nns_node, principal, 10000);
+        create_canister_from_icp(env.clone(), recovered_nns_node, principal, 1000);
     info!(logger, "WALLET_CANISTER = {wallet_canister_id}");
     let dfx_path: PathBuf = env.clone().get_dependency_path("external/dfx/dfx");
     let home = env.base_path();
@@ -1419,6 +1416,8 @@ fn write_sh_lib(
     let sns_quill =
         fs::canonicalize(env.get_dependency_path("external/sns_quill/sns-quill")).unwrap();
     let idl2json = fs::canonicalize(env.get_dependency_path("external/idl2json/idl2json")).unwrap();
+    let ic_wasm =
+        fs::canonicalize(env.get_dependency_path("rs/tests/recovery/binaries/ic-wasm")).unwrap();
     let dfx_home = fs::canonicalize(env.base_path()).unwrap();
     let didc_dir = fs::canonicalize(env.get_dependency_path("external/candid"))
         .unwrap()
@@ -1442,6 +1441,7 @@ fn write_sh_lib(
              export SNS_QUILL={sns_quill:?};\n\
              export IDL2JSON={idl2json:?};\n\
              export DFX_HOME={dfx_home:?};\n\
+             export IC_WASM={ic_wasm:?};\n\
              export PATH=\"{didc_dir}:{dfx_dir}:$PATH\";\n\
             "
         ),

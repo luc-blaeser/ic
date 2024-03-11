@@ -14,7 +14,6 @@ use ic_replicated_state::{
     metadata_state::StreamMap, testing::ReplicatedStateTesting, ReplicatedState, Stream,
 };
 use ic_test_utilities::{
-    mock_time,
     state_manager::FakeStateManager,
     types::{
         ids::{
@@ -27,6 +26,7 @@ use ic_test_utilities::{
 use ic_test_utilities_registry::test_subnet_record;
 use ic_types::{
     messages::CallbackId,
+    time::UNIX_EPOCH,
     xnet::{CertifiedStreamSlice, StreamIndex, StreamIndexedQueue},
     Height, NumBytes, RegistryVersion, SubnetId,
 };
@@ -223,7 +223,7 @@ pub(crate) fn generate_stream(config: &StreamConfig) -> Stream {
 /// Generates a `ValidationContext` at `REGISTRY_VERSION` and
 /// `CERTIFIED_HEIGHT`.
 pub(crate) fn get_validation_context_for_test() -> ValidationContext {
-    let time = mock_time();
+    let time = UNIX_EPOCH;
     ValidationContext {
         registry_version: REGISTRY_VERSION,
         certified_height: CERTIFIED_HEIGHT,

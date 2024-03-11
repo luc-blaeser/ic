@@ -31,7 +31,7 @@ use ic_interfaces_state_manager::{StateManager, StateManagerError};
 use ic_logger::{error, info, log, warn, ReplicaLogger};
 use ic_metrics::{
     buckets::{decimal_buckets, decimal_buckets_with_zero},
-    MetricsRegistry, Timer,
+    MetricsRegistry,
 };
 use ic_protobuf::messaging::xnet::v1 as pb;
 use ic_protobuf::proxy::{ProtoProxy, ProxyDecodeError};
@@ -203,10 +203,10 @@ impl XNetPayloadBuilderMetrics {
     }
 
     /// Records the status and duration of a `get_xnet_payload()` call.
-    fn observe_build_duration(&self, status: &str, timer: Timer) {
+    fn observe_build_duration(&self, status: &str, since: Instant) {
         self.build_payload_duration
             .with_label_values(&[status])
-            .observe(timer.elapsed());
+            .observe(since.elapsed().as_secs_f64());
     }
 
     /// Increments the `pull_attempt_count` counter for the given status.
@@ -215,17 +215,17 @@ impl XNetPayloadBuilderMetrics {
     }
 
     /// Observes the elapsed `query_slice_duration` under the given status.
-    fn observe_query_slice_duration(&self, status: &str, proximity: &str, timer: Timer) {
+    fn observe_query_slice_duration(&self, status: &str, proximity: &str, since: Instant) {
         self.query_slice_duration
             .with_label_values(&[status, proximity])
-            .observe(timer.elapsed());
+            .observe(since.elapsed().as_secs_f64());
     }
 
     /// Records the status and duration of a `validate_xnet_payload()` call.
-    fn observe_validate_duration(&self, status: &str, timer: Timer) {
+    fn observe_validate_duration(&self, status: &str, since: Instant) {
         self.validate_payload_duration
             .with_label_values(&[status])
-            .observe(timer.elapsed());
+            .observe(since.elapsed().as_secs_f64());
     }
 }
 
@@ -432,10 +432,10 @@ impl XNetPayloadBuilderImpl {
                     return ExpectedIndices {
                         message_index: messages.end(),
                         signal_index: most_recent_signal_index
-                            .unwrap_or_else(|| slice.header().signals_end),
+                            .unwrap_or_else(|| slice.header().signals_end()),
                     };
                 }
-                most_recent_signal_index.get_or_insert_with(|| slice.header().signals_end);
+                most_recent_signal_index.get_or_insert_with(|| slice.header().signals_end());
             }
         }
 
@@ -619,13 +619,13 @@ impl XNetPayloadBuilderImpl {
         };
 
         // Valid stream message bounds.
-        if slice.header().begin > slice.header().end {
+        if slice.header().begin() > slice.header().end() {
             warn!(
                 self.log,
                 "Stream from {}: begin index ({}) after end index ({})",
                 subnet_id,
-                slice.header().begin,
-                slice.header().end
+                slice.header().begin(),
+                slice.header().end()
             );
             return SliceValidationResult::Invalid(format!(
                 "Invalid stream bounds in stream from {}",
@@ -635,16 +635,16 @@ impl XNetPayloadBuilderImpl {
 
         // Expected message index within stream message bounds (always present in the
         // header, even for empty slices).
-        if expected.message_index < slice.header().begin
-            || slice.header().end < expected.message_index
+        if expected.message_index < slice.header().begin()
+            || slice.header().end() < expected.message_index
         {
             warn!(
                 self.log,
                 "Stream from {}: expecting message {}, outside of stream bounds [{}, {})",
                 subnet_id,
                 expected.message_index,
-                slice.header().begin,
-                slice.header().end
+                slice.header().begin(),
+                slice.header().end()
             );
             return SliceValidationResult::Invalid(format!(
                 "Unexpected messages in stream from {}",
@@ -652,7 +652,7 @@ impl XNetPayloadBuilderImpl {
             ));
         }
 
-        if slice.messages().is_none() && slice.header().signals_end == expected.signal_index {
+        if slice.messages().is_none() && slice.header().signals_end() == expected.signal_index {
             // Empty slice: no messages and no additional signals (in addition to what we
             // have in state and any intervening payloads). Not actually invalid, but
             // we don't want it in a payload.
@@ -661,15 +661,15 @@ impl XNetPayloadBuilderImpl {
 
         if let Some(messages) = slice.messages() {
             // Messages in slice within stream message bounds.
-            if messages.begin() < slice.header().begin || messages.end() > slice.header().end {
+            if messages.begin() < slice.header().begin() || messages.end() > slice.header().end() {
                 warn!(
                     self.log,
                     "Stream from {}: slice bounds [{}, {}) outside of stream bounds [{}, {})",
                     subnet_id,
                     messages.begin(),
                     messages.end(),
-                    slice.header().begin,
-                    slice.header().end
+                    slice.header().begin(),
+                    slice.header().end()
                 );
                 return SliceValidationResult::Invalid(format!(
                     "Invalid slice bounds in stream from {}",
@@ -733,8 +733,8 @@ impl XNetPayloadBuilderImpl {
         // message).
         match self.validate_signals(
             subnet_id,
-            slice.header().signals_end,
-            &slice.header().reject_signals,
+            slice.header().signals_end(),
+            slice.header().reject_signals(),
             expected.signal_index,
             state,
         ) {
@@ -751,7 +751,7 @@ impl XNetPayloadBuilderImpl {
                         .messages()
                         .map(|messages| messages.end())
                         .unwrap_or(expected.message_index),
-                    signals_end: slice.header().signals_end,
+                    signals_end: slice.header().signals_end(),
                     byte_size,
                 }
             }
@@ -1018,18 +1018,18 @@ impl XNetPayloadBuilder for XNetPayloadBuilderImpl {
         past_payloads: &[&XNetPayload],
         byte_limit: NumBytes,
     ) -> (XNetPayload, NumBytes) {
-        let timer = Timer::start();
+        let since = Instant::now();
         let payload =
             match self.get_xnet_payload_impl(validation_context, past_payloads, byte_limit) {
                 Ok((payload, byte_size)) => {
-                    self.metrics.observe_build_duration(STATUS_SUCCESS, timer);
+                    self.metrics.observe_build_duration(STATUS_SUCCESS, since);
                     (payload, byte_size)
                 }
 
                 Err(e) => {
                     log!(self.log, e.log_level(), "{}", e);
                     self.metrics
-                        .observe_build_duration(e.to_label_value(), timer);
+                        .observe_build_duration(e.to_label_value(), since);
 
                     (XNetPayload::default(), 0.into())
                 }
@@ -1048,7 +1048,7 @@ impl XNetPayloadBuilder for XNetPayloadBuilderImpl {
         validation_context: &ValidationContext,
         past_payloads: &[&XNetPayload],
     ) -> Result<NumBytes, XNetPayloadValidationError> {
-        let timer = Timer::start();
+        let since = Instant::now();
         let state = match self
             .state_manager
             .get_state_at(validation_context.certified_height)
@@ -1056,7 +1056,7 @@ impl XNetPayloadBuilder for XNetPayloadBuilderImpl {
             Ok(state) => state.take(),
             Err(err) => {
                 self.metrics
-                    .observe_validate_duration(VALIDATION_STATUS_ERROR, timer);
+                    .observe_validate_duration(VALIDATION_STATUS_ERROR, since);
                 return Err(from_state_manager_error(err));
             }
         };
@@ -1075,14 +1075,14 @@ impl XNetPayloadBuilder for XNetPayloadBuilderImpl {
             ) {
                 SliceValidationResult::Invalid(reason) => {
                     self.metrics
-                        .observe_validate_duration(VALIDATION_STATUS_INVALID, timer);
+                        .observe_validate_duration(VALIDATION_STATUS_INVALID, since);
                     return Err(ValidationError::Permanent(
                         InvalidXNetPayload::InvalidSlice(reason),
                     ));
                 }
                 SliceValidationResult::Empty => {
                     self.metrics
-                        .observe_validate_duration(VALIDATION_STATUS_EMPTY_SLICE, timer);
+                        .observe_validate_duration(VALIDATION_STATUS_EMPTY_SLICE, since);
                     return Err(ValidationError::Permanent(
                         InvalidXNetPayload::InvalidSlice("Empty slice".to_string()),
                     ));
@@ -1116,7 +1116,7 @@ impl XNetPayloadBuilder for XNetPayloadBuilderImpl {
         self.refill_task_handle.trigger_refill();
 
         self.metrics
-            .observe_validate_duration(VALIDATION_STATUS_VALID, timer);
+            .observe_validate_duration(VALIDATION_STATUS_VALID, since);
         Ok(NumBytes::new(payload_byte_size as u64))
     }
 }
@@ -1289,7 +1289,7 @@ impl PoolRefillTask {
             let pool = Arc::clone(&self.pool);
             let log = self.log.clone();
             self.runtime_handle.spawn(async move {
-                let timer = Timer::start();
+                let since = Instant::now();
                 metrics.outstanding_queries.inc();
                 let query_result = xnet_client.query(&endpoint_locator).await;
                 metrics.outstanding_queries.dec();
@@ -1309,12 +1309,12 @@ impl PoolRefillTask {
                             Err(e) => e.to_label_value(),
                         };
 
-                        metrics.observe_query_slice_duration(status, proximity, timer);
+                        metrics.observe_query_slice_duration(status, proximity, since);
                         metrics.observe_pull_attempt(status);
                     }
 
                     Err(e) => {
-                        metrics.observe_query_slice_duration(&e.to_label_value(), proximity, timer);
+                        metrics.observe_query_slice_duration(&e.to_label_value(), proximity, since);
                         metrics.observe_pull_attempt(&e.to_label_value());
                         if let XNetClientError::NoContent = e {
                         } else if Self::pass_log_sampling() {

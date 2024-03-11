@@ -1,12 +1,10 @@
 use super::*;
 
 use crate::pb::v1::Vote;
+use ic_base_types::PrincipalId;
 use ic_nns_common::pb::v1::ProposalId;
 use lazy_static::lazy_static;
 use pretty_assertions::assert_eq;
-
-// TODO(NNS1-2497): Add tests that fail if our BoundedStorage types grow. This
-// way, people are very aware of how they might be eating into our headroom.
 
 lazy_static! {
     static ref MODEL_NEURON: Neuron = Neuron {
@@ -208,10 +206,10 @@ fn test_store_simplest_nontrivial_case() {
     // Derive neuron_5 from neuron_1 by adding entries to collections (to make
     // sure the updating collections works).
     let neuron_5 = {
-        let mut hot_keys = neuron_1.hot_keys;
+        let mut hot_keys = neuron_1.hot_keys.clone();
         hot_keys.push(PrincipalId::new_user_test_id(102));
 
-        let mut followees = neuron_1.followees;
+        let mut followees = neuron_1.followees.clone();
         assert_eq!(
             followees.insert(
                 7,
@@ -222,16 +220,16 @@ fn test_store_simplest_nontrivial_case() {
             None,
         );
 
-        let mut recent_ballots = neuron_1.recent_ballots;
+        let mut recent_ballots = neuron_1.recent_ballots.clone();
         recent_ballots.push(BallotInfo {
             proposal_id: Some(ProposalId { id: 303 }),
             vote: Vote::Yes as i32,
         });
 
-        let mut known_neuron_data = neuron_1.known_neuron_data;
+        let mut known_neuron_data = neuron_1.known_neuron_data.clone();
         known_neuron_data.as_mut().unwrap().name = "I changed my mind".to_string();
 
-        let mut transfer = neuron_1.transfer;
+        let mut transfer = neuron_1.transfer.clone();
         transfer.as_mut().unwrap().memo = 405_405;
 
         Neuron {
@@ -244,21 +242,22 @@ fn test_store_simplest_nontrivial_case() {
             known_neuron_data,
             transfer,
 
-            ..neuron_1
+            ..neuron_1.clone()
         }
     };
-    assert_eq!(store.update(neuron_5.clone()), Ok(()));
+    assert_eq!(store.update(&neuron_1, neuron_5.clone()), Ok(()));
     assert_that_red_herring_neurons_are_untouched(&store);
 
     // 6. Read to verify update.
     assert_eq!(store.read(NeuronId { id: 42 }), Ok(neuron_5.clone()));
 
     // 7. Bad update: Neuron not found (unknown ID).
-    let update_result = store.update(Neuron {
+    let non_existent_neuron = Neuron {
         id: Some(NeuronId { id: 0xDEAD_BEEF }),
         cached_neuron_stake_e8s: 0xBAD_F00D,
         ..Default::default()
-    });
+    };
+    let update_result = store.update(&non_existent_neuron, non_existent_neuron.clone());
     match &update_result {
         // This is what we expected.
         Err(err) => match err {
@@ -294,9 +293,9 @@ fn test_store_simplest_nontrivial_case() {
     let neuron_9 = Neuron {
         known_neuron_data: None,
         transfer: None,
-        ..neuron_5
+        ..neuron_5.clone()
     };
-    assert_eq!(store.update(neuron_9.clone()), Ok(()));
+    assert_eq!(store.update(&neuron_5, neuron_9.clone()), Ok(()));
     assert_that_red_herring_neurons_are_untouched(&store);
 
     // 10. Read to verify second update.
@@ -351,8 +350,8 @@ fn test_store_simplest_nontrivial_case() {
         key_value_to_neuron_id: impl Fn(Key, Value) -> NeuronId,
         bad_neuron_id: NeuronId,
     ) where
-        Key: BoundedStorable + Ord + Copy + std::fmt::Debug,
-        Value: BoundedStorable + Clone + std::fmt::Debug,
+        Key: Storable + Ord + Copy + std::fmt::Debug,
+        Value: Storable + Clone + std::fmt::Debug,
         Memory: ic_stable_structures::Memory,
     {
         for (key, value) in map.iter() {
@@ -375,32 +374,119 @@ fn test_store_simplest_nontrivial_case() {
     assert_no_zombie_references_in(
         "hot_keys",
         &store.hot_keys_map,
-        |key, _| NeuronId { id: key.0 },
+        |key, _| key.0,
         original_neuron_id,
     );
     assert_no_zombie_references_in(
         "recent_ballots",
         &store.recent_ballots_map,
-        |key, _| NeuronId { id: key.0 },
+        |key, _| key.0,
         original_neuron_id,
     );
     assert_no_zombie_references_in(
         "followees",
         &store.followees_map,
-        |_, followee_id| NeuronId { id: followee_id },
+        |_, followee_id| followee_id,
         original_neuron_id,
     );
 
     assert_no_zombie_references_in(
         "known_neuron_data",
         &store.known_neuron_data_map,
-        |key, _| NeuronId { id: key },
+        |key, _| key,
         original_neuron_id,
     );
     assert_no_zombie_references_in(
         "transfer",
         &store.transfer_map,
-        |key, _| NeuronId { id: key },
+        |key, _| key,
         original_neuron_id,
     );
+}
+
+#[test]
+fn test_store_as_neuron_deserialized_as_abridged() {
+    // Step 1: Prepare a neuron and get its serialized bytes.
+    let neuron = Neuron {
+        id: Some(NeuronId { id: 1 }),
+        account: vec![u8::MAX; 32],
+        controller: Some(PrincipalId::new_user_test_id(1)),
+        cached_neuron_stake_e8s: 1,
+        neuron_fees_e8s: 2,
+        created_timestamp_seconds: 3,
+        aging_since_timestamp_seconds: 4,
+        spawn_at_timestamp_seconds: Some(5),
+        kyc_verified: false,
+        maturity_e8s_equivalent: 6,
+        staked_maturity_e8s_equivalent: Some(7),
+        auto_stake_maturity: Some(true),
+        not_for_profit: true,
+        joined_community_fund_timestamp_seconds: Some(8),
+        neuron_type: Some(9),
+        dissolve_state: Some(NeuronDissolveState::WhenDissolvedTimestampSeconds(10)),
+        ..Default::default()
+    };
+    let serialized = neuron.encode_to_vec();
+
+    // Step 2: Deserialize as abridged neuron.
+    let abridged = AbridgedNeuron::decode(&serialized[..]).unwrap();
+
+    // Step 3: Verify the abridged neuron has the same fields.
+    assert_eq!(
+        abridged,
+        AbridgedNeuron {
+            account: vec![u8::MAX; 32],
+            controller: Some(PrincipalId::new_user_test_id(1)),
+            cached_neuron_stake_e8s: 1,
+            neuron_fees_e8s: 2,
+            created_timestamp_seconds: 3,
+            aging_since_timestamp_seconds: 4,
+            spawn_at_timestamp_seconds: Some(5),
+            kyc_verified: false,
+            maturity_e8s_equivalent: 6,
+            staked_maturity_e8s_equivalent: Some(7),
+            auto_stake_maturity: Some(true),
+            not_for_profit: true,
+            joined_community_fund_timestamp_seconds: Some(8),
+            neuron_type: Some(9),
+            dissolve_state: Some(AbridgedNeuronDissolveState::WhenDissolvedTimestampSeconds(
+                10
+            )),
+        }
+    );
+}
+
+#[test]
+fn test_abridged_neuron_size() {
+    // All VARINT encoded fields (e.g. int32, uint64, ..., as opposed to fixed32/fixed64) have
+    // larger serialized size for larger numbers (10 bytes for u64::MAX as uint64, while 1 byte for
+    // 0u64). Therefore, we make the numbers below as large as possible even though they aren't
+    // realistic.
+    let abridged_neuron = AbridgedNeuron {
+        account: vec![u8::MAX; 32],
+        controller: Some(PrincipalId::new(
+            PrincipalId::MAX_LENGTH_IN_BYTES,
+            [u8::MAX; PrincipalId::MAX_LENGTH_IN_BYTES],
+        )),
+        cached_neuron_stake_e8s: u64::MAX,
+        neuron_fees_e8s: u64::MAX,
+        created_timestamp_seconds: u64::MAX,
+        aging_since_timestamp_seconds: u64::MAX,
+        spawn_at_timestamp_seconds: Some(u64::MAX),
+        kyc_verified: true,
+        maturity_e8s_equivalent: u64::MAX,
+        staked_maturity_e8s_equivalent: Some(u64::MAX),
+        auto_stake_maturity: Some(true),
+        not_for_profit: true,
+        joined_community_fund_timestamp_seconds: Some(u64::MAX),
+        neuron_type: Some(i32::MAX),
+        dissolve_state: Some(AbridgedNeuronDissolveState::WhenDissolvedTimestampSeconds(
+            u64::MAX,
+        )),
+    };
+
+    assert!(abridged_neuron.encoded_len() as u32 <= AbridgedNeuron::BOUND.max_size());
+    // This size can be updated. This assertion is created so that we are aware of the available
+    // headroom.
+    assert_eq!(abridged_neuron.encoded_len(), 184);
 }

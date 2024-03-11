@@ -29,27 +29,31 @@
 //!
 //!
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fmt::Debug,
+    future::Future,
     net::SocketAddr,
     sync::{Arc, RwLock},
 };
 
+use anyhow::anyhow;
 use async_trait::async_trait;
-use axum::Router;
+use axum::{
+    http::{Request, Response},
+    Router,
+};
 use bytes::Bytes;
 use either::Either;
-use http::{Request, Response};
-use ic_base_types::NodeId;
+use ic_base_types::{NodeId, RegistryVersion};
 use ic_crypto_tls_interfaces::{TlsConfig, TlsStream};
 use ic_icos_sev::ValidateAttestedStream;
 use ic_interfaces_registry::RegistryClient;
 use ic_logger::{info, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
-use ic_peer_manager::SubnetTopology;
 use phantom_newtype::AmountOf;
 use quinn::AsyncUdpSocket;
-use thiserror::Error;
+use tokio::sync::watch;
+use tokio_util::{sync::CancellationToken, task::task_tracker::TaskTracker};
 
 use crate::connection_handle::ConnectionHandle;
 use crate::connection_manager::start_connection_manager;
@@ -61,20 +65,60 @@ mod request_handler;
 mod utils;
 
 #[derive(Clone)]
-pub struct QuicTransport(Arc<RwLock<HashMap<NodeId, ConnectionHandle>>>);
+pub struct Shutdown {
+    rt_handle: tokio::runtime::Handle,
+    cancellation: CancellationToken,
+    task_tracker: TaskTracker,
+}
 
+impl Shutdown {
+    pub fn new(rt_handle: tokio::runtime::Handle) -> Self {
+        Self {
+            rt_handle,
+            cancellation: CancellationToken::new(),
+            task_tracker: TaskTracker::new(),
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        let _ = self.task_tracker.close();
+        // If an error is returned it means the conn manager is already stopped.
+        self.cancellation.cancel();
+        self.task_tracker.wait().await;
+    }
+
+    pub fn spawn_on_with_cancellation<F>(&self, run: impl FnOnce(CancellationToken) -> F)
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.task_tracker
+            .spawn_on(run(self.cancellation.clone()), &self.rt_handle);
+        // no need to return the join handle because it is already managed by the task tracker
+    }
+}
+
+#[derive(Clone)]
+pub struct QuicTransport {
+    conn_handles: Arc<RwLock<HashMap<NodeId, ConnectionHandle>>>,
+    shutdown: Shutdown,
+}
+
+/// This is the main transport handle used for communication between peers.
+/// The handler can safely be shared across threads and tasks.
+///
+/// Instead of the common `connect` and `disconnect`` methods the implementation
+/// listens for changes of the topology using a watcher.
+/// (The watcher matches better the semantics of peer discovery in the IC).
+///
+/// This enables complete separation between peer discovery and the core P2P
+/// protocols that use `QuicTransport`.
+/// For example, "P2P for consensus" implements a generic replication protocol which is
+/// agnostic to the subnet membership logic required by the consensus algorithm.
+/// This makes "P2P for consensus" a generic implementation that potentially can be used
+/// not only by the consensus protocol of the IC.
 impl QuicTransport {
-    /// This is the entry point for creating and starting the quic transport.
-    ///
-    /// Instead of the common `connect` and `disconnect`` methods the implementation
-    /// listens for changes of the topology using a watcher.
-    ///
-    /// This allows is to have complete separation between peer discovery and the core P2P
-    /// protocols that use `QuicTransport`.
-    /// For example, "P2P for consensus" implements a generic replication protocol which is
-    /// agnostic to the subnet membership logic required by the consensus algorithm.
-    /// This makes "P2P for consensus" a generic implementation that potentially can be used
-    /// not only by the consensus protocol of the IC.
+    /// This is the entry point for creating (e.g. binding) and starting the quic transport.
     pub fn start(
         log: &ReplicaLogger,
         metrics_registry: &MetricsRegistry,
@@ -83,16 +127,18 @@ impl QuicTransport {
         registry_client: Arc<dyn RegistryClient>,
         sev_handshake: Arc<dyn ValidateAttestedStream<Box<dyn TlsStream>> + Send + Sync>,
         node_id: NodeId,
-        topology_watcher: tokio::sync::watch::Receiver<SubnetTopology>,
+        // The receiver is passed here mainly to be consistent with other managers that also
+        // require receivers on construction.
+        topology_watcher: watch::Receiver<SubnetTopology>,
         udp_socket: Either<SocketAddr, impl AsyncUdpSocket>,
         // Make sure this is respected https://docs.rs/axum/latest/axum/struct.Router.html#a-note-about-performance
         router: Router,
     ) -> QuicTransport {
         info!(log, "Starting Quic transport.");
 
-        let peer_map = Arc::new(RwLock::new(HashMap::new()));
+        let conn_handles = Arc::new(RwLock::new(HashMap::new()));
 
-        start_connection_manager(
+        let shutdown = start_connection_manager(
             log,
             metrics_registry,
             rt,
@@ -100,24 +146,33 @@ impl QuicTransport {
             registry_client,
             sev_handshake,
             node_id,
-            peer_map.clone(),
+            conn_handles.clone(),
             topology_watcher,
             udp_socket,
             router,
         );
 
-        QuicTransport(peer_map)
+        QuicTransport {
+            conn_handles,
+            shutdown,
+        }
     }
 
-    pub(crate) fn get_conn_handle(&self, peer_id: &NodeId) -> Result<ConnectionHandle, SendError> {
+    /// Graceful shutdown of transport
+    pub async fn shutdown(&self) {
+        self.shutdown.shutdown().await;
+    }
+
+    pub(crate) fn get_conn_handle(
+        &self,
+        peer_id: &NodeId,
+    ) -> Result<ConnectionHandle, anyhow::Error> {
         let conn = self
-            .0
+            .conn_handles
             .read()
             .unwrap()
             .get(peer_id)
-            .ok_or(SendError::ConnectionNotFound {
-                reason: "Currently not connected to this peer".to_string(),
-            })?
+            .ok_or(anyhow!("Currently not connected to this peer"))?
             .clone();
         Ok(conn)
     }
@@ -129,18 +184,18 @@ impl Transport for QuicTransport {
         &self,
         peer_id: &NodeId,
         request: Request<Bytes>,
-    ) -> Result<Response<Bytes>, SendError> {
+    ) -> Result<Response<Bytes>, anyhow::Error> {
         let peer = self.get_conn_handle(peer_id)?;
         peer.rpc(request).await
     }
 
-    async fn push(&self, peer_id: &NodeId, request: Request<Bytes>) -> Result<(), SendError> {
+    async fn push(&self, peer_id: &NodeId, request: Request<Bytes>) -> Result<(), anyhow::Error> {
         let peer = self.get_conn_handle(peer_id)?;
         peer.push(request).await
     }
 
     fn peers(&self) -> Vec<(NodeId, ConnId)> {
-        self.0
+        self.conn_handles
             .read()
             .unwrap()
             .iter()
@@ -149,25 +204,15 @@ impl Transport for QuicTransport {
     }
 }
 
-#[derive(Debug, Error)]
-pub enum SendError {
-    #[error("No connection to peer: {reason:?}")]
-    ConnectionNotFound { reason: String },
-    #[error("Sending a request failed: `{reason:?}")]
-    SendRequestFailed { reason: String },
-    #[error("Receiving a response failed: {reason:?}")]
-    RecvResponseFailed { reason: String },
-}
-
 #[async_trait]
 pub trait Transport: Send + Sync {
     async fn rpc(
         &self,
         peer_id: &NodeId,
         request: Request<Bytes>,
-    ) -> Result<Response<Bytes>, SendError>;
+    ) -> Result<Response<Bytes>, anyhow::Error>;
 
-    async fn push(&self, peer_id: &NodeId, request: Request<Bytes>) -> Result<(), SendError>;
+    async fn push(&self, peer_id: &NodeId, request: Request<Bytes>) -> Result<(), anyhow::Error>;
 
     fn peers(&self) -> Vec<(NodeId, ConnId)>;
 }
@@ -205,5 +250,51 @@ impl AsyncUdpSocket for DummyUdpSocket {
     }
     fn may_fragment(&self) -> bool {
         todo!()
+    }
+}
+
+/// Holds socket addresses of all peers in a subnet.
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
+pub struct SubnetTopology {
+    subnet_nodes: HashMap<NodeId, SocketAddr>,
+    earliest_registry_version: RegistryVersion,
+    latest_registry_version: RegistryVersion,
+}
+
+impl SubnetTopology {
+    pub fn new<T: IntoIterator<Item = (NodeId, SocketAddr)>>(
+        subnet_nodes: T,
+        earliest_registry_version: RegistryVersion,
+        latest_registry_version: RegistryVersion,
+    ) -> Self {
+        Self {
+            subnet_nodes: HashMap::from_iter(subnet_nodes),
+            earliest_registry_version,
+            latest_registry_version,
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&NodeId, &SocketAddr)> {
+        self.subnet_nodes.iter()
+    }
+
+    pub fn is_member(&self, node: &NodeId) -> bool {
+        self.subnet_nodes.contains_key(node)
+    }
+
+    pub fn get_addr(&self, node: &NodeId) -> Option<SocketAddr> {
+        self.subnet_nodes.get(node).copied()
+    }
+
+    pub fn latest_registry_version(&self) -> RegistryVersion {
+        self.latest_registry_version
+    }
+
+    pub fn earliest_registry_version(&self) -> RegistryVersion {
+        self.earliest_registry_version
+    }
+
+    pub fn get_subnet_nodes(&self) -> BTreeSet<NodeId> {
+        self.subnet_nodes.keys().copied().collect()
     }
 }

@@ -1,14 +1,11 @@
-use crate::{
-    mock_time,
-    types::{
-        arbitrary,
-        ids::{canister_test_id, message_test_id, subnet_test_id, user_test_id},
-        messages::{RequestBuilder, SignedIngressBuilder},
-    },
+use crate::types::{
+    arbitrary,
+    ids::{canister_test_id, message_test_id, subnet_test_id, user_test_id},
+    messages::{RequestBuilder, SignedIngressBuilder},
 };
 use ic_base_types::NumSeconds;
 use ic_btc_types_internal::BitcoinAdapterRequestWrapper;
-use ic_ic00_types::CanisterStatusType;
+use ic_management_canister_types::{CanisterStatusType, LogVisibility};
 use ic_registry_routing_table::{CanisterIdRange, RoutingTable};
 use ic_registry_subnet_features::SubnetFeatures;
 use ic_registry_subnet_type::SubnetType;
@@ -29,13 +26,13 @@ use ic_replicated_state::{
     CallContext, CallOrigin, CanisterState, CanisterStatus, ExecutionState, ExportedFunctions,
     InputQueueType, Memory, NumWasmPages, ReplicatedState, SchedulerState, SystemState,
 };
+use ic_types::batch::RawQueryStats;
 use ic_types::methods::{Callback, WasmClosure};
-use ic_types::time::UNIX_EPOCH;
-use ic_types::{batch::RawQueryStats, messages::CallbackId};
+use ic_types::time::{CoarseTime, UNIX_EPOCH};
 use ic_types::{
-    messages::{Ingress, Request, RequestOrResponse},
+    messages::{CallbackId, Ingress, Request, RequestMetadata, RequestOrResponse},
     nominal_cycles::NominalCycles,
-    xnet::{StreamHeader, StreamIndex, StreamIndexedQueue},
+    xnet::{StreamFlags, StreamHeader, StreamIndex, StreamIndexedQueue},
     CanisterId, ComputeAllocation, Cycles, ExecutionRound, MemoryAllocation, NumBytes, PrincipalId,
     SubnetId, Time,
 };
@@ -134,7 +131,7 @@ impl ReplicatedStateBuilder {
                         SubnetCallContext::BitcoinGetSuccessors(BitcoinGetSuccessorsContext {
                             request: RequestBuilder::default().build(),
                             payload,
-                            time: mock_time(),
+                            time: UNIX_EPOCH,
                         }),
                     );
                 }
@@ -144,7 +141,7 @@ impl ReplicatedStateBuilder {
                             BitcoinSendTransactionInternalContext {
                                 request: RequestBuilder::default().build(),
                                 payload,
-                                time: mock_time(),
+                                time: UNIX_EPOCH,
                             },
                         ),
                     );
@@ -162,7 +159,7 @@ impl Default for ReplicatedStateBuilder {
             canisters: Vec::new(),
             subnet_type: SubnetType::Application,
             subnet_id: subnet_test_id(1),
-            batch_time: mock_time(),
+            batch_time: UNIX_EPOCH,
             subnet_features: SubnetFeatures::default(),
             bitcoin_adapter_requests: Vec::new(),
             query_stats: RawQueryStats::default(),
@@ -185,6 +182,7 @@ pub struct CanisterStateBuilder {
     inputs: Vec<RequestOrResponse>,
     time_of_last_allocation_charge: Time,
     certified_data: Vec<u8>,
+    log_visibility: LogVisibility,
 }
 
 impl CanisterStateBuilder {
@@ -268,6 +266,11 @@ impl CanisterStateBuilder {
         self
     }
 
+    pub fn with_log_visibility(mut self, log_visibility: LogVisibility) -> Self {
+        self.log_visibility = log_visibility;
+        self
+    }
+
     pub fn build(self) -> CanisterState {
         let mut system_state = match self.status {
             CanisterStatusType::Running => SystemState::new_running_for_testing(
@@ -306,7 +309,8 @@ impl CanisterStateBuilder {
             let call_context_id = call_context_manager.new_call_context(
                 call_context.call_origin().clone(),
                 call_context.available_cycles(),
-                call_context.time().unwrap(),
+                call_context.time(),
+                call_context.metadata().clone(),
             );
 
             let call_context_in_call_context_manager = call_context_manager
@@ -376,6 +380,7 @@ impl Default for CanisterStateBuilder {
             inputs: Vec::default(),
             time_of_last_allocation_charge: UNIX_EPOCH,
             certified_data: vec![],
+            log_visibility: LogVisibility::default(),
         }
     }
 }
@@ -468,6 +473,7 @@ impl CallContextBuilder {
             false,
             Cycles::zero(),
             self.time,
+            RequestMetadata::new(0, UNIX_EPOCH),
         )
     }
 }
@@ -732,27 +738,30 @@ pub fn register_callback(
     originator: CanisterId,
     respondent: CanisterId,
     callback_id: CallbackId,
+    deadline: CoarseTime,
 ) {
     let call_context_manager = canister_state
         .system_state
         .call_context_manager_mut()
         .unwrap();
     let call_context_id = call_context_manager.new_call_context(
-        CallOrigin::CanisterUpdate(originator, callback_id),
+        CallOrigin::CanisterUpdate(originator, callback_id, deadline),
         Cycles::zero(),
         Time::from_nanos_since_unix_epoch(0),
+        RequestMetadata::new(0, UNIX_EPOCH),
     );
 
     call_context_manager.register_callback(Callback::new(
         call_context_id,
-        Some(originator),
-        Some(respondent),
+        originator,
+        respondent,
         Cycles::zero(),
-        Some(Cycles::new(42)),
-        Some(Cycles::new(84)),
+        Cycles::new(42),
+        Cycles::new(84),
         WasmClosure::new(0, 2),
         WasmClosure::new(0, 2),
         None,
+        deadline,
     ));
 }
 
@@ -777,10 +786,10 @@ pub fn insert_dummy_canister(
 
 prop_compose! {
     /// Produces a strategy that generates an arbitrary `signals_end` and between
-    /// `[sig_min_size, sig_max_size]` reject signals .
-    pub fn arb_reject_signals(sig_min_size: usize, sig_max_size: usize)(
+    /// `[min_signal_count, max_signal_count]` reject signals .
+    pub fn arb_reject_signals(min_signal_count: usize, max_signal_count: usize)(
         sig_start in 0..10000u64,
-        sigs in prop::collection::btree_set(arbitrary::stream_index(100 + sig_max_size as u64), sig_min_size..=sig_max_size),
+        sigs in prop::collection::btree_set(arbitrary::stream_index(100 + max_signal_count as u64), min_signal_count..=max_signal_count),
         sig_end_delta in 0..10u64,
     ) -> (StreamIndex, VecDeque<StreamIndex>) {
         let mut reject_signals = VecDeque::with_capacity(sigs.len());
@@ -795,30 +804,48 @@ prop_compose! {
 
 prop_compose! {
     /// Produces a strategy that generates a stream with between
-    /// `[min_size, max_size]` messages and between `[sig_min_size, sig_max_size]`
-    /// reject signals.
-    pub fn arb_stream(min_size: usize, max_size: usize, sig_min_size: usize, sig_max_size: usize)(
+    /// `[min_size, max_size]` messages; between `[min_signal_count, max_signal_count]`
+    /// reject signals; and with or without request metadata and/or message deadlines.
+    pub fn arb_stream_with_config(min_size: usize, max_size: usize, min_signal_count: usize, max_signal_count: usize, populate_request_metadata: bool, populate_deadline: bool)(
         msg_start in 0..10000u64,
         msgs in prop::collection::vec(
-            arbitrary::request_or_response(),
+            // TODO(MR-549) Use `request_or_response()` once the canonical state can encode
+            // message deadlines.
+            arbitrary::request_or_response_with_config(populate_request_metadata, populate_deadline),
             min_size..=max_size
         ),
-        (signals_end, reject_signals) in arb_reject_signals(sig_min_size, sig_max_size),
+        (signals_end, reject_signals) in arb_reject_signals(min_signal_count, max_signal_count),
+        responses_only_flag in any::<bool>(),
     ) -> Stream {
         let mut messages = StreamIndexedQueue::with_begin(StreamIndex::from(msg_start));
         for m in msgs {
             messages.push(m)
         }
 
-        Stream::with_signals(messages, signals_end, reject_signals)
+        let mut stream = Stream::with_signals(messages, signals_end, reject_signals);
+        stream.set_reverse_stream_flags(StreamFlags {
+            responses_only: responses_only_flag,
+        });
+        stream
+    }
+}
+
+prop_compose! {
+    /// Produces a strategy that generates a stream with between
+    /// `[min_size, max_size]` messages and between `[min_signal_count, max_signal_count]`
+    /// reject signals.
+    pub fn arb_stream(min_size: usize, max_size: usize, min_signal_count: usize, max_signal_count: usize)(
+        stream in arb_stream_with_config(min_size, max_size, min_signal_count, max_signal_count, true, true)
+    ) -> Stream {
+        stream
     }
 }
 
 prop_compose! {
     /// Produces a strategy consisting of an arbitrary stream and valid slice begin and message
     /// count values for extracting a slice from the stream.
-    pub fn arb_stream_slice(min_size: usize, max_size: usize, sig_min_size: usize, sig_max_size: usize)(
-        stream in arb_stream(min_size, max_size, sig_min_size, sig_max_size),
+    pub fn arb_stream_slice(min_size: usize, max_size: usize, min_signal_count: usize, max_signal_count: usize)(
+        stream in arb_stream(min_size, max_size, min_signal_count, max_signal_count),
         from_percent in -20..120i64,
         percent_above_min_size in 0..120i64,
     ) ->  (Stream, StreamIndex, usize) {
@@ -834,20 +861,24 @@ prop_compose! {
 }
 
 prop_compose! {
-    pub fn arb_stream_header(sig_min_size: usize, sig_max_size: usize)(
+    pub fn arb_stream_header(min_signal_count: usize, max_signal_count: usize, with_responses_only_flag: Vec<bool>)(
         msg_start in 0..10000u64,
         msg_len in 0..10000u64,
-        (signals_end, reject_signals) in arb_reject_signals(sig_min_size, sig_max_size),
+        (signals_end, reject_signals) in arb_reject_signals(min_signal_count, max_signal_count),
+        responses_only in proptest::sample::select(with_responses_only_flag),
     ) -> StreamHeader {
         let begin = StreamIndex::from(msg_start);
         let end = StreamIndex::from(msg_start + msg_len);
 
-        StreamHeader {
+        StreamHeader::new(
             begin,
             end,
             signals_end,
             reject_signals,
-        }
+            StreamFlags {
+                responses_only,
+            },
+        )
     }
 }
 

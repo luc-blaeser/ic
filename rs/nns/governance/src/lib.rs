@@ -120,11 +120,20 @@
 //! without need for a quorum of voting power to participate, and it
 //! can also always decide upon proposals in a timely manner.
 
-use crate::governance::{Governance, TimeWarp};
-use crate::pb::v1::governance::GovernanceCachedMetrics;
+use crate::{
+    governance::{Governance, TimeWarp},
+    pb::v1::{governance::GovernanceCachedMetrics, ProposalStatus},
+};
 use mockall::automock;
-use std::{collections::HashMap, io};
+use std::{
+    collections::{BTreeMap, HashMap},
+    io,
+};
 
+#[cfg(test)]
+pub mod test_utils;
+
+mod account_id_index;
 mod audit_event;
 mod garbage_collection;
 /// The 'governance' module contains the canister (smart contract)
@@ -148,7 +157,6 @@ pub mod neurons_fund;
 pub mod pb;
 pub mod proposals;
 mod reward;
-pub mod seed_accounts;
 pub mod storage;
 mod subaccount_index;
 
@@ -352,6 +360,7 @@ pub fn encode_metrics(
         principal: principal_index_len,
         following: following_index_len,
         known_neuron: known_neuron_index_len,
+        account_id: account_id_index_len,
     } = governance.neuron_store.stable_indexes_lens();
 
     w.encode_gauge(
@@ -374,12 +383,59 @@ pub fn encode_metrics(
         known_neuron_index_len as f64,
         "Total number of entries in the known neuron index",
     )?;
+    w.encode_gauge(
+        "governance_account_id_index_len",
+        account_id_index_len as f64,
+        "Total number of entries in the account_id index",
+    )?;
 
     w.encode_gauge(
         "governance_stable_memory_neuron_count",
         governance.neuron_store.stable_neuron_store_len() as f64,
         "The number of neurons in stable memory.",
     )?;
+
+    let mut builder = w.gauge_vec(
+        "governance_proposal_deadline_timestamp_seconds",
+        "The deadline for open proposals, labelled with proposal id",
+    )?;
+
+    let open_proposals_deadline = governance
+        .heap_data
+        .proposals
+        .iter()
+        .filter(|(_, data)| data.status() == ProposalStatus::Open)
+        .map(|(proposal_id, data)| {
+            let voting_period = governance.voting_period_seconds()(data.topic());
+            let deadline_ts = data.get_deadline_timestamp_seconds(voting_period);
+            let proposal_topic = data.topic().as_str_name();
+            let proposal_action_type = data
+                .proposal
+                .as_ref()
+                .map(|proposal| proposal.action_type());
+
+            (
+                proposal_id,
+                (deadline_ts, proposal_topic, proposal_action_type),
+            )
+        })
+        .collect::<BTreeMap<&u64, (u64, &str, Option<String>)>>();
+
+    for (proposal_id, (deadline_ts, proposal_topic, proposal_action_type)) in
+        open_proposals_deadline.iter()
+    {
+        let proposal_id = proposal_id.to_string();
+        let mut labels: Vec<(&str, &str)> = vec![
+            ("proposal_id", proposal_id.as_str()),
+            ("proposal_topic", *proposal_topic),
+        ];
+        if let Some(proposal_action_type) = proposal_action_type {
+            labels.push(("proposal_type", proposal_action_type))
+        }
+        builder = builder
+            .value(labels.as_slice(), Metric::into(*deadline_ts))
+            .unwrap();
+    }
 
     if let Some(metrics) = &governance.heap_data.metrics {
         let GovernanceCachedMetrics {

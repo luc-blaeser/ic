@@ -20,8 +20,6 @@ impl std::fmt::Display for WasmError {
 /// Different errors that be returned by `validate_wasm_binary`
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WasmValidationError {
-    /// Failure in deserialization of the wasm module.
-    WasmDeserializeError(WasmError),
     /// wasmtime::Module::validate() failed
     WasmtimeValidation(String),
     /// Failed to decode the canister module.
@@ -44,8 +42,6 @@ pub enum WasmValidationError {
     TooManyFunctions { defined: usize, allowed: usize },
     /// Module contains too many custom sections.
     TooManyCustomSections { defined: usize, allowed: usize },
-    /// Module defines an invalid index for a local function.
-    InvalidFunctionIndex { index: usize, import_count: usize },
     /// A function was too complex.
     FunctionComplexityTooHigh {
         index: usize,
@@ -65,9 +61,6 @@ pub enum WasmValidationError {
 impl std::fmt::Display for WasmValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::WasmDeserializeError(err) => {
-                write!(f, "Failed to deserialize wasm module with {}", err)
-            }
             Self::WasmtimeValidation(err) => {
                 write!(f, "Wasmtime failed to validate wasm module {}", err)
             }
@@ -107,14 +100,6 @@ impl std::fmt::Display for WasmValidationError {
                 "Wasm module defined {} custom sections which exceeds the maximum number allowed {}.",
                 defined, allowed
             ),
-            Self::InvalidFunctionIndex {
-                index,
-                import_count,
-            } => write!(
-                f,
-                "Function has index {} but should start from {}.",
-                index, import_count
-            ),
             Self::FunctionComplexityTooHigh{ index, complexity, allowed } => write!(
                 f,
                 "Wasm module contains a function at index {} with complexity {} which exceeds the maximum complexity allowed {}",
@@ -150,7 +135,6 @@ pub enum WasmInstrumentationError {
         offset: usize,
         len: usize,
     },
-    InvalidExport(String),
     InvalidFunctionType(String),
 }
 
@@ -173,7 +157,6 @@ impl std::fmt::Display for WasmInstrumentationError {
                 "Wasm module has invalid data segment of {} bytes at {}",
                 len, offset
             ),
-            Self::InvalidExport(err) => write!(f, "Failed to export: {}", err),
             Self::InvalidFunctionType(err) => write!(f, "Invalid function type: {}", err),
         }
     }

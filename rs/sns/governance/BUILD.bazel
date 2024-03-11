@@ -18,20 +18,25 @@ DEPENDENCIES = [
     "//rs/nervous_system/clients",
     "//rs/nervous_system/common",
     "//rs/nervous_system/governance",
+    "//rs/nervous_system/collections/union_multi_map",
     "//rs/nervous_system/proto",
     "//rs/nervous_system/root",
     "//rs/nervous_system/runtime",
     "//rs/nns/constants",
     "//rs/protobuf",
     "//rs/rosetta-api/icp_ledger",
+    "//rs/rosetta-api/icrc1/ledger",
     "//rs/rosetta-api/ledger_core",
     "//rs/rust_canisters/canister_log",
     "//rs/rust_canisters/canister_profiler",
     "//rs/rust_canisters/dfn_candid",
     "//rs/rust_canisters/dfn_core",
     "//rs/rust_canisters/http_types",
+    "//rs/sns/governance/proposal_criticality",
+    "//rs/sns/governance/token_valuation",
+    "//rs/sns/governance/treasury_transfer_limit",
     "//rs/types/base_types",
-    "//rs/types/ic00_types",
+    "//rs/types/management_canister_types",
     "@crate_index//:base64",
     "@crate_index//:build-info",
     "@crate_index//:candid",
@@ -88,7 +93,7 @@ LIB_SRCS = glob(
     ["src/**"],
     # Ensures that we do not need to rebuild just because a _test.rs file
     # changed.
-    exclude = ["**/*_tests.rs"],
+    exclude = ["**/*tests.rs"],
 )
 
 cargo_build_script(

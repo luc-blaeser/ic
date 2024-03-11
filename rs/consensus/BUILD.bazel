@@ -1,11 +1,10 @@
 load("@rules_rust//rust:defs.bzl", "rust_doc", "rust_library", "rust_test")
-load("//bazel:defs.bzl", "rust_bench")
+load("//bazel:defs.bzl", "rust_ic_bench")
 
 package(default_visibility = ["//visibility:public"])
 
 DEPENDENCIES = [
     # Keep sorted.
-    "//rs/artifact_pool",
     "//rs/config",
     "//rs/consensus/utils",
     "//rs/crypto",
@@ -26,7 +25,7 @@ DEPENDENCIES = [
     "//rs/registry/subnet_type",
     "//rs/replicated_state",
     "//rs/types/error_types",
-    "//rs/types/ic00_types",
+    "//rs/types/management_canister_types",
     "//rs/types/types",
     "@crate_index//:prometheus",
     "@crate_index//:rand",
@@ -37,11 +36,13 @@ DEPENDENCIES = [
 
 DEV_DEPENDENCIES = [
     # Keep sorted.
+    "//rs/artifact_pool",
     "//rs/bitcoin/types/internal",
     "//rs/consensus/mocks",
     "//rs/crypto/temp_crypto",
     "//rs/crypto/test_utils/ni-dkg",
     "//rs/crypto/test_utils/reproducible_rng",
+    "//rs/crypto/tree_hash",
     "//rs/execution_environment",
     "//rs/ingress_manager",
     "//rs/interfaces/certified_stream_store",
@@ -51,11 +52,12 @@ DEV_DEPENDENCIES = [
     "//rs/registry/fake",
     "//rs/registry/proto_data_provider",
     "//rs/state_manager",
+    "//rs/sys",
     "//rs/test_utilities",
     "//rs/test_utilities/artifact_pool",
     "//rs/test_utilities/logger",
     "//rs/test_utilities/registry",
-    "//rs/utils",
+    "//rs/test_utilities/time",
     "@crate_index//:assert_matches",
     "@crate_index//:criterion",
     "@crate_index//:proptest",
@@ -72,14 +74,10 @@ MACRO_DEPENDENCIES = [
 ]
 
 DATA = [
-    "//rs/canister_sandbox",
-    "//rs/canister_sandbox/sandbox_launcher",
     "//rs/rust_canisters/stable_structures:stable_structures_canister",
 ]
 
 ENV = {
-    "LAUNCHER_BINARY": "$(rootpath //rs/canister_sandbox/sandbox_launcher)",
-    "SANDBOX_BINARY": "$(rootpath //rs/canister_sandbox)",
     "STABLE_STRUCTURES_CANISTER_WASM_PATH": "$(rootpath //rs/rust_canisters/stable_structures:stable_structures_canister)",
 }
 
@@ -129,7 +127,7 @@ rust_test(
     deps = DEPENDENCIES + DEV_DEPENDENCIES + [":consensus"],
 )
 
-rust_bench(
+rust_ic_bench(
     name = "validate_payload_bench",
     testonly = True,
     srcs = ["benches/validate_payload.rs"],
@@ -155,7 +153,8 @@ rust_bench(
         "//rs/state_manager",
         "//rs/test_utilities",
         "//rs/test_utilities/registry",
-        "//rs/types/ic00_types",
+        "//rs/test_utilities/time",
+        "//rs/types/management_canister_types",
         "//rs/types/types",
         "@crate_index//:criterion",
         "@crate_index//:tempfile",

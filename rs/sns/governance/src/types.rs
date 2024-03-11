@@ -1,10 +1,10 @@
 use crate::{
     governance::{Governance, TimeWarp, NERVOUS_SYSTEM_FUNCTION_DELETION_MARKER},
-    logs::INFO,
+    logs::{ERROR, INFO},
     pb::{
         sns_root_types::{
-            set_dapp_controllers_request::CanisterIds, RegisterDappCanistersRequest,
-            SetDappControllersRequest,
+            set_dapp_controllers_request::CanisterIds, ManageDappCanisterSettingsRequest,
+            RegisterDappCanistersRequest, SetDappControllersRequest,
         },
         v1::{
             claim_swap_neurons_request::NeuronParameters,
@@ -23,11 +23,11 @@ use crate::{
             proposal::Action,
             ClaimSwapNeuronsError, ClaimSwapNeuronsResponse, ClaimedSwapNeuronStatus,
             DefaultFollowees, DeregisterDappCanisters, Empty, ExecuteGenericNervousSystemFunction,
-            GovernanceError, ManageNeuronResponse, MintSnsTokens, Motion, NervousSystemFunction,
-            NervousSystemParameters, Neuron, NeuronId, NeuronPermission, NeuronPermissionList,
-            NeuronPermissionType, ProposalId, RegisterDappCanisters, RewardEvent,
-            TransferSnsTreasuryFunds, UpgradeSnsControlledCanister, UpgradeSnsToNextVersion, Vote,
-            VotingRewardsParameters,
+            GovernanceError, ManageDappCanisterSettings, ManageNeuronResponse, MintSnsTokens,
+            Motion, NervousSystemFunction, NervousSystemParameters, Neuron, NeuronId,
+            NeuronPermission, NeuronPermissionList, NeuronPermissionType, ProposalId,
+            RegisterDappCanisters, RewardEvent, TransferSnsTreasuryFunds,
+            UpgradeSnsControlledCanister, UpgradeSnsToNextVersion, Vote, VotingRewardsParameters,
         },
     },
     proposal::ValidGenericNervousSystemFunction,
@@ -36,14 +36,17 @@ use async_trait::async_trait;
 use ic_base_types::{CanisterId, PrincipalId};
 use ic_canister_log::log;
 use ic_crypto_sha2::Sha256;
-use ic_ic00_types::CanisterInstallModeError;
 use ic_ledger_core::tokens::{Tokens, TOKEN_SUBDIVIDABLE_BY};
-use ic_nervous_system_common::{validate_proposal_url, NervousSystemError};
-use ic_nervous_system_proto::pb::v1::Percentage;
+use ic_management_canister_types::CanisterInstallModeError;
+use ic_nervous_system_common::{validate_proposal_url, NervousSystemError, SECONDS_PER_DAY};
+use ic_nervous_system_proto::pb::v1::{Duration as PbDuration, Percentage};
+use ic_sns_governance_proposal_criticality::{
+    ProposalCriticality, VotingDurationParameters, VotingPowerThresholds,
+};
 use lazy_static::lazy_static;
 use maplit::btreemap;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::TryFrom,
     fmt,
 };
@@ -104,6 +107,12 @@ pub mod native_action_ids {
 
     /// MintSnsTokens
     pub const MINT_SNS_TOKENS: u64 = 12;
+
+    /// ManageLedgerParameters Action.
+    pub const MANAGE_LEDGER_PARAMETERS: u64 = 13;
+
+    /// ManageDappCanisterSettings Action.
+    pub const MANAGE_DAPP_CANISTER_SETTINGS: u64 = 14;
 }
 
 impl governance::Mode {
@@ -294,17 +303,6 @@ impl From<&manage_neuron::Command> for neuron_in_flight_command::Command {
             S::RemoveNeuronPermissions(x) => D::RemoveNeuronPermissions(x),
             S::StakeMaturity          (_) => D::SyncCommand(SyncCommand{}),
         }
-    }
-}
-
-lazy_static! {
-    static ref DEFAULT_NERVOUS_SYSTEM_PARAMETERS: NervousSystemParameters =
-        NervousSystemParameters::default();
-}
-
-impl Default for &NervousSystemParameters {
-    fn default() -> Self {
-        &DEFAULT_NERVOUS_SYSTEM_PARAMETERS
     }
 }
 
@@ -984,9 +982,9 @@ impl From<Action> for NervousSystemFunction {
         match action {
             Action::Unspecified(_) => NervousSystemFunction {
                 id: native_action_ids::UNSPECIFIED,
-                name: "All Topics".to_string(),
+                name: "All non-critical topics".to_string(),
                 description: Some(
-                    "Catch-all w.r.t to following for all types of proposals.".to_string(),
+                    "Catch-all w.r.t to following for non-critical proposals.".to_string(),
                 ),
                 function_type: Some(FunctionType::NativeNervousSystemFunction(Empty {})),
             },
@@ -1091,6 +1089,22 @@ impl From<Action> for NervousSystemFunction {
                 name: "Mint SNS Tokens".to_string(),
                 description: Some(
                     "Proposal to mint SNS tokens to a specified recipient.".to_string(),
+                ),
+                function_type: Some(FunctionType::NativeNervousSystemFunction(Empty {})),
+            },
+            Action::ManageLedgerParameters(_) => NervousSystemFunction {
+                id: native_action_ids::MANAGE_LEDGER_PARAMETERS,
+                name: "Manage ledger parameters".to_string(),
+                description: Some(
+                    "Proposal to change some parameters in the ledger canister.".to_string(),
+                ),
+                function_type: Some(FunctionType::NativeNervousSystemFunction(Empty {})),
+            },
+            Action::ManageDappCanisterSettings(_) => NervousSystemFunction {
+                id: native_action_ids::MANAGE_DAPP_CANISTER_SETTINGS,
+                name: "Manage dapp canister settings".to_string(),
+                description: Some(
+                    "Proposal to change canister settings for some dapp canisters.".to_string(),
                 ),
                 function_type: Some(FunctionType::NativeNervousSystemFunction(Empty {})),
             },
@@ -1415,6 +1429,16 @@ impl SnsMetadata {
     }
 }
 
+lazy_static! {
+    static ref DEFAULT_ACTION: Action = Action::Unspecified(Default::default());
+}
+
+impl Default for &Action {
+    fn default() -> Self {
+        &DEFAULT_ACTION
+    }
+}
+
 impl Action {
     /// Returns whether proposals with such an action should be allowed to
     /// be submitted when the heap growth potential is low.
@@ -1461,29 +1485,110 @@ impl Action {
         }
     }
 
-    pub fn minimum_yes_proportion_of_total(&self) -> ic_nervous_system_proto::pb::v1::Percentage {
-        match self {
-            Action::DeregisterDappCanisters(_)
-            | Action::TransferSnsTreasuryFunds(_)
-            | Action::MintSnsTokens(_) => {
-                NervousSystemParameters::CRITICAL_MINIMUM_YES_PROPORTION_OF_TOTAL_VOTING_POWER
+    pub(crate) fn voting_power_thresholds(&self) -> VotingPowerThresholds {
+        // This just reduces to the method of the same name in
+        // ProposalCriticality
+        self.proposal_criticality().voting_power_thresholds()
+    }
+
+    pub(crate) fn voting_duration_parameters(
+        &self,
+        nervous_system_parameters: &NervousSystemParameters,
+    ) -> VotingDurationParameters {
+        let initial_voting_period_seconds = nervous_system_parameters.initial_voting_period_seconds;
+        let wait_for_quiet_deadline_increase_seconds =
+            nervous_system_parameters.wait_for_quiet_deadline_increase_seconds;
+
+        match self.proposal_criticality() {
+            ProposalCriticality::Normal => VotingDurationParameters {
+                initial_voting_period: PbDuration {
+                    seconds: initial_voting_period_seconds,
+                },
+                wait_for_quiet_deadline_increase: PbDuration {
+                    seconds: wait_for_quiet_deadline_increase_seconds,
+                },
+            },
+
+            ProposalCriticality::Critical => {
+                let initial_voting_period_seconds =
+                    initial_voting_period_seconds.unwrap_or_default();
+                let wait_for_quiet_deadline_increase_seconds =
+                    wait_for_quiet_deadline_increase_seconds.unwrap_or_default();
+
+                VotingDurationParameters {
+                    initial_voting_period: PbDuration {
+                        seconds: Some(initial_voting_period_seconds.max(5 * SECONDS_PER_DAY)),
+                    },
+                    wait_for_quiet_deadline_increase: PbDuration {
+                        seconds: Some(wait_for_quiet_deadline_increase_seconds.max(
+                            2 * SECONDS_PER_DAY + SECONDS_PER_DAY / 2, // 2.5 days
+                        )),
+                    },
+                }
             }
-            _ => NervousSystemParameters::DEFAULT_MINIMUM_YES_PROPORTION_OF_TOTAL_VOTING_POWER,
         }
     }
 
-    pub fn minimum_yes_proportion_of_exercised(
-        &self,
-    ) -> ic_nervous_system_proto::pb::v1::Percentage {
+    fn proposal_criticality(&self) -> ProposalCriticality {
+        use Action::*;
         match self {
-            Action::DeregisterDappCanisters(_)
-            | Action::TransferSnsTreasuryFunds(_)
-            | Action::MintSnsTokens(_) => {
-                NervousSystemParameters::CRITICAL_MINIMUM_YES_PROPORTION_OF_EXERCISED_VOTING_POWER
+            DeregisterDappCanisters(_) | TransferSnsTreasuryFunds(_) | MintSnsTokens(_) => {
+                ProposalCriticality::Critical
             }
-            _ => NervousSystemParameters::DEFAULT_MINIMUM_YES_PROPORTION_OF_EXERCISED_VOTING_POWER,
+
+            Unspecified(_)
+            | ManageNervousSystemParameters(_)
+            | UpgradeSnsControlledCanister(_)
+            | Motion(_)
+            | AddGenericNervousSystemFunction(_)
+            | RemoveGenericNervousSystemFunction(_)
+            | ExecuteGenericNervousSystemFunction(_)
+            | UpgradeSnsToNextVersion(_)
+            | ManageSnsMetadata(_)
+            | ManageLedgerParameters(_)
+            | RegisterDappCanisters(_)
+            | ManageDappCanisterSettings(_) => ProposalCriticality::Normal,
         }
     }
+}
+
+pub(crate) fn function_id_to_proposal_criticality(function_id: u64) -> ProposalCriticality {
+    lazy_static! {
+        static ref FUNCTION_ID_TO_PROPOSAL_CRITICALITY: HashMap</* function_id */ u64, ProposalCriticality> = {
+            let mut result = HashMap::new();
+
+            for action in Action::iter() {
+                // Skip non-native, aka generic functions.
+                if let Action::ExecuteGenericNervousSystemFunction(_) = action {
+                    continue;
+                }
+
+                let function_id = u64::from(&action);
+                let previous_value = result.insert(function_id, action.proposal_criticality());
+                debug_assert!(previous_value.is_none(), "{:#?}", previous_value);
+            }
+
+            result
+        };
+    }
+
+    if let Some(result) = FUNCTION_ID_TO_PROPOSAL_CRITICALITY.get(&function_id) {
+        return *result;
+    }
+
+    // Default to Normal. This is not unusual; it happens when the function is a generic
+    // (user-defined) nervous system functions. Such functions have IDs that are >= MIN_ID.
+
+    if function_id < ValidGenericNervousSystemFunction::MIN_ID {
+        log!(
+            ERROR,
+            "Defaulting to ProposalCriticality::Normal, but the function ID is too small \
+             to be that of a generic nervous system function: {}",
+            function_id,
+        );
+    }
+
+    ProposalCriticality::Normal
 }
 
 impl UpgradeSnsControlledCanister {
@@ -1578,6 +1683,10 @@ impl From<&Action> for u64 {
             Action::ManageSnsMetadata(_) => native_action_ids::MANAGE_SNS_METADATA,
             Action::TransferSnsTreasuryFunds(_) => native_action_ids::TRANSFER_SNS_TREASURY_FUNDS,
             Action::MintSnsTokens(_) => native_action_ids::MINT_SNS_TOKENS,
+            Action::ManageLedgerParameters(_) => native_action_ids::MANAGE_LEDGER_PARAMETERS,
+            Action::ManageDappCanisterSettings(_) => {
+                native_action_ids::MANAGE_DAPP_CANISTER_SETTINGS
+            }
         }
     }
 }
@@ -1594,35 +1703,6 @@ pub fn is_registered_function_id(
     match nervous_system_functions.get(&function_id) {
         None => false,
         Some(function) => function != &*NERVOUS_SYSTEM_FUNCTION_DELETION_MARKER,
-    }
-}
-
-// This is almost a copy n' paste from NNS. The main difference (as of
-// 2023-11-17) is to account for the fact that here in SNS,
-// total_available_e8s_equivalent is optional. (Therefore, an extra
-// unwrap_or_default call is added.)
-impl RewardEvent {
-    /// Calculates the total_available_e8s_equivalent in this event that should
-    /// be "rolled over" into the next `RewardEvent`.
-    ///
-    /// Behavior:
-    /// - If rewards were distributed for this event, then no available_icp_e8s
-    ///   should be rolled over, so this function returns 0.
-    /// - Otherwise, this function returns
-    ///   `total_available_e8s_equivalent`.
-    pub(crate) fn e8s_equivalent_to_be_rolled_over(&self) -> u64 {
-        if self.rewards_rolled_over() {
-            self.total_available_e8s_equivalent.unwrap_or_default()
-        } else {
-            0
-        }
-    }
-
-    // Not copied from NNS: fn rounds_since_last_distribution_to_be_rolled_over
-
-    /// Whether this is a "rollover event", where no rewards were distributed.
-    pub(crate) fn rewards_rolled_over(&self) -> bool {
-        self.settled_proposals.is_empty()
     }
 }
 
@@ -2004,6 +2084,28 @@ impl From<DeregisterDappCanisters> for SetDappControllersRequest {
     }
 }
 
+impl From<ManageDappCanisterSettings> for ManageDappCanisterSettingsRequest {
+    fn from(manage_dapp_canister_settings: ManageDappCanisterSettings) -> Self {
+        let ManageDappCanisterSettings {
+            canister_ids,
+            compute_allocation,
+            memory_allocation,
+            freezing_threshold,
+            reserved_cycles_limit,
+            log_visibility,
+        } = manage_dapp_canister_settings;
+
+        ManageDappCanisterSettingsRequest {
+            canister_ids,
+            compute_allocation,
+            memory_allocation,
+            freezing_threshold,
+            reserved_cycles_limit,
+            log_visibility,
+        }
+    }
+}
+
 impl Motion {
     pub fn new(text: &str) -> Self {
         Motion {
@@ -2318,6 +2420,71 @@ pub(crate) mod tests {
     use lazy_static::lazy_static;
     use maplit::{btreemap, hashset};
     use std::convert::TryInto;
+
+    #[test]
+    fn test_voting_period_parameters() {
+        let non_critical_action = Action::Motion(Default::default());
+        let critical_action = Action::TransferSnsTreasuryFunds(Default::default());
+
+        let normal_nervous_system_parameters = NervousSystemParameters {
+            initial_voting_period_seconds: Some(4 * SECONDS_PER_DAY),
+            wait_for_quiet_deadline_increase_seconds: Some(2 * SECONDS_PER_DAY),
+            ..Default::default()
+        };
+        assert_eq!(
+            non_critical_action.voting_duration_parameters(&normal_nervous_system_parameters),
+            VotingDurationParameters {
+                initial_voting_period: PbDuration {
+                    seconds: Some(4 * SECONDS_PER_DAY),
+                },
+                wait_for_quiet_deadline_increase: PbDuration {
+                    seconds: Some(2 * SECONDS_PER_DAY),
+                }
+            },
+        );
+        assert_eq!(
+            critical_action.voting_duration_parameters(&normal_nervous_system_parameters),
+            VotingDurationParameters {
+                initial_voting_period: PbDuration {
+                    seconds: Some(5 * SECONDS_PER_DAY),
+                },
+                wait_for_quiet_deadline_increase: PbDuration {
+                    seconds: Some(2 * SECONDS_PER_DAY + SECONDS_PER_DAY / 2),
+                }
+            },
+        );
+
+        // This is even slower than the hard-coded values (5 days initial and 2.5 days wait for
+        // quiet) for critical proposals. Therefore, these values are used for both normal and
+        // critical proposals.
+        let slow_nervous_system_parameters = NervousSystemParameters {
+            initial_voting_period_seconds: Some(7 * SECONDS_PER_DAY),
+            wait_for_quiet_deadline_increase_seconds: Some(4 * SECONDS_PER_DAY),
+            ..Default::default()
+        };
+        assert_eq!(
+            non_critical_action.voting_duration_parameters(&slow_nervous_system_parameters),
+            VotingDurationParameters {
+                initial_voting_period: PbDuration {
+                    seconds: Some(7 * SECONDS_PER_DAY),
+                },
+                wait_for_quiet_deadline_increase: PbDuration {
+                    seconds: Some(4 * SECONDS_PER_DAY),
+                }
+            },
+        );
+        assert_eq!(
+            critical_action.voting_duration_parameters(&slow_nervous_system_parameters),
+            VotingDurationParameters {
+                initial_voting_period: PbDuration {
+                    seconds: Some(7 * SECONDS_PER_DAY),
+                },
+                wait_for_quiet_deadline_increase: PbDuration {
+                    seconds: Some(4 * SECONDS_PER_DAY),
+                }
+            },
+        );
+    }
 
     #[test]
     fn test_nervous_system_parameters_validate() {

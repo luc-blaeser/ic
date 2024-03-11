@@ -9,9 +9,9 @@ use ic_config::firewall::{Config as FirewallConfig, FIREWALL_FILE_DEFAULT_PATH};
 use ic_logger::{debug, info, warn, ReplicaLogger};
 use ic_protobuf::registry::firewall::v1::{FirewallAction, FirewallRule, FirewallRuleDirection};
 use ic_registry_keys::FirewallRulesScope;
+use ic_sys::fs::write_string_using_tmp_file;
 use ic_types::NodeId;
 use ic_types::RegistryVersion;
-use ic_utils::fs::write_string_using_tmp_file;
 use std::{
     cmp::{max, min},
     collections::BTreeSet,
@@ -163,15 +163,7 @@ impl Firewall {
             .catchup_package_provider
             .get_local_cup()
             .map(|latest_cup| {
-                let summary = &latest_cup
-                    .content
-                    .block
-                    .get_value()
-                    .payload
-                    .as_ref()
-                    .as_summary();
-
-                let cup_registry_version = summary.get_oldest_registry_version_in_use();
+                let cup_registry_version = latest_cup.get_oldest_registry_version_in_use();
 
                 // Iterate:
                 // - from   min(cup_registry_version, registry_version)
@@ -476,16 +468,12 @@ impl Firewall {
             "Checking for firewall config registry version: {}", registry_version
         );
 
-        match self.check_for_firewall_config(registry_version).await {
-            Ok(()) => self
-                .metrics
-                .datacenter_registry_version
-                .set(registry_version.get() as i64),
-            Err(e) => info!(
+        if let Err(e) = self.check_for_firewall_config(registry_version).await {
+            info!(
                 self.logger,
                 "Failed to check for firewall config at version {}: {}", registry_version, e
-            ),
-        };
+            )
+        }
     }
 
     pub fn get_last_applied_version(&self) -> Arc<RwLock<RegistryVersion>> {

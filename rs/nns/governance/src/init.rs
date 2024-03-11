@@ -11,9 +11,20 @@ use rand_chacha::ChaCha20Rng;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
-use crate::pb::v1::{Governance, NetworkEconomics, Neuron};
+use crate::pb::v1::{
+    Governance, NetworkEconomics, Neuron, XdrConversionRate as XdrConversionRatePb,
+};
 use ic_base_types::PrincipalId;
 use ic_nns_common::types::NeuronId;
+
+// To update or add more, add print statements to `with_test_neurons` to print
+// the generated neuron IDs and copy the printed IDs here.
+pub const TEST_NEURON_1_ID: u64 = 449479075714955186;
+pub const TEST_NEURON_2_ID: u64 = 4368585614685248742;
+pub const TEST_NEURON_3_ID: u64 = 4884056990215423907;
+
+/// The sum of the total ICP staked in test neurons.
+pub const TEST_NEURON_TOTAL_STAKE_DOMS: u64 = 1_110_000_000;
 
 #[allow(dead_code)]
 pub struct GovernanceCanisterInitPayloadBuilder {
@@ -32,6 +43,7 @@ impl GovernanceCanisterInitPayloadBuilder {
                 wait_for_quiet_threshold_seconds: 60 * 60 * 24 * 4, // 4 days
                 short_voting_period_seconds: 60 * 60 * 12,          // 12 hours
                 neuron_management_voting_period_seconds: Some(60 * 60 * 48), // 48 hours
+                xdr_conversion_rate: Some(XdrConversionRatePb::with_default_values()),
                 ..Default::default()
             },
             voters_to_add_to_all_neurons: Vec::new(),
@@ -107,10 +119,14 @@ impl GovernanceCanisterInitPayloadBuilder {
                 ..Default::default()
             }
         };
+        assert_eq!(neuron1.id.as_ref().unwrap().id, TEST_NEURON_1_ID);
 
         if let Some(maturity_equivalent_icp_e8s) = maturity_equivalent_icp_e8s {
             neuron1.maturity_e8s_equivalent = maturity_equivalent_icp_e8s;
             neuron1.joined_community_fund_timestamp_seconds = Some(1);
+            // Setting `auto_stake_maturity` makes simplifies testing, as maturity accumulated
+            // over time does not need to be taken into account.
+            neuron1.auto_stake_maturity = Some(true);
         }
 
         let neuron2 = {
@@ -129,6 +145,7 @@ impl GovernanceCanisterInitPayloadBuilder {
                 ..Default::default()
             }
         };
+        assert_eq!(neuron2.id.as_ref().unwrap().id, TEST_NEURON_2_ID);
 
         let neuron3 = {
             let neuron_id = NeuronIdProto::from(self.new_neuron_id());
@@ -146,6 +163,8 @@ impl GovernanceCanisterInitPayloadBuilder {
                 ..Default::default()
             }
         };
+        assert_eq!(neuron3.id.as_ref().unwrap().id, TEST_NEURON_3_ID);
+
         self.with_additional_neurons(vec![neuron1, neuron2, neuron3])
     }
 

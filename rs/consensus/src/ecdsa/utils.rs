@@ -2,19 +2,19 @@
 
 use crate::consensus::metrics::EcdsaPayloadMetrics;
 use crate::ecdsa::complaints::{EcdsaTranscriptLoader, TranscriptLoadStatus};
-use ic_artifact_pool::consensus_pool::build_consensus_block_chain;
 use ic_consensus_utils::pool_reader::PoolReader;
 use ic_crypto::get_tecdsa_master_public_key;
-use ic_ic00_types::EcdsaKeyId;
 use ic_interfaces::consensus_pool::ConsensusBlockChain;
 use ic_interfaces::ecdsa::{EcdsaChangeAction, EcdsaChangeSet, EcdsaPool};
 use ic_interfaces_registry::RegistryClient;
 use ic_logger::{warn, ReplicaLogger};
+use ic_management_canister_types::EcdsaKeyId;
 use ic_protobuf::registry::subnet::v1 as pb;
 use ic_registry_client_helpers::ecdsa_keys::EcdsaKeysRegistry;
 use ic_registry_client_helpers::subnet::SubnetRegistry;
 use ic_registry_subnet_features::EcdsaConfig;
-use ic_types::consensus::ecdsa::QuadrupleId;
+use ic_replicated_state::metadata_state::subnet_call_context_manager::SignWithEcdsaContext;
+use ic_types::consensus::ecdsa::{PreSignatureQuadrupleRef, QuadrupleId};
 use ic_types::consensus::Block;
 use ic_types::consensus::{
     ecdsa::{
@@ -26,15 +26,17 @@ use ic_types::consensus::{
 use ic_types::crypto::canister_threshold_sig::idkg::{
     IDkgTranscript, IDkgTranscriptOperation, InitialIDkgDealings,
 };
-use ic_types::crypto::canister_threshold_sig::MasterEcdsaPublicKey;
+use ic_types::crypto::canister_threshold_sig::{ExtendedDerivationPath, MasterEcdsaPublicKey};
 use ic_types::registry::RegistryClientError;
 use ic_types::{Height, RegistryVersion, SubnetId};
-use std::collections::BTreeSet;
+use phantom_newtype::Id;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryInto;
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
-pub struct InvalidChainCacheError(String);
+pub(crate) struct InvalidChainCacheError(String);
 
 pub(super) struct EcdsaBlockReaderImpl {
     chain: Arc<dyn ConsensusBlockChain>,
@@ -84,6 +86,15 @@ impl EcdsaBlockReader for EcdsaBlockReaderImpl {
             .map_or(Box::new(std::iter::empty()), |payload| {
                 Box::new(payload.ongoing_signatures.iter())
             })
+    }
+
+    fn available_quadruple(&self, id: &QuadrupleId) -> Option<&PreSignatureQuadrupleRef> {
+        self.chain
+            .tip()
+            .payload
+            .as_ref()
+            .as_ecdsa()
+            .and_then(|ecdsa_payload| ecdsa_payload.available_quadruples.get(id))
     }
 
     fn active_transcripts(&self) -> BTreeSet<TranscriptRef> {
@@ -186,7 +197,7 @@ pub(super) fn block_chain_cache(
     start: &Block,
     end: &Block,
 ) -> Result<Arc<dyn ConsensusBlockChain>, InvalidChainCacheError> {
-    let chain = build_consensus_block_chain(pool_reader.pool(), start, end);
+    let chain = pool_reader.pool().build_block_chain(start, end);
     let expected_len = (end.height().get() - start.height().get() + 1) as usize;
     let chain_len = chain.len();
     if chain_len == expected_len {
@@ -206,6 +217,43 @@ pub(super) fn block_chain_cache(
             pool_reader.get_catch_up_height()
         )))
     }
+}
+
+/// Helper to build the [`RequestId`] if the context is already completed
+pub(super) fn get_context_request_id(context: &SignWithEcdsaContext) -> Option<RequestId> {
+    context
+        .matched_quadruple
+        .clone()
+        .map(|(quadruple_id, height)| RequestId {
+            quadruple_id,
+            pseudo_random_id: context.pseudo_random_id,
+            height,
+        })
+}
+
+/// Helper to build threshold signature inputs from the context and
+/// the pre-signature quadruple
+pub(super) fn build_signature_inputs(
+    context: &SignWithEcdsaContext,
+    block_reader: &dyn EcdsaBlockReader,
+) -> Option<(RequestId, ThresholdEcdsaSigInputsRef)> {
+    let request_id = get_context_request_id(context)?;
+    let extended_derivation_path = ExtendedDerivationPath {
+        caller: context.request.sender.into(),
+        derivation_path: context.derivation_path.clone(),
+    };
+    let quadruple = block_reader
+        .available_quadruple(&request_id.quadruple_id)?
+        .clone();
+    let key_transcript_ref = quadruple.key_unmasked_ref;
+    let inputs = ThresholdEcdsaSigInputsRef::new(
+        extended_derivation_path,
+        context.message_hash,
+        Id::from(context.nonce?),
+        quadruple,
+        key_transcript_ref,
+    );
+    Some((request_id, inputs))
 }
 
 /// Load the given transcripts
@@ -242,6 +290,7 @@ pub(super) fn load_transcripts(
 pub(super) fn transcript_op_summary(op: &IDkgTranscriptOperation) -> String {
     match op {
         IDkgTranscriptOperation::Random => "Random".to_string(),
+        IDkgTranscriptOperation::RandomUnmasked => "RandomUnmasked".to_string(),
         IDkgTranscriptOperation::ReshareOfMasked(t) => {
             format!("ReshareOfMasked({:?})", t.transcript_id)
         }
@@ -259,11 +308,10 @@ pub(super) fn transcript_op_summary(op: &IDkgTranscriptOperation) -> String {
 /// Return key_id and dealings.
 pub(crate) fn inspect_ecdsa_initializations(
     ecdsa_initializations: &[pb::EcdsaInitialization],
-) -> Result<Option<(EcdsaKeyId, InitialIDkgDealings)>, String> {
-    if ecdsa_initializations.is_empty() {
-        return Ok(None);
-    }
+) -> Result<BTreeMap<EcdsaKeyId, InitialIDkgDealings>, String> {
+    let mut initial_dealings_per_key_id = BTreeMap::new();
 
+    // TODO(CON-1053): remove this check
     if ecdsa_initializations.len() > 1 {
         return Err(
             "More than one ecdsa_initialization is not supported. Choose the first one."
@@ -271,35 +319,35 @@ pub(crate) fn inspect_ecdsa_initializations(
         );
     }
 
-    let ecdsa_init = ecdsa_initializations
-        .get(0)
-        .expect("Error: Ecdsa Initialization is None");
+    for ecdsa_init in ecdsa_initializations {
+        let ecdsa_key_id = ecdsa_init
+            .key_id
+            .clone()
+            .expect("Error: Failed to find key_id in ecdsa_initializations")
+            .try_into()
+            .map_err(|err| {
+                format!(
+                    "Error reading ECDSA key_id: {:?}. Setting ecdsa_summary to None.",
+                    err
+                )
+            })?;
 
-    let ecdsa_key_id = ecdsa_init
-        .key_id
-        .clone()
-        .expect("Error: Failed to find key_id in ecdsa_initializations")
-        .try_into()
-        .map_err(|err| {
-            format!(
-                "Error reading ECDSA key_id: {:?}. Setting ecdsa_summary to None.",
-                err
-            )
-        })?;
+        let dealings = ecdsa_init
+            .dealings
+            .as_ref()
+            .expect("Error: Failed to find dealings in ecdsa_initializations")
+            .try_into()
+            .map_err(|err| {
+                format!(
+                    "Error reading ECDSA dealings: {:?}. Setting ecdsa_summary to None.",
+                    err
+                )
+            })?;
 
-    let dealings = ecdsa_init
-        .dealings
-        .as_ref()
-        .expect("Error: Failed to find dealings in ecdsa_initializations")
-        .try_into()
-        .map_err(|err| {
-            format!(
-                "Error reading ECDSA dealings: {:?}. Setting ecdsa_summary to None.",
-                err
-            )
-        })?;
+        initial_dealings_per_key_id.insert(ecdsa_key_id, dealings);
+    }
 
-    Ok(Some((ecdsa_key_id, dealings)))
+    Ok(initial_dealings_per_key_id)
 }
 
 /// Return [`EcdsaConfig`] if it is enabled for the given subnet.
@@ -353,7 +401,38 @@ pub(crate) fn get_enabled_signing_keys(
         .collect())
 }
 
-/// This function returns the ECDSA subnet public key to be added to the batch, if required.
+/// Return the set of quadruple IDs to be delivered in the batch of this block.
+/// We deliver IDs of all available quadruples that were created using the current key transcript.
+pub(crate) fn get_quadruple_ids_to_deliver(
+    block: &Block,
+) -> BTreeMap<EcdsaKeyId, BTreeSet<QuadrupleId>> {
+    let Some(ecdsa) = block.payload.as_ref().as_ecdsa() else {
+        return BTreeMap::new();
+    };
+    let Some(unmasked_transcript) = ecdsa.key_transcript.current.as_ref() else {
+        return BTreeMap::new();
+    };
+    let current_key_transcript_id = unmasked_transcript.transcript_id();
+
+    let mut quadruple_ids: BTreeMap<EcdsaKeyId, BTreeSet<QuadrupleId>> = BTreeMap::new();
+    quadruple_ids.insert(ecdsa.key_transcript.key_id.clone(), BTreeSet::new());
+
+    for (quadruple_id, quadruple) in &ecdsa.available_quadruples {
+        if current_key_transcript_id != quadruple.key_unmasked_ref.as_ref().transcript_id {
+            continue;
+        }
+
+        quadruple_ids
+            .entry(ecdsa.key_transcript.key_id.clone())
+            .and_modify(|s| {
+                s.insert(quadruple_id.clone());
+            });
+    }
+
+    quadruple_ids
+}
+
+/// This function returns the ECDSA subnet public keys to be added to the batch, if required.
 /// We return `Ok(Some(key))`, if
 /// - The block contains an ECDSA payload with current key transcript ref, and
 /// - the corresponding transcript exists in past blocks, and
@@ -366,18 +445,9 @@ pub(crate) fn get_ecdsa_subnet_public_key(
     block: &Block,
     pool: &PoolReader<'_>,
     log: &ReplicaLogger,
-) -> Result<Option<(EcdsaKeyId, MasterEcdsaPublicKey)>, String> {
+) -> Result<BTreeMap<EcdsaKeyId, MasterEcdsaPublicKey>, String> {
     let Some(ecdsa_payload) = block.payload.as_ref().as_ecdsa() else {
-        return Ok(None);
-    };
-
-    let Some(transcript_ref) = ecdsa_payload
-        .key_transcript
-        .current
-        .as_ref()
-        .map(|unmasked| *unmasked.as_ref())
-    else {
-        return Ok(None);
+        return Ok(BTreeMap::new());
     };
 
     let Some(summary) = pool.dkg_summary_block_for_finalized_height(block.height) else {
@@ -386,8 +456,21 @@ pub(crate) fn get_ecdsa_subnet_public_key(
             block.height
         ));
     };
-    let chain = build_consensus_block_chain(pool.pool(), &summary, block);
+    let chain = pool.pool().build_block_chain(&summary, block);
     let block_reader = EcdsaBlockReaderImpl::new(chain);
+
+    let mut public_keys = BTreeMap::new();
+
+    // TODO(CON-1053): add a support for multiple keys
+    let key_id = ecdsa_payload.key_transcript.key_id.clone();
+    let Some(transcript_ref) = ecdsa_payload
+        .key_transcript
+        .current
+        .as_ref()
+        .map(|unmasked| *unmasked.as_ref())
+    else {
+        return Ok(BTreeMap::new());
+    };
 
     let ecdsa_subnet_public_key = match block_reader.transcript(&transcript_ref) {
         Ok(transcript) => get_ecdsa_subnet_public_key_(&transcript, log),
@@ -401,8 +484,11 @@ pub(crate) fn get_ecdsa_subnet_public_key(
         }
     };
 
-    Ok(ecdsa_subnet_public_key
-        .map(|public_key| (ecdsa_payload.key_transcript.key_id.clone(), public_key)))
+    if let Some(public_key) = ecdsa_subnet_public_key {
+        public_keys.insert(key_id, public_key);
+    }
+
+    Ok(public_keys)
 }
 
 fn get_ecdsa_subnet_public_key_(
@@ -419,13 +505,23 @@ fn get_ecdsa_subnet_public_key_(
     }
 }
 
+/// Updates the latest purge height, and returns true if
+/// it increased. Otherwise returns false.
+pub(crate) fn update_purge_height(cell: &RefCell<Height>, new_height: Height) -> bool {
+    let prev_purge_height = cell.replace(new_height);
+    new_height > prev_purge_height
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
 
     use ic_config::artifact_pool::ArtifactPoolConfig;
     use ic_consensus_mocks::{dependencies, Dependencies};
-    use ic_crypto_test_utils_canister_threshold_sigs::dummy_values::dummy_initial_idkg_dealing_for_tests;
+    use ic_crypto_test_utils_canister_threshold_sigs::{
+        dummy_values::dummy_initial_idkg_dealing_for_tests, generate_key_transcript,
+        IDkgParticipants,
+    };
     use ic_crypto_test_utils_reproducible_rng::reproducible_rng;
     use ic_logger::replica_logger::no_op_logger;
     use ic_protobuf::registry::{
@@ -434,9 +530,23 @@ mod tests {
     use ic_registry_client_fake::FakeRegistryClient;
     use ic_registry_keys::make_ecdsa_signing_subnet_list_key;
     use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
-    use ic_test_utilities::types::ids::{node_test_id, subnet_test_id};
+    use ic_test_utilities::{
+        consensus::fake::Fake,
+        types::ids::{node_test_id, subnet_test_id},
+    };
     use ic_test_utilities_registry::{add_subnet_record, SubnetRecordBuilder};
-    use ic_types::subnet_id_into_protobuf;
+    use ic_types::{
+        batch::ValidationContext,
+        consensus::{
+            ecdsa::{EcdsaPayload, UnmaskedTranscript},
+            BlockPayload, Payload, SummaryPayload,
+        },
+        crypto::{AlgorithmId, CryptoHashOf},
+        subnet_id_into_protobuf,
+        time::UNIX_EPOCH,
+    };
+
+    use crate::ecdsa::test_utils::{create_sig_inputs, set_up_ecdsa_payload};
 
     use super::*;
 
@@ -445,7 +555,7 @@ mod tests {
         let init =
             inspect_ecdsa_initializations(&[]).expect("Should successfully get initializations");
 
-        assert!(init.is_none());
+        assert!(init.is_empty());
     }
 
     #[test]
@@ -464,7 +574,7 @@ mod tests {
         let init = inspect_ecdsa_initializations(&[ecdsa_init])
             .expect("Should successfully get initializations");
 
-        assert_eq!(init, Some((key_id, initial_dealings)));
+        assert_eq!(init, BTreeMap::from([(key_id, initial_dealings)]));
     }
 
     #[test]
@@ -653,5 +763,143 @@ mod tests {
             );
             assert_eq!(result, expected);
         }
+    }
+
+    fn add_available_quadruples_with_key_transcript(
+        ecdsa_payload: &mut EcdsaPayload,
+        key_transcript: UnmaskedTranscript,
+        key_id: &EcdsaKeyId,
+    ) -> Vec<QuadrupleId> {
+        let mut quadruple_ids = vec![];
+        for i in 0..10 {
+            let sig_inputs = create_sig_inputs(i);
+            let mut quadruple_id = ecdsa_payload
+                .uid_generator
+                .next_quadruple_id(key_id.clone());
+            quadruple_id.1 = Some(key_id.clone());
+            quadruple_ids.push(quadruple_id.clone());
+            let mut quadruple_ref = sig_inputs.sig_inputs_ref.presig_quadruple_ref.clone();
+            quadruple_ref.key_unmasked_ref = key_transcript;
+            ecdsa_payload
+                .available_quadruples
+                .insert(quadruple_id, quadruple_ref.clone());
+        }
+        quadruple_ids
+    }
+
+    fn make_block(ecdsa_payload: Option<EcdsaPayload>) -> Block {
+        Block::new(
+            CryptoHashOf::from(ic_types::crypto::CryptoHash(Vec::new())),
+            Payload::new(
+                ic_types::crypto::crypto_hash,
+                BlockPayload::Summary(SummaryPayload {
+                    dkg: ic_types::consensus::dkg::Summary::fake(),
+                    ecdsa: ecdsa_payload,
+                }),
+            ),
+            Height::from(123),
+            ic_types::consensus::Rank(456),
+            ValidationContext {
+                registry_version: RegistryVersion::from(99),
+                certified_height: Height::from(42),
+                time: UNIX_EPOCH,
+            },
+        )
+    }
+
+    #[test]
+    fn test_get_quadruple_ids_to_deliver() {
+        let mut rng = reproducible_rng();
+        let (mut ecdsa_payload, env, _) = set_up_ecdsa_payload(
+            &mut rng,
+            subnet_test_id(1),
+            /*nodes_count=*/ 8,
+            /*should_create_key_transcript=*/ true,
+        );
+        let current_key_transcript = ecdsa_payload.key_transcript.current.clone().unwrap();
+        let key_id = &ecdsa_payload.key_transcript.key_id.clone();
+
+        let quadruple_ids_to_be_delivered = add_available_quadruples_with_key_transcript(
+            &mut ecdsa_payload,
+            current_key_transcript.unmasked_transcript(),
+            key_id,
+        );
+
+        let (dealers, receivers) = env.choose_dealers_and_receivers(
+            &IDkgParticipants::AllNodesAsDealersAndReceivers,
+            &mut rng,
+        );
+
+        let key_transcript = generate_key_transcript(
+            &env,
+            &dealers,
+            &receivers,
+            AlgorithmId::ThresholdEcdsaSecp256k1,
+            &mut rng,
+        );
+        let old_key_transcript =
+            UnmaskedTranscript::try_from((Height::from(0), &key_transcript)).unwrap();
+        let quadruple_ids_not_to_be_delivered = add_available_quadruples_with_key_transcript(
+            &mut ecdsa_payload,
+            old_key_transcript,
+            key_id,
+        );
+
+        let block = make_block(Some(ecdsa_payload));
+        let mut delivered_map = get_quadruple_ids_to_deliver(&block);
+        assert_eq!(delivered_map.len(), 1);
+        let delivered_ids = delivered_map.remove(key_id).unwrap();
+
+        assert!(!quadruple_ids_not_to_be_delivered
+            .into_iter()
+            .any(|qid| delivered_ids.contains(&qid)));
+        assert_eq!(
+            quadruple_ids_to_be_delivered,
+            delivered_ids.into_iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_block_without_ecdsa_should_not_deliver_quadruples() {
+        let block = make_block(None);
+        let delivered_ids = get_quadruple_ids_to_deliver(&block);
+
+        assert!(delivered_ids.is_empty());
+    }
+
+    #[test]
+    fn test_block_without_key_should_not_deliver_quadruples() {
+        let mut rng = reproducible_rng();
+        let (mut ecdsa_payload, env, _) = set_up_ecdsa_payload(
+            &mut rng,
+            subnet_test_id(1),
+            /*nodes_count=*/ 8,
+            /*should_create_key_transcript=*/ false,
+        );
+
+        let (dealers, receivers) = env.choose_dealers_and_receivers(
+            &IDkgParticipants::AllNodesAsDealersAndReceivers,
+            &mut rng,
+        );
+        let key_transcript = generate_key_transcript(
+            &env,
+            &dealers,
+            &receivers,
+            AlgorithmId::ThresholdEcdsaSecp256k1,
+            &mut rng,
+        );
+        let key_transcript_ref =
+            UnmaskedTranscript::try_from((Height::from(0), &key_transcript)).unwrap();
+        let key_id = EcdsaKeyId::from_str("Secp256k1:some_key").unwrap();
+        add_available_quadruples_with_key_transcript(
+            &mut ecdsa_payload,
+            key_transcript_ref,
+            &key_id,
+        );
+
+        let block = make_block(Some(ecdsa_payload));
+        let delivered_ids = get_quadruple_ids_to_deliver(&block);
+
+        assert!(delivered_ids.is_empty());
     }
 }

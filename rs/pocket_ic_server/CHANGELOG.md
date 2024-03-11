@@ -12,11 +12,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Added
-- New endpoint `/api.json` that serves an OpenAPI documentation of the PocketIC server
+- New endpoints `/instances/<instance_id>/auto_progress` and `/instances/<instance_id>/stop_progress` to make IC instances
+  progress (updating time and executing rounds) automatically.
+- New endpoints `/instances/<instance_id>/api/v2/...` supporting the HTTP interface of the IC as described
+  by the [Interface Specification](https://internetcomputer.org/docs/current/references/ic-interface-spec).
+- New subnet specification allowing to set very high instruction limits for (asymptotic) benchmarking canister code.
+
+### Fixed
+
+- Subnet IDs are derived from the subnets' public keys by default.
+- The time of every subnet advances by 1ns before every round execution to make sure the subnet time is strictly increasing in every round.
+
+
+## 3.0.1 - 2024-02-14
+
+### Fixed
+- Traps in tECDSA calls due to malformed tECDSA public key.
+- Server rejects jsons containing unimplemented variants of `SubnetStateConfig`.
+- The `inspect_message` method no longer panics when call is rejected.
+
+## 3.0.0 - 2024-02-06
+
+### Added
+- New endpoint `/api.json` that serves an OpenAPI documentation of the PocketIC server.
+- Instances can be created from existing NNS state.
 
 ### Changed
-- Canisters are created with 100T cycles by default when using the provisional management canister API.
+- Breaking: The create_instance endpoint accepts an ExtendedSubnetConfigSet, which allows more options. 
 
+### Fixed
+- Canister inspect message errors when executing ingress messages are returned as canister execution results rather than request errors.
+- Subnets agree on which subnet id is the NNS subnet id. Fixes the problem where a canister installation via CMC directly would fail. 
 
 
 ## 2.0.1 - 2023-11-23

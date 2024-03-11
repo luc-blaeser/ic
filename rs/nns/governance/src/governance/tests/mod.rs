@@ -1,36 +1,23 @@
 use super::*;
-use crate::pb::v1::{
-    governance::{followers_map::Followers, FollowersMap},
-    settle_community_fund_participation, ExecuteNnsFunction, GovernanceError, Neuron,
-    OpenSnsTokenSwap, SettleCommunityFundParticipation,
+use crate::{
+    pb::v1::{
+        governance::{followers_map::Followers, FollowersMap},
+        Neuron,
+    },
+    test_utils::{MockEnvironment, StubCMC, StubIcpLedger},
 };
-use async_trait::async_trait;
-use candid::{Decode, Encode};
-#[cfg(target_arch = "wasm32")]
-use dfn_core::println;
-use ic_base_types::{CanisterId, PrincipalId};
+use ic_base_types::PrincipalId;
 use ic_nervous_system_common::{assert_is_err, assert_is_ok, E8};
 #[cfg(feature = "test")]
 use ic_nervous_system_proto::pb::v1::GlobalTimeOfDay;
 use ic_nns_common::pb::v1::NeuronId;
-use ic_nns_constants::SNS_WASM_CANISTER_ID;
 #[cfg(feature = "test")]
 use ic_sns_init::pb::v1::SnsInitPayload;
 #[cfg(feature = "test")]
 use ic_sns_init::pb::v1::{self as sns_init_pb};
-use ic_sns_swap::pb::{
-    v1 as sns_swap_pb,
-    v1::{NeuronBasketConstructionParameters, Swap},
-};
-use ic_sns_wasm::pb::v1::{DeployedSns, ListDeployedSnsesRequest, ListDeployedSnsesResponse};
 use lazy_static::lazy_static;
-use maplit::{btreemap, hashmap, hashset};
-use std::{
-    collections::VecDeque,
-    convert::TryFrom,
-    string::ToString,
-    sync::{Arc, Mutex},
-};
+use maplit::{btreemap, hashmap};
+use std::convert::TryFrom;
 
 mod stake_maturity;
 
@@ -45,950 +32,6 @@ fn test_time_warp() {
     let w = TimeWarp { delta_s: -42_i64 };
     assert_eq!(w.apply(100_u64), 58);
 }
-
-const PARAMS: Params = Params {
-    max_icp_e8s: 1000 * E8,
-    min_icp_e8s: 10 * E8,
-    max_direct_participation_icp_e8s: Some(1000 * E8),
-    min_direct_participation_icp_e8s: Some(10 * E8),
-    min_participant_icp_e8s: 5 * E8,
-    max_participant_icp_e8s: 1000 * E8,
-    min_participants: 2,
-    sns_token_e8s: 1000 * E8,
-    swap_due_timestamp_seconds: 2524629600, // midnight, Jan 1, 2050
-    neuron_basket_construction_parameters: Some(NeuronBasketConstructionParameters {
-        count: 3,
-        dissolve_delay_interval_seconds: 7890000, // 3 months
-    }),
-    sale_delay_seconds: None,
-};
-
-type CanisterMethodCallResult = Result<Vec<u8>, (Option<i32>, String)>;
-
-lazy_static! {
-    static ref PRINCIPAL_ID_1: PrincipalId = PrincipalId::new_user_test_id(1);
-    static ref PRINCIPAL_ID_2: PrincipalId = PrincipalId::new_user_test_id(2);
-    static ref PRINCIPAL_ID_3: PrincipalId = PrincipalId::new_user_test_id(3);
-    static ref TARGET_SWAP_CANISTER_ID: CanisterId = CanisterId::from_u64(435106);
-    static ref OPEN_SNS_TOKEN_SWAP: OpenSnsTokenSwap = OpenSnsTokenSwap {
-        target_swap_canister_id: Some((*TARGET_SWAP_CANISTER_ID).into()),
-        params: Some(PARAMS.clone()),
-        community_fund_investment_e8s: Some(500),
-    };
-    static ref SWAP_INIT: sns_swap_pb::Init = sns_swap_pb::Init {
-        transaction_fee_e8s: Some(12_345),
-        neuron_minimum_stake_e8s: Some(123_456_789),
-        ..Default::default() // Not realistic, but good enough for tests.
-    };
-
-    static ref EXPECTED_LIST_DEPLOYED_SNSES: (ExpectedCallCanisterMethodCallArguments<'static>, CanisterMethodCallResult) =
-        (
-            ExpectedCallCanisterMethodCallArguments {
-                target: SNS_WASM_CANISTER_ID,
-                method_name: "list_deployed_snses",
-                request: Encode!(&ListDeployedSnsesRequest {}).unwrap(),
-            },
-            Ok(Encode!(&ListDeployedSnsesResponse {
-                instances: vec![DeployedSns {
-                    swap_canister_id: Some((*TARGET_SWAP_CANISTER_ID).into()),
-                    ..Default::default()
-                },]
-            })
-               .unwrap()),
-        );
-}
-
-struct StubIcpLedger {}
-#[async_trait]
-impl IcpLedger for StubIcpLedger {
-    async fn transfer_funds(
-        &self,
-        _amount_e8s: u64,
-        _fee_e8s: u64,
-        _from_subaccount: Option<Subaccount>,
-        _to: AccountIdentifier,
-        _memo: u64,
-    ) -> Result<u64, NervousSystemError> {
-        unimplemented!()
-    }
-
-    async fn total_supply(&self) -> Result<Tokens, NervousSystemError> {
-        unimplemented!()
-    }
-
-    async fn account_balance(
-        &self,
-        _account: AccountIdentifier,
-    ) -> Result<Tokens, NervousSystemError> {
-        unimplemented!()
-    }
-
-    fn canister_id(&self) -> CanisterId {
-        unimplemented!()
-    }
-}
-
-struct StubCMC {}
-#[async_trait]
-impl CMC for StubCMC {
-    async fn neuron_maturity_modulation(&mut self) -> Result<i32, String> {
-        unimplemented!()
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-struct ExpectedCallCanisterMethodCallArguments<'a> {
-    target: CanisterId,
-    method_name: &'a str,
-    request: Vec<u8>,
-}
-
-#[allow(clippy::type_complexity)]
-struct MockEnvironment<'a> {
-    expected_call_canister_method_calls: Arc<
-        Mutex<
-            VecDeque<(
-                ExpectedCallCanisterMethodCallArguments<'a>,
-                Result<Vec<u8>, (Option<i32>, String)>,
-            )>,
-        >,
-    >,
-    now: Arc<Mutex<u64>>,
-}
-
-impl Default for MockEnvironment<'_> {
-    fn default() -> Self {
-        Self {
-            expected_call_canister_method_calls: Arc::new(Mutex::new(VecDeque::from([
-                EXPECTED_LIST_DEPLOYED_SNSES.clone(),
-                (
-                    ExpectedCallCanisterMethodCallArguments {
-                        target: *TARGET_SWAP_CANISTER_ID,
-                        method_name: "get_state",
-                        request: Encode!(&sns_swap_pb::GetStateRequest {}).unwrap(),
-                    },
-                    Ok(Encode!(&sns_swap_pb::GetStateResponse {
-                        swap: Some(Swap {
-                            init: Some(SWAP_INIT.clone()),
-                            ..Default::default() // Not realistic, but good enough for test.
-                        }),
-                        derived: None, // Not realistic, but good enough for test.
-                    })
-                    .unwrap()),
-                ),
-            ]))),
-            now: Arc::new(Mutex::new(0)),
-        }
-    }
-}
-
-#[async_trait]
-impl Environment for MockEnvironment<'_> {
-    fn now(&self) -> u64 {
-        *self.now.lock().unwrap()
-    }
-
-    fn random_u64(&mut self) -> u64 {
-        unimplemented!();
-    }
-
-    fn random_byte_array(&mut self) -> [u8; 32] {
-        unimplemented!();
-    }
-
-    fn execute_nns_function(
-        &self,
-        _proposal_id: u64,
-        _update: &ExecuteNnsFunction,
-    ) -> Result<(), GovernanceError> {
-        unimplemented!();
-    }
-
-    fn heap_growth_potential(&self) -> HeapGrowthPotential {
-        unimplemented!();
-    }
-
-    async fn call_canister_method(
-        &mut self,
-        target: CanisterId,
-        method_name: &str,
-        request: Vec<u8>,
-    ) -> Result<Vec<u8>, (Option<i32>, String)> {
-        let (expected_arguments, result) = self
-            .expected_call_canister_method_calls
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or_else(|| {
-                panic!(
-                    "Unexpected canister method call:\n\
-                     method_name = {}\n\
-                     target = {}\n\
-                     request.len() = {}",
-                    method_name,
-                    target,
-                    request.len(),
-                )
-            });
-
-        let decode_request_bytes = |bytes| {
-            match method_name {
-                "get_state" => {
-                    match Decode!(bytes, sns_swap_pb::GetStateRequest) {
-                        Ok(ok) => format!("{:#?}", ok),
-                        Err(err) => format!(
-                            "Unable to decode request bytes as GetStateRequest because of {:?}: {}",
-                            err, default_request_bytes_format(bytes),
-                        ),
-                    }
-                }
-
-                "list_deployed_snses" => {
-                    match Decode!(bytes, ListDeployedSnsesRequest) {
-                        Ok(ok) => format!("{:#?}", ok),
-                        Err(err) => format!(
-                            "Unable to decode request bytes as ListDeployedSnsesRequest because of {:?}: {}",
-                            err, default_request_bytes_format(bytes),
-                        ),
-                    }
-                }
-
-                _ => default_request_bytes_format(bytes)
-            }
-        };
-        fn default_request_bytes_format(bytes: &[u8]) -> String {
-            let truncated = if bytes.len() > 16 {
-                let head = &bytes[..8];
-                let tail = &bytes[(bytes.len() - 8)..];
-                format!("head = {:?}, tail = {:?}", head, tail)
-            } else {
-                format!("content = {:?}", bytes)
-            };
-
-            format!("<len = {}, {}>", bytes.len(), truncated)
-        }
-
-        // Compare incoming arguments vs. expected.
-        assert_eq!(
-            method_name, expected_arguments.method_name,
-            "{:#?}",
-            expected_arguments
-        );
-        assert_eq!(
-            target, expected_arguments.target,
-            "{:#?}",
-            expected_arguments
-        );
-        assert!(
-            // Because these are Vec<u8>, assert_eq would generate feedback
-            // that's very hard to decipher, so we skip that by using
-            // assert! plus the == operator instead.
-            request == expected_arguments.request,
-            "{}\nvs.\n{}",
-            decode_request_bytes(&request),
-            decode_request_bytes(&expected_arguments.request),
-        );
-
-        result
-    }
-}
-
-#[tokio::test]
-async fn validate_open_sns_token_swap_ok() {
-    let result =
-        validate_open_sns_token_swap(&OPEN_SNS_TOKEN_SWAP, &mut MockEnvironment::default()).await;
-    assert!(result.is_ok(), "{:#?}", result);
-}
-
-#[tokio::test]
-async fn validate_open_sns_token_swap_missing_target_swap_canister_id() {
-    assert_is_err!(
-        validate_open_sns_token_swap(
-            &OpenSnsTokenSwap {
-                target_swap_canister_id: None,
-                ..OPEN_SNS_TOKEN_SWAP.clone()
-            },
-            &mut MockEnvironment::default(),
-        )
-        .await
-    );
-}
-
-#[tokio::test]
-async fn validate_open_sns_token_swap_params_no_params() {
-    assert_is_err!(
-        validate_open_sns_token_swap(
-            &OpenSnsTokenSwap {
-                params: None,
-                ..OPEN_SNS_TOKEN_SWAP.clone()
-            },
-            &mut MockEnvironment::default(),
-        )
-        .await
-    );
-}
-
-#[tokio::test]
-async fn validate_open_sns_token_swap_sns_wasm_list_deployed_snses_fail() {
-    assert_is_err!(
-        validate_open_sns_token_swap(
-            &OPEN_SNS_TOKEN_SWAP,
-            &mut MockEnvironment {
-                expected_call_canister_method_calls: Arc::new(Mutex::new(VecDeque::from([(
-                    ExpectedCallCanisterMethodCallArguments {
-                        target: SNS_WASM_CANISTER_ID,
-                        method_name: "list_deployed_snses",
-                        request: Encode!(&ListDeployedSnsesRequest {}).unwrap(),
-                    },
-                    Err((None, "derp".to_string())),
-                ),]),)),
-                now: Arc::new(Mutex::new(0))
-            },
-        )
-        .await
-    );
-}
-
-#[tokio::test]
-async fn validate_open_sns_token_swap_unknown_swap() {
-    assert_is_err!(
-        validate_open_sns_token_swap(
-            &OPEN_SNS_TOKEN_SWAP,
-            &mut MockEnvironment {
-                expected_call_canister_method_calls: Arc::new(Mutex::new(VecDeque::from([(
-                    ExpectedCallCanisterMethodCallArguments {
-                        target: SNS_WASM_CANISTER_ID,
-                        method_name: "list_deployed_snses",
-                        request: Encode!(&ListDeployedSnsesRequest {}).unwrap(),
-                    },
-                    Ok(Encode!(&ListDeployedSnsesResponse { instances: vec![] }).unwrap()),
-                )]))),
-                now: Arc::new(Mutex::new(0))
-            },
-        )
-        .await
-    );
-}
-
-#[tokio::test]
-async fn validate_open_sns_token_swap_swap_get_state_fail() {
-    assert_is_err!(
-        validate_open_sns_token_swap(
-            &OPEN_SNS_TOKEN_SWAP,
-            &mut MockEnvironment {
-                expected_call_canister_method_calls: Arc::new(Mutex::new(VecDeque::from([
-                    EXPECTED_LIST_DEPLOYED_SNSES.clone(),
-                    (
-                        ExpectedCallCanisterMethodCallArguments {
-                            target: *TARGET_SWAP_CANISTER_ID,
-                            method_name: "get_state",
-                            request: Encode!(&sns_swap_pb::GetStateRequest {}).unwrap(),
-                        },
-                        Err((None, "derp".to_string())),
-                    )
-                ]),)),
-                now: Arc::new(Mutex::new(0))
-            },
-        )
-        .await
-    );
-}
-
-#[tokio::test]
-async fn validate_open_sns_token_swap_params_max_icp_e8s_too_small() {
-    assert_is_err!(
-        validate_open_sns_token_swap(
-            &OpenSnsTokenSwap {
-                params: Some(sns_swap_pb::Params {
-                    max_icp_e8s: 1, // Too small.
-                    ..PARAMS.clone()
-                }),
-                ..OPEN_SNS_TOKEN_SWAP.clone()
-            },
-            &mut MockEnvironment::default(),
-        )
-        .await
-    );
-}
-
-#[tokio::test]
-async fn validate_open_sns_token_swap_params_basket_count_too_small() {
-    assert_is_err!(
-        validate_open_sns_token_swap(
-            &OpenSnsTokenSwap {
-                params: Some(sns_swap_pb::Params {
-                    neuron_basket_construction_parameters: Some(
-                        NeuronBasketConstructionParameters {
-                            count: 0,                                 // Too small
-                            dissolve_delay_interval_seconds: 7890000, // 3 months
-                        },
-                    ),
-                    ..PARAMS.clone()
-                }),
-                ..OPEN_SNS_TOKEN_SWAP.clone()
-            },
-            &mut MockEnvironment::default(),
-        )
-        .await
-    );
-}
-
-#[tokio::test]
-async fn validate_open_sns_token_swap_params_zero_dissolve_delay() {
-    assert_is_err!(
-        validate_open_sns_token_swap(
-            &OpenSnsTokenSwap {
-                params: Some(sns_swap_pb::Params {
-                    neuron_basket_construction_parameters: Some(
-                        NeuronBasketConstructionParameters {
-                            count: 12,
-                            dissolve_delay_interval_seconds: 0, // Too small
-                        },
-                    ),
-                    ..PARAMS.clone()
-                }),
-                ..OPEN_SNS_TOKEN_SWAP.clone()
-            },
-            &mut MockEnvironment::default(),
-        )
-        .await
-    );
-}
-
-#[tokio::test]
-async fn validate_open_sns_token_swap_params_practically_forever_dissolve_delay() {
-    assert_is_err!(
-        validate_open_sns_token_swap(
-            &OpenSnsTokenSwap {
-                params: Some(sns_swap_pb::Params {
-                    neuron_basket_construction_parameters: Some(
-                        NeuronBasketConstructionParameters {
-                            count: 2,
-                            dissolve_delay_interval_seconds: u64::MAX, // Will result in overflow
-                        },
-                    ),
-                    ..PARAMS.clone()
-                }),
-                ..OPEN_SNS_TOKEN_SWAP.clone()
-            },
-            &mut MockEnvironment::default(),
-        )
-        .await
-    );
-}
-
-#[tokio::test]
-async fn validate_open_sns_token_swap_community_fund_investment_e8s() {
-    assert_is_err!(
-        validate_open_sns_token_swap(
-            &OpenSnsTokenSwap {
-                community_fund_investment_e8s: Some(1001 * E8), // Exceeds max_icp_e8s.
-                ..OPEN_SNS_TOKEN_SWAP.clone()
-            },
-            &mut MockEnvironment::default(),
-        )
-        .await
-    );
-}
-
-lazy_static! {
-    static ref NEURON_STORE: NeuronStore = craft_neuron_store(&[
-        // (maturity, controller, joined cf at)
-
-        // CF neurons.
-        (100 * E8, *PRINCIPAL_ID_1, Some(1)),
-        (200 * E8, *PRINCIPAL_ID_2, Some(1)),
-        (300 * E8, *PRINCIPAL_ID_1, Some(1)),
-
-        // non-CF neurons.
-        (400 * E8, *PRINCIPAL_ID_1, None),
-        (500 * E8, *PRINCIPAL_ID_2, None),
-    ]);
-
-    static ref ORIGINAL_TOTAL_COMMUNITY_FUND_MATURITY_E8S_EQUIVALENT: u64 = {
-        let result = total_community_fund_maturity_e8s_equivalent(&NEURON_STORE);
-        assert_eq!(result, 600 * E8);
-        result
-    };
-}
-
-fn craft_neuron_store(
-    values: &[(
-        /* maturity: */ u64,
-        /* controller: */ PrincipalId,
-        /* joined cf at: */ Option<u64>,
-    )],
-) -> NeuronStore {
-    NeuronStore::new(
-        values
-            .iter()
-            .enumerate()
-            .map(|(i, arg)| {
-                let i = i as u64;
-                let (maturity_e8s_equivalent, controller, joined_community_fund_timestamp_seconds) =
-                    *arg;
-
-                let id = i + 1;
-                let neuron = Neuron {
-                    id: Some(NeuronId { id }),
-                    controller: Some(controller),
-                    maturity_e8s_equivalent,
-                    joined_community_fund_timestamp_seconds,
-                    ..Default::default()
-                };
-
-                (id, neuron)
-            })
-            .collect(),
-    )
-}
-
-fn assert_clean_refund(
-    neuron_store: &mut NeuronStore,
-    cf_participants: &Vec<sns_swap_pb::CfParticipant>,
-    expected_neuron_store: &NeuronStore,
-) {
-    let original_id_to_neuron = neuron_store.clone_neurons();
-    let mut original_neuron_store = NeuronStore::new(original_id_to_neuron);
-
-    let failed_refunds = refund_community_fund_maturity(neuron_store, cf_participants);
-    assert!(failed_refunds.is_empty(), "{:#?}", failed_refunds);
-
-    // Assert that neurons have been restored to the way they were originally.
-    assert_eq!(neuron_store, expected_neuron_store);
-
-    // Assert that inserting extraneous elements into cf_participants does
-    // not change the result, but it does result in failed refunds.
-    let mut extra_cf_participants = cf_participants.clone();
-    let mut expected_failed_refunds = vec![];
-    if !extra_cf_participants.is_empty() {
-        let cf_neuron = sns_swap_pb::CfNeuron::try_new(688477, 592).unwrap();
-        extra_cf_participants
-            .get_mut(0)
-            .unwrap()
-            .cf_neurons
-            .push(cf_neuron.clone());
-        expected_failed_refunds.push(sns_swap_pb::CfParticipant {
-            hotkey_principal: extra_cf_participants
-                .get(0)
-                .unwrap()
-                .hotkey_principal
-                .clone(),
-            cf_neurons: vec![cf_neuron],
-        });
-    }
-
-    let cf_participant = sns_swap_pb::CfParticipant {
-        hotkey_principal: PrincipalId::new_user_test_id(301590).to_string(),
-        cf_neurons: vec![
-            sns_swap_pb::CfNeuron::try_new(875889, 591).unwrap(),
-            sns_swap_pb::CfNeuron::try_new(734429, 917).unwrap(),
-        ],
-    };
-    extra_cf_participants.push(cf_participant.clone());
-    expected_failed_refunds.push(cf_participant);
-
-    assert_eq!(
-        refund_community_fund_maturity(&mut original_neuron_store, &extra_cf_participants,),
-        expected_failed_refunds,
-    );
-    assert_eq!(original_neuron_store, *expected_neuron_store);
-}
-
-#[test]
-fn draw_funds_from_the_community_fund_all_cf_neurons_have_zero_maturity() {
-    let mut neuron_store = craft_neuron_store(&[
-        // (maturity, controller, joined cf at)
-
-        // CF neurons.
-        (0, *PRINCIPAL_ID_1, Some(1)),
-        (0, *PRINCIPAL_ID_2, Some(1)),
-        (0, *PRINCIPAL_ID_1, Some(1)),
-        // non-CF neurons.
-        (400, *PRINCIPAL_ID_1, None),
-        (500, *PRINCIPAL_ID_2, None),
-    ]);
-    let original_neuron_store = neuron_store.clone();
-
-    let observed_cf_neurons = draw_funds_from_the_community_fund(
-        &mut neuron_store,
-        *ORIGINAL_TOTAL_COMMUNITY_FUND_MATURITY_E8S_EQUIVALENT,
-        /* withdrawal_amount_e8s = */ 60,
-        &PARAMS,
-    );
-
-    // Inspect results.
-    assert_eq!(observed_cf_neurons, vec![]);
-    assert_eq!(neuron_store, original_neuron_store);
-    assert_clean_refund(
-        &mut neuron_store,
-        &observed_cf_neurons,
-        &original_neuron_store,
-    );
-}
-
-#[test]
-fn draw_funds_from_the_community_fund_zero_withdrawal_amount() {
-    let mut neuron_store = craft_neuron_store(&[
-        // (maturity, controller, joined cf at)
-
-        // CF neurons.
-        (0, *PRINCIPAL_ID_1, Some(1)),
-        (10, *PRINCIPAL_ID_2, Some(1)),
-        (50, *PRINCIPAL_ID_1, Some(1)),
-        // non-CF neurons.
-        (400, *PRINCIPAL_ID_1, None),
-        (500, *PRINCIPAL_ID_2, None),
-    ]);
-    let original_neuron_store = neuron_store.clone();
-
-    let observed_cf_neurons = draw_funds_from_the_community_fund(
-        &mut neuron_store,
-        *ORIGINAL_TOTAL_COMMUNITY_FUND_MATURITY_E8S_EQUIVALENT,
-        /* withdrawal_amount_e8s = */ 0,
-        &PARAMS,
-    );
-
-    // Inspect results.
-    assert_eq!(observed_cf_neurons, vec![]);
-    assert_eq!(neuron_store, original_neuron_store);
-    assert_clean_refund(
-        &mut neuron_store,
-        &observed_cf_neurons,
-        &original_neuron_store,
-    );
-}
-
-#[test]
-fn draw_funds_from_the_community_fund_typical() {
-    let mut neuron_store = NEURON_STORE.clone();
-    let observed_cf_neurons = draw_funds_from_the_community_fund(
-        &mut neuron_store,
-        *ORIGINAL_TOTAL_COMMUNITY_FUND_MATURITY_E8S_EQUIVALENT,
-        /* withdrawal_amount_e8s = */ 60 * E8,
-        &PARAMS,
-    );
-
-    // Inspect results.
-
-    let mut expected_cf_neurons = vec![
-        sns_swap_pb::CfParticipant {
-            hotkey_principal: PRINCIPAL_ID_1.to_string(),
-            cf_neurons: vec![
-                sns_swap_pb::CfNeuron::try_new(1, 10 * E8).unwrap(),
-                sns_swap_pb::CfNeuron::try_new(3, 30 * E8).unwrap(),
-            ],
-        },
-        sns_swap_pb::CfParticipant {
-            hotkey_principal: PRINCIPAL_ID_2.to_string(),
-            cf_neurons: vec![sns_swap_pb::CfNeuron::try_new(2, 20 * E8).unwrap()],
-        },
-    ];
-    expected_cf_neurons.sort_by(|n1, n2| n1.hotkey_principal.cmp(&n2.hotkey_principal));
-    assert_eq!(observed_cf_neurons, expected_cf_neurons);
-
-    assert_eq!(
-        neuron_store,
-        craft_neuron_store(&[
-            // CF neurons less 10% of their maturity.
-            (90 * E8, *PRINCIPAL_ID_1, Some(1)),
-            (180 * E8, *PRINCIPAL_ID_2, Some(1)),
-            (270 * E8, *PRINCIPAL_ID_1, Some(1)),
-            // non-CF neurons remain untouched.
-            (400 * E8, *PRINCIPAL_ID_1, None),
-            (500 * E8, *PRINCIPAL_ID_2, None),
-        ]),
-    );
-
-    assert_clean_refund(&mut neuron_store, &observed_cf_neurons, &NEURON_STORE);
-}
-
-#[test]
-fn draw_funds_from_the_community_fund_cf_shrank_during_voting_period() {
-    let mut neuron_store = NEURON_STORE.clone();
-
-    let observed_cf_neurons = draw_funds_from_the_community_fund(
-        &mut neuron_store,
-        2 * *ORIGINAL_TOTAL_COMMUNITY_FUND_MATURITY_E8S_EQUIVALENT,
-        /* withdrawal_amount_e8s = */ 60 * E8,
-        &PARAMS,
-    );
-
-    // Inspect results.
-
-    let mut expected_cf_neurons = vec![
-        sns_swap_pb::CfParticipant {
-            hotkey_principal: PRINCIPAL_ID_1.to_string(),
-            cf_neurons: vec![
-                sns_swap_pb::CfNeuron::try_new(1, 5 * E8).unwrap(),
-                sns_swap_pb::CfNeuron::try_new(3, 15 * E8).unwrap(),
-            ],
-        },
-        sns_swap_pb::CfParticipant {
-            hotkey_principal: PRINCIPAL_ID_2.to_string(),
-            cf_neurons: vec![sns_swap_pb::CfNeuron::try_new(2, 10 * E8).unwrap()],
-        },
-    ];
-    expected_cf_neurons.sort_by(|n1, n2| n1.hotkey_principal.cmp(&n2.hotkey_principal));
-    assert_eq!(observed_cf_neurons, expected_cf_neurons);
-
-    assert_eq!(
-        neuron_store,
-        craft_neuron_store(&[
-            // CF neurons less 10% of their maturity.
-            (95 * E8, *PRINCIPAL_ID_1, Some(1)),
-            (190 * E8, *PRINCIPAL_ID_2, Some(1)),
-            (285 * E8, *PRINCIPAL_ID_1, Some(1)),
-            // non-CF neurons remain untouched.
-            (400 * E8, *PRINCIPAL_ID_1, None),
-            (500 * E8, *PRINCIPAL_ID_2, None),
-        ]),
-    );
-
-    assert_clean_refund(&mut neuron_store, &observed_cf_neurons, &NEURON_STORE);
-}
-
-#[test]
-fn draw_funds_from_the_community_fund_cf_grew_during_voting_period() {
-    let mut neuron_store = NEURON_STORE.clone();
-
-    let observed_cf_neurons = draw_funds_from_the_community_fund(
-        &mut neuron_store,
-        *ORIGINAL_TOTAL_COMMUNITY_FUND_MATURITY_E8S_EQUIVALENT / 2,
-        /* withdrawal_amount_e8s = */ 60 * E8,
-        &PARAMS,
-    );
-
-    // Inspect results. Same as typical (copy n' pasted).
-
-    let mut expected_cf_neurons = vec![
-        sns_swap_pb::CfParticipant {
-            hotkey_principal: PRINCIPAL_ID_1.to_string(),
-            cf_neurons: vec![
-                sns_swap_pb::CfNeuron::try_new(1, 10 * E8).unwrap(),
-                sns_swap_pb::CfNeuron::try_new(3, 30 * E8).unwrap(),
-            ],
-        },
-        sns_swap_pb::CfParticipant {
-            hotkey_principal: PRINCIPAL_ID_2.to_string(),
-            cf_neurons: vec![sns_swap_pb::CfNeuron::try_new(2, 20 * E8).unwrap()],
-        },
-    ];
-    expected_cf_neurons.sort_by(|n1, n2| n1.hotkey_principal.cmp(&n2.hotkey_principal));
-    assert_eq!(observed_cf_neurons, expected_cf_neurons);
-
-    assert_eq!(
-        neuron_store,
-        craft_neuron_store(&[
-            // CF neurons less 10% of their maturity.
-            (90 * E8, *PRINCIPAL_ID_1, Some(1)),
-            (180 * E8, *PRINCIPAL_ID_2, Some(1)),
-            (270 * E8, *PRINCIPAL_ID_1, Some(1)),
-            // non-CF neurons remain untouched.
-            (400 * E8, *PRINCIPAL_ID_1, None),
-            (500 * E8, *PRINCIPAL_ID_2, None),
-        ]),
-    );
-
-    assert_clean_refund(&mut neuron_store, &observed_cf_neurons, &NEURON_STORE);
-}
-
-#[test]
-fn draw_funds_from_the_community_fund_trivial() {
-    let mut neuron_store = NeuronStore::new(btreemap! {});
-    let original_total_community_fund_maturity_e8s_equivalent = 0;
-
-    let observed_cf_neurons = draw_funds_from_the_community_fund(
-        &mut neuron_store,
-        original_total_community_fund_maturity_e8s_equivalent,
-        /* withdrawal_amount_e8s = */ 60,
-        &PARAMS,
-    );
-
-    // Inspect results.
-    assert_eq!(observed_cf_neurons, vec![]);
-    assert_eq!(neuron_store, NeuronStore::new(btreemap! {}));
-
-    assert_clean_refund(
-        &mut neuron_store,
-        &observed_cf_neurons,
-        &NeuronStore::new(btreemap! {}),
-    );
-}
-
-#[test]
-fn draw_funds_from_the_community_fund_cf_not_large_enough() {
-    let mut neuron_store = NEURON_STORE.clone();
-
-    let observed_cf_neurons = draw_funds_from_the_community_fund(
-        &mut neuron_store,
-        *ORIGINAL_TOTAL_COMMUNITY_FUND_MATURITY_E8S_EQUIVALENT,
-        /* withdrawal_amount_e8s = */ 1000 * E8,
-        &PARAMS,
-    );
-
-    // Inspect results.
-
-    let mut expected_cf_neurons = vec![
-        sns_swap_pb::CfParticipant {
-            hotkey_principal: PRINCIPAL_ID_1.to_string(),
-            cf_neurons: vec![
-                sns_swap_pb::CfNeuron::try_new(1, 100 * E8).unwrap(),
-                sns_swap_pb::CfNeuron::try_new(3, 300 * E8).unwrap(),
-            ],
-        },
-        sns_swap_pb::CfParticipant {
-            hotkey_principal: PRINCIPAL_ID_2.to_string(),
-            cf_neurons: vec![sns_swap_pb::CfNeuron::try_new(2, 200 * E8).unwrap()],
-        },
-    ];
-    expected_cf_neurons.sort_by(|n1, n2| n1.hotkey_principal.cmp(&n2.hotkey_principal));
-    assert_eq!(observed_cf_neurons, expected_cf_neurons);
-
-    assert_eq!(
-        neuron_store,
-        craft_neuron_store(&[
-            // CF neurons have been completely depleted.
-            (0, *PRINCIPAL_ID_1, Some(1)),
-            (0, *PRINCIPAL_ID_2, Some(1)),
-            (0, *PRINCIPAL_ID_1, Some(1)),
-            // non-CF neurons remain untouched.
-            (400 * E8, *PRINCIPAL_ID_1, None),
-            (500 * E8, *PRINCIPAL_ID_2, None),
-        ]),
-    );
-
-    assert_clean_refund(&mut neuron_store, &observed_cf_neurons, &NEURON_STORE);
-}
-
-#[test]
-fn draw_funds_from_the_community_fund_exclude_small_cf_neuron_and_cap_large() {
-    let params = Params {
-        min_participant_icp_e8s: 150 * E8,
-        max_participant_icp_e8s: 225 * E8,
-        ..PARAMS.clone()
-    };
-    let mut neuron_store = NEURON_STORE.clone();
-
-    let observed_cf_neurons = draw_funds_from_the_community_fund(
-        &mut neuron_store,
-        *ORIGINAL_TOTAL_COMMUNITY_FUND_MATURITY_E8S_EQUIVALENT,
-        /* withdrawal_amount_e8s = */ 600 * E8,
-        &params,
-    );
-
-    // Inspect results.
-
-    let mut expected_cf_neurons = vec![
-        sns_swap_pb::CfParticipant {
-            hotkey_principal: PRINCIPAL_ID_1.to_string(),
-            cf_neurons: vec![sns_swap_pb::CfNeuron::try_new(3, 225 * E8).unwrap()],
-        },
-        sns_swap_pb::CfParticipant {
-            hotkey_principal: PRINCIPAL_ID_2.to_string(),
-            cf_neurons: vec![sns_swap_pb::CfNeuron::try_new(2, 200 * E8).unwrap()],
-        },
-    ];
-    expected_cf_neurons.sort_by(|n1, n2| n1.hotkey_principal.cmp(&n2.hotkey_principal));
-    assert_eq!(observed_cf_neurons, expected_cf_neurons);
-
-    assert_eq!(
-        neuron_store,
-        craft_neuron_store(&[
-            // CF neurons.
-            (100 * E8, *PRINCIPAL_ID_1, Some(1)), // Does not participate, because too small.
-            (0, *PRINCIPAL_ID_2, Some(1)),        // Fully participates.
-            (75 * E8, *PRINCIPAL_ID_1, Some(1)),  // Participates up to the allowed participant max.
-            // non-CF neurons remain untouched.
-            (400 * E8, *PRINCIPAL_ID_1, None),
-            (500 * E8, *PRINCIPAL_ID_2, None),
-        ]),
-    );
-
-    assert_clean_refund(&mut neuron_store, &observed_cf_neurons, &NEURON_STORE);
-}
-
-#[test]
-fn sum_cf_participants_e8s_nonempty() {
-    assert_eq!(
-        sum_cf_participants_e8s(&[
-            sns_swap_pb::CfParticipant {
-                hotkey_principal: PRINCIPAL_ID_1.to_string(),
-                cf_neurons: vec![
-                    sns_swap_pb::CfNeuron::try_new(1, 100,).unwrap(),
-                    sns_swap_pb::CfNeuron::try_new(3, 300,).unwrap(),
-                ],
-            },
-            sns_swap_pb::CfParticipant {
-                hotkey_principal: PRINCIPAL_ID_2.to_string(),
-                cf_neurons: vec![sns_swap_pb::CfNeuron::try_new(2, 200,).unwrap()],
-            },
-        ]),
-        600,
-    );
-}
-
-// TODO[NNS1-2632]: Remove this test once `settle_community_fund_participation` is deprecated.
-mod settle_community_fund_participation_tests {
-    use settle_community_fund_participation::{Aborted, Committed, Result};
-
-    use super::*;
-
-    lazy_static! {
-        static ref COMMITTED: SettleCommunityFundParticipation = SettleCommunityFundParticipation {
-            open_sns_token_swap_proposal_id: Some(7),
-            result: Some(Result::Committed(Committed {
-                sns_governance_canister_id: Some(PrincipalId::new_user_test_id(672891)),
-                total_direct_contribution_icp_e8s: None,
-                total_neurons_fund_contribution_icp_e8s: None,
-            })),
-        };
-        static ref ABORTED: SettleCommunityFundParticipation = SettleCommunityFundParticipation {
-            open_sns_token_swap_proposal_id: Some(42),
-            result: Some(Result::Aborted(Aborted {})),
-        };
-    }
-
-    #[test]
-    fn ok() {
-        assert_is_ok!(validate_settle_community_fund_participation(&COMMITTED));
-        assert_is_ok!(validate_settle_community_fund_participation(&ABORTED));
-    }
-
-    #[test]
-    fn no_proposal_id() {
-        assert_is_err!(validate_settle_community_fund_participation(
-            &SettleCommunityFundParticipation {
-                open_sns_token_swap_proposal_id: None,
-                ..COMMITTED.clone()
-            }
-        ));
-    }
-
-    #[test]
-    fn no_result() {
-        assert_is_err!(validate_settle_community_fund_participation(
-            &SettleCommunityFundParticipation {
-                result: None,
-                ..COMMITTED.clone()
-            }
-        ));
-    }
-
-    #[test]
-    fn no_sns_governance_canister_id() {
-        assert_is_err!(validate_settle_community_fund_participation(
-            &SettleCommunityFundParticipation {
-                open_sns_token_swap_proposal_id: Some(7),
-                result: Some(Result::Committed(Committed {
-                    sns_governance_canister_id: None,
-                    total_direct_contribution_icp_e8s: None,
-                    total_neurons_fund_contribution_icp_e8s: None,
-                })),
-            }
-        ));
-    }
-} // end mod settle_community_fund_participation_tests
 
 mod settle_neurons_fund_participation_request_tests {
     use settle_neurons_fund_participation_request::{Aborted, Committed, Result};
@@ -1091,6 +134,7 @@ mod convert_from_create_service_nervous_system_to_sns_init_payload_tests {
     use super::*;
     use ic_nervous_system_proto::pb::v1 as pb;
     use ic_sns_init::pb::v1::sns_init_payload;
+    use ic_sns_swap::pb::v1::NeuronBasketConstructionParameters;
     use test_data::{CREATE_SERVICE_NERVOUS_SYSTEM_WITH_MATCHED_FUNDING, IMAGE_1, IMAGE_2};
 
     // Alias types from crate::pb::v1::...
@@ -1116,7 +160,6 @@ mod convert_from_create_service_nervous_system_to_sns_init_payload_tests {
         Some(original.as_ref().unwrap().basis_points.unwrap())
     }
 
-    #[cfg(feature = "test")]
     #[test]
     fn test_convert_from_valid() {
         // Step 1: Prepare the world. (In this case, trivial.)
@@ -1275,7 +318,7 @@ mod convert_from_create_service_nervous_system_to_sns_init_payload_tests {
         );
         let original_neuron_distribution: &_ = original_developer_distribution
             .developer_neurons
-            .get(0)
+            .first()
             .unwrap();
 
         let src::SwapDistribution { total: swap_total } = original_initial_token_distribution
@@ -1358,7 +401,6 @@ mod convert_from_create_service_nervous_system_to_sns_init_payload_tests {
         assert_eq!(converted.swap_due_timestamp_seconds, None);
     }
 
-    #[cfg(feature = "test")]
     #[test]
     fn test_convert_from_invalid() {
         // Step 1: Prepare the world: construct input.
@@ -1391,8 +433,8 @@ mod convert_from_executed_create_service_nervous_system_proposal_to_sns_init_pay
     use super::*;
     use ic_nervous_system_proto::pb::v1 as pb;
     use ic_sns_init::pb::v1::sns_init_payload;
-    use test_data::CREATE_SERVICE_NERVOUS_SYSTEM_WITH_MATCHED_FUNDING;
-    use test_data::{IMAGE_1, IMAGE_2};
+    use ic_sns_swap::pb::v1::NeuronBasketConstructionParameters;
+    use test_data::{CREATE_SERVICE_NERVOUS_SYSTEM_WITH_MATCHED_FUNDING, IMAGE_1, IMAGE_2};
 
     // Alias types from crate::pb::v1::...
     //
@@ -1421,8 +463,6 @@ mod convert_from_executed_create_service_nervous_system_proposal_to_sns_init_pay
     fn test_convert_from_valid() {
         // Step 1: Prepare the world. (In this case, trivial.)
 
-        use ic_sns_init::pb::v1::NeuronsFundParticipants;
-
         use crate::governance::test_data::NEURONS_FUND_PARTICIPATION_CONSTRAINTS;
         let current_timestamp_seconds = 13_245;
         let proposal_id = 1000;
@@ -1433,7 +473,6 @@ mod convert_from_executed_create_service_nervous_system_proposal_to_sns_init_pay
                 create_service_nervous_system: CREATE_SERVICE_NERVOUS_SYSTEM_WITH_MATCHED_FUNDING
                     .clone(),
                 proposal_id,
-                neurons_fund_participants: vec![],
                 random_swap_start_time: GlobalTimeOfDay {
                     seconds_after_utc_midnight: Some(0),
                 },
@@ -1564,9 +603,7 @@ mod convert_from_executed_create_service_nervous_system_proposal_to_sns_init_pay
                 confirmation_text: original_swap_parameters.confirmation_text.clone(),
                 restricted_countries: original_swap_parameters.restricted_countries.clone(),
                 nns_proposal_id: Some(proposal_id),
-                neurons_fund_participants: Some(NeuronsFundParticipants {
-                    participants: vec![],
-                }),
+                neurons_fund_participants: None,
                 neurons_fund_participation: Some(true),
 
                 neurons_fund_participation_constraints: Some(
@@ -1598,7 +635,7 @@ mod convert_from_executed_create_service_nervous_system_proposal_to_sns_init_pay
         );
         let original_neuron_distribution: &_ = original_developer_distribution
             .developer_neurons
-            .get(0)
+            .first()
             .unwrap();
 
         let src::SwapDistribution { total: swap_total } = original_initial_token_distribution
@@ -1695,17 +732,16 @@ mod convert_from_executed_create_service_nervous_system_proposal_to_sns_init_pay
 }
 
 mod metrics_tests {
-    use std::sync::{Arc, Mutex};
 
     use maplit::btreemap;
 
     use crate::{
         encode_metrics,
-        governance::{
-            tests::{MockEnvironment, StubCMC, StubIcpLedger},
-            Governance,
+        governance::Governance,
+        pb::v1::{
+            proposal, Governance as GovernanceProto, Motion, Proposal, ProposalData, Tally, Topic,
         },
-        pb::v1::{proposal, Governance as GovernanceProto, Motion, Proposal, ProposalData, Tally},
+        test_utils::{MockEnvironment, StubCMC, StubIcpLedger},
     };
 
     #[test]
@@ -1751,10 +787,7 @@ mod metrics_tests {
                 },
                 ..GovernanceProto::default()
             },
-            Box::new(MockEnvironment {
-                expected_call_canister_method_calls: Arc::new(Mutex::new(Default::default())),
-                now: Arc::new(Mutex::new(0)),
-            }),
+            Box::new(MockEnvironment::new(Default::default(), 0)),
             Box::new(StubIcpLedger {}),
             Box::new(StubCMC {}),
         );
@@ -1769,6 +802,86 @@ mod metrics_tests {
         // We assert that it is '555' instead of '1', so that we know the correct
         // proposal action is filtered out.
         assert!(s.contains("governance_voting_power_total 555 1000"));
+    }
+
+    #[test]
+    fn test_metrics_proposal_deadline_timestamp_seconds() {
+        let manage_neuron_action = proposal::Action::ManageNeuron(Box::default());
+        let motion_action = proposal::Action::Motion(Motion {
+            motion_text: "Text for this motion".to_string(),
+        });
+
+        let open_proposal = ProposalData {
+            proposal: Some(Proposal {
+                title: Some("open_proposal".to_string()),
+                action: Some(manage_neuron_action.clone()),
+                ..Proposal::default()
+            }),
+            ..ProposalData::default()
+        };
+
+        let rejected_proposal = ProposalData {
+            proposal: Some(Proposal {
+                title: Some("rejected_proposal".to_string()),
+                action: Some(manage_neuron_action.clone()),
+                ..Proposal::default()
+            }),
+            decided_timestamp_seconds: 1,
+            ..ProposalData::default()
+        };
+
+        let motion_proposal = ProposalData {
+            proposal: Some(Proposal {
+                title: Some("Foo Foo Bar".to_string()),
+                action: Some(motion_action.clone()),
+                ..Proposal::default()
+            }),
+            ..ProposalData::default()
+        };
+
+        let governance = Governance::new(
+            GovernanceProto {
+                proposals: btreemap! {
+                    1 =>  open_proposal.clone(),
+                    2 =>  rejected_proposal,
+                    3 =>  motion_proposal.clone(),
+                },
+                ..GovernanceProto::default()
+            },
+            Box::<MockEnvironment>::default(),
+            Box::new(StubIcpLedger {}),
+            Box::new(StubCMC {}),
+        );
+
+        let mut writer = ic_metrics_encoder::MetricsEncoder::new(vec![], 10);
+
+        encode_metrics(&governance, &mut writer).unwrap();
+
+        let body = writer.into_inner();
+        let s = String::from_utf8_lossy(&body);
+
+        let voting_period = governance.voting_period_seconds()(open_proposal.topic());
+        let deadline_ts = open_proposal.get_deadline_timestamp_seconds(voting_period);
+
+        assert!(s.contains(&format!(
+            "governance_proposal_deadline_timestamp_seconds{{proposal_id=\"1\",proposal_topic=\"{}\",proposal_type=\"{}\"}} {} 10",
+            Topic::NeuronManagement.as_str_name(),
+            &manage_neuron_action.as_str_name(),
+            deadline_ts,
+        )));
+
+        let voting_period = governance.voting_period_seconds()(motion_proposal.topic());
+        let deadline_ts = motion_proposal.get_deadline_timestamp_seconds(voting_period);
+
+        assert!(s.contains(&format!(
+            "governance_proposal_deadline_timestamp_seconds{{proposal_id=\"3\",proposal_topic=\"{}\",proposal_type=\"{}\"}} {} 10",
+            Topic::Governance.as_str_name(),
+            &motion_action.as_str_name(),
+            deadline_ts,
+        )));
+
+        // We assert that decided proposals are filtered out from metrics
+        assert!(!s.contains("proposal_id=\"2\""));
     }
 }
 
@@ -2106,10 +1219,7 @@ fn governance_remove_neuron_updates_followee_index_correctly() {
             },
             ..Default::default()
         },
-        Box::new(MockEnvironment {
-            expected_call_canister_method_calls: Arc::new(Mutex::new(Default::default())),
-            now: Arc::new(Mutex::new(0)),
-        }),
+        Box::new(MockEnvironment::new(vec![], 0)),
         Box::new(StubIcpLedger {}),
         Box::new(StubCMC {}),
     );
@@ -2139,6 +1249,7 @@ fn test_pre_and_post_upgrade_first_time() {
                 followees: vec![NeuronId { id : 3}]
             }
         },
+        account: vec![0; 32],
         ..Default::default()
     };
     let neurons = btreemap! { 1 => neuron1 };
@@ -2156,7 +1267,7 @@ fn test_pre_and_post_upgrade_first_time() {
     // Then Governance is instantiated during upgrade with proto
     let mut governance = Governance::new(
         governance_proto,
-        Box::<MockEnvironment<'_>>::default(),
+        Box::<MockEnvironment>::default(),
         Box::new(StubIcpLedger {}),
         Box::new(StubCMC {}),
     );
@@ -2180,7 +1291,7 @@ fn test_pre_and_post_upgrade_first_time() {
     // We now simulate the post_upgrade
     let mut governance = Governance::new_restored(
         extracted_proto,
-        Box::<MockEnvironment<'_>>::default(),
+        Box::<MockEnvironment>::default(),
         Box::new(StubIcpLedger {}),
         Box::new(StubCMC {}),
     );
@@ -2191,126 +1302,48 @@ fn test_pre_and_post_upgrade_first_time() {
 }
 
 #[test]
-fn governance_sets_seed_accounts_if_unset() {
-    // Setup the test
-
+fn can_spawn_neurons_only_true_when_not_spawning_and_neurons_ready_to_spawn() {
     let proto = GovernanceProto {
-        // Setting the seed_accounts to None in GovernanceProto should trigger the Governance
-        // canister to set seed_accounts itself.
-        seed_accounts: None,
         ..Default::default()
     };
 
-    // Capture all of the Seed and ECT accounts into a Set to be used to verify
-    // success later.
-    let mut expected_seed_account_ids: HashSet<String> = SEED_ROUND_ACCOUNTS
-        .iter()
-        .map(|(account_id, _)| account_id.to_string())
-        .collect();
-    let mut expected_ect_account_ids: HashSet<String> = ECT_ACCOUNTS
-        .iter()
-        .map(|(account_id, _)| account_id.to_string())
-        .collect();
+    let mock_env = MockEnvironment::new(vec![], 100);
 
-    // Execute code under test
-
-    let governance = Governance::new(
+    let mut governance = Governance::new(
         proto,
-        Box::<MockEnvironment<'_>>::default(),
+        Box::new(mock_env),
         Box::new(StubIcpLedger {}),
         Box::new(StubCMC {}),
     );
+    // No neurons to spawn...
+    assert!(!governance.can_spawn_neurons());
 
-    // Verify
+    governance
+        .neuron_store
+        .add_neuron(Neuron {
+            id: Some(NeuronId { id: 1 }),
+            spawn_at_timestamp_seconds: Some(99),
+            ..Default::default()
+        })
+        .unwrap();
 
-    assert!(governance.heap_data.seed_accounts.is_some());
-    // Assert that seed_accounts is created as expected
-    for seed_account in &governance
-        .heap_data
-        .seed_accounts
-        .as_ref()
-        .unwrap()
-        .accounts
-    {
-        let SeedAccount {
-            account_id,
-            tag_start_timestamp_seconds,
-            tag_end_timestamp_seconds,
-            error_count,
-            neuron_type,
-        } = seed_account;
+    governance.heap_data.spawning_neurons = Some(true);
 
-        // This should be set to their default to be used later during processing.
-        assert_eq!(*tag_start_timestamp_seconds, None);
-        assert_eq!(*tag_end_timestamp_seconds, None);
-        assert_eq!(*error_count, 0);
+    // spawning_neurons is true, so it shouldn't be able to spawn again.
+    assert!(!governance.can_spawn_neurons());
 
-        // Make sure the SeedAccount has the correct Neuron type and is set. Do this by removing
-        // it from the set of expected account ids.
-        match NeuronType::try_from(*neuron_type) {
-            Ok(NeuronType::Seed) => {
-                assert!(expected_seed_account_ids.contains(account_id.as_str()));
-                expected_seed_account_ids.remove(account_id.as_str());
-            }
-            Ok(NeuronType::Ect) => {
-                assert!(expected_ect_account_ids.contains(account_id.as_str()));
-                expected_ect_account_ids.remove(account_id.as_str());
-            }
-            Err(msg) => panic!(
-                "SeedAccount {} has an unknown NeuronType value as i32 {}. Error: {:?}",
-                account_id, neuron_type, msg
-            ),
-            Ok(NeuronType::Unspecified) => panic!(
-                "SeedAccount {} has a disallowed NeuronType value {}",
-                account_id, neuron_type
-            ),
-        }
-    }
+    governance.heap_data.spawning_neurons = None;
 
-    // Make sure no Seed Accounts were skipped
-    assert_eq!(expected_seed_account_ids, hashset! {});
-    assert_eq!(expected_ect_account_ids, hashset! {});
+    // Work to do, no lock, should say yes.
+    assert!(governance.can_spawn_neurons());
 }
 
-/// This test makes sure that seed_accounts survives across upgrades
 #[test]
-fn governance_ignores_if_seed_accounts_is_set() {
-    // Setup the test
+fn topic_min_max_test() {
+    use strum::IntoEnumIterator;
 
-    let expected_seed_accounts = Some(SeedAccounts {
-        accounts: vec![
-            SeedAccount {
-                account_id: "Some Random String".to_string(),
-                tag_start_timestamp_seconds: None,
-                tag_end_timestamp_seconds: None,
-                error_count: 0,
-                neuron_type: NeuronType::Seed as i32,
-            },
-            SeedAccount {
-                account_id: "Some Other Random String".to_string(),
-                tag_end_timestamp_seconds: None,
-                tag_start_timestamp_seconds: None,
-                error_count: 0,
-                neuron_type: NeuronType::Ect as i32,
-            },
-        ],
-    });
-
-    let proto = GovernanceProto {
-        seed_accounts: expected_seed_accounts.clone(),
-        ..Default::default()
-    };
-
-    // Execute code under test
-
-    // Since seed_accounts is None, it should be set after calling new()
-    let governance = Governance::new(
-        proto,
-        Box::<MockEnvironment<'_>>::default(),
-        Box::new(StubIcpLedger {}),
-        Box::new(StubCMC {}),
-    );
-
-    assert!(governance.heap_data.seed_accounts.is_some());
-    assert_eq!(governance.heap_data.seed_accounts, expected_seed_accounts);
+    for topic in Topic::iter() {
+        assert!(topic >= Topic::MIN, "Topic::MIN needs to be updated");
+        assert!(topic <= Topic::MAX, "Topic::MAX needs to be updated");
+    }
 }

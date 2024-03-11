@@ -4,28 +4,31 @@ use crate::utils::do_copy;
 use ic_base_types::{NumBytes, NumSeconds};
 use ic_config::flag_status::FlagStatus;
 use ic_logger::{error, info, warn, ReplicaLogger};
+use ic_management_canister_types::{CanisterLog, LogVisibility};
 use ic_metrics::{buckets::decimal_buckets, MetricsRegistry};
 use ic_protobuf::{
     proxy::{try_from_option_field, ProxyDecodeError},
     state::{
+        canister_snapshot_bits::v1 as pb_canister_snapshot_bits,
         canister_state_bits::v1 as pb_canister_state_bits, ingress::v1 as pb_ingress,
         queues::v1 as pb_queues, stats::v1 as pb_stats, system_metadata::v1 as pb_metadata,
     },
 };
 use ic_replicated_state::{
+    canister_snapshots::SnapshotId,
     canister_state::{
         execution_state::{NextScheduledMethod, WasmMetadata},
         system_state::{wasm_chunk_store::WasmChunkStoreMetadata, CanisterHistory, CyclesUseCase},
     },
+    page_map::Shard,
     CallContextManager, CanisterStatus, ExecutionTask, ExportedFunctions, Global, NumWasmPages,
 };
-use ic_sys::mmap::ScopedMmap;
+use ic_sys::{fs::sync_path, mmap::ScopedMmap};
 use ic_types::{
     batch::TotalQueryStats, nominal_cycles::NominalCycles, AccumulatedPriority, CanisterId,
     ComputeAllocation, Cycles, ExecutionRound, Height, MemoryAllocation, NumInstructions,
-    PrincipalId,
+    PrincipalId, Time,
 };
-use ic_utils::fs::sync_path;
 use ic_utils::thread::parallel_map;
 use ic_wasm_types::{CanisterModule, WasmHash};
 use prometheus::{Histogram, IntCounterVec};
@@ -53,6 +56,7 @@ pub const SPLIT_MARKER_FILE: &str = "split_from.pbuf";
 pub const SUBNET_QUEUES_FILE: &str = "subnet_queues.pbuf";
 pub const SYSTEM_METADATA_FILE: &str = "system_metadata.pbuf";
 pub const STATS_FILE: &str = "stats.pbuf";
+pub const WASM_FILE: &str = "software.wasm";
 
 /// `ReadOnly` is the access policy used for reading checkpoints. We
 /// don't want to ever modify persisted states.
@@ -161,6 +165,32 @@ pub struct CanisterStateBits {
     pub canister_history: CanisterHistory,
     pub wasm_chunk_store_metadata: WasmChunkStoreMetadata,
     pub total_query_stats: TotalQueryStats,
+    pub log_visibility: LogVisibility,
+    pub canister_log: CanisterLog,
+}
+
+/// This struct contains bits of the `CanisterSnapshot` that are not already
+/// covered somewhere else and are too small to be serialized separately.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CanisterSnapshotBits {
+    /// The ID of the canister snapshot.
+    pub snapshot_id: SnapshotId,
+    /// Identifies the canister to which this snapshot belongs.
+    pub canister_id: CanisterId,
+    /// The timestamp indicating the moment the snapshot was captured.
+    pub taken_at_timestamp: Time,
+    /// The canister version at the time of taking the snapshot.
+    pub canister_version: u64,
+    /// The hash of the canister wasm.
+    pub binary_hash: Option<WasmHash>,
+    /// The certified data blob belonging to the canister.
+    pub certified_data: Vec<u8>,
+    /// The metadata required for a wasm chunk store.
+    pub wasm_chunk_store_metadata: WasmChunkStoreMetadata,
+    /// The size of the stable memory in pages.
+    pub stable_memory_size: NumWasmPages,
+    /// The size of the wasm memory in pages.
+    pub wasm_memory_size: NumWasmPages,
 }
 
 #[derive(Clone)]
@@ -1370,6 +1400,62 @@ pub struct CanisterLayout<Permissions: AccessPolicy> {
     permissions_tag: PhantomData<Permissions>,
 }
 
+/// Get overlay height as encoded in CanisterLayout.
+pub fn overlay_height(overlay: &Path) -> Result<Height, LayoutError> {
+    let file_name = overlay
+        .file_name()
+        .ok_or(LayoutError::CorruptedLayout {
+            path: overlay.to_path_buf(),
+            message: "No file name".to_owned(),
+        })?
+        .to_str()
+        .ok_or(LayoutError::CorruptedLayout {
+            path: overlay.to_path_buf(),
+            message: "Cannot convert file name to string".to_owned(),
+        })?;
+    let hex = file_name
+        .split('_')
+        .next()
+        .ok_or(LayoutError::CorruptedLayout {
+            path: overlay.to_path_buf(),
+            message: "Cannot parse file name".to_owned(),
+        })?;
+    u64::from_str_radix(hex, 16)
+        .map(Height::new)
+        .map_err(|err| LayoutError::CorruptedLayout {
+            path: overlay.to_path_buf(),
+            message: format!("failed to get height for overlay {}: {}", hex, err),
+        })
+}
+
+/// Get overlay height as encoded in CanisterLayout.
+pub fn overlay_shard(overlay: &Path) -> Result<Shard, LayoutError> {
+    let file_name = overlay
+        .file_name()
+        .ok_or(LayoutError::CorruptedLayout {
+            path: overlay.to_path_buf(),
+            message: "No file name".to_owned(),
+        })?
+        .to_str()
+        .ok_or(LayoutError::CorruptedLayout {
+            path: overlay.to_path_buf(),
+            message: "Cannot convert file name to string".to_owned(),
+        })?;
+    let hex = file_name
+        .split('_')
+        .nth(1)
+        .ok_or(LayoutError::CorruptedLayout {
+            path: overlay.to_path_buf(),
+            message: "Cannot parse file name".to_owned(),
+        })?;
+    u64::from_str_radix(hex, 16)
+        .map(Shard::new)
+        .map_err(|err| LayoutError::CorruptedLayout {
+            path: overlay.to_path_buf(),
+            message: format!("failed to get shard for overlay {}: {}", hex, err),
+        })
+}
+
 impl<Permissions: AccessPolicy> CanisterLayout<Permissions> {
     pub fn new(canister_root: PathBuf) -> Result<Self, LayoutError> {
         Permissions::check_dir(&canister_root)?;
@@ -1388,13 +1474,23 @@ impl<Permissions: AccessPolicy> CanisterLayout<Permissions> {
     }
 
     pub fn wasm(&self) -> WasmFile<Permissions> {
-        self.canister_root.join("software.wasm").into()
+        self.canister_root.join(WASM_FILE).into()
     }
 
     pub fn canister(
         &self,
     ) -> ProtoFileWith<pb_canister_state_bits::CanisterStateBits, Permissions> {
         self.canister_root.join(CANISTER_FILE).into()
+    }
+
+    /// Overlay path encoding, consistent with `overlay_height()` and `overlay_shard()`.
+    fn overlay_path(&self, name_end: &str, height: Height, shard: Shard) -> PathBuf {
+        self.canister_root.join(format!(
+            "{:016x}_{:04x}_{}",
+            height.get(),
+            shard.get(),
+            name_end,
+        ))
     }
 
     /// List all overlay files with a particular name ending.
@@ -1436,10 +1532,10 @@ impl<Permissions: AccessPolicy> CanisterLayout<Permissions> {
         self.overlays_impl("_vmemory_0.overlay")
     }
 
-    /// Name of a (potentially new) overlay file for the wasm memory written at `height`.
-    pub fn vmemory_0_overlay(&self, height: Height) -> PathBuf {
-        self.canister_root
-            .join(format!("{:016x}_vmemory_0.overlay", height.get()))
+    /// Name of a (potentially new) overlay file for the wasm memory written at `height` and shard
+    /// `shard`.
+    pub fn vmemory_0_overlay(&self, height: Height, shard: Shard) -> PathBuf {
+        self.overlay_path("vmemory_0.overlay", height, shard)
     }
 
     /// Base file for stable memory.
@@ -1452,10 +1548,10 @@ impl<Permissions: AccessPolicy> CanisterLayout<Permissions> {
         self.overlays_impl("_stable_memory.overlay")
     }
 
-    /// Name of a (potentially new) overlay file for the stable memory written at `height`.
-    pub fn stable_memory_overlay(&self, height: Height) -> PathBuf {
-        self.canister_root
-            .join(format!("{:016x}_stable_memory.overlay", height.get()))
+    /// Name of a (potentially new) overlay file for the stable memory written at `height` and shard
+    /// `shard`.
+    pub fn stable_memory_overlay(&self, height: Height, shard: Shard) -> PathBuf {
+        self.overlay_path("stable_memory.overlay", height, shard)
     }
 
     /// Base file for wasm chunk store.
@@ -1468,10 +1564,10 @@ impl<Permissions: AccessPolicy> CanisterLayout<Permissions> {
         self.overlays_impl("_wasm_chunk_store.overlay")
     }
 
-    /// Name of a (potentially new) overlay file for the wasm chunk store written at `height`.
-    pub fn wasm_chunk_store_overlay(&self, height: Height) -> PathBuf {
-        self.canister_root
-            .join(format!("{:016x}_wasm_chunk_store.overlay", height.get()))
+    /// Name of a (potentially new) overlay file for the wasm chunk store written at `height` and
+    /// shard `shard`.
+    pub fn wasm_chunk_store_overlay(&self, height: Height, shard: Shard) -> PathBuf {
+        self.overlay_path("wasm_chunk_store.overlay", height, shard)
     }
 }
 
@@ -1766,6 +1862,14 @@ impl From<CanisterStateBits> for pb_canister_state_bits::CanisterStateBits {
             canister_history: Some((&item.canister_history).into()),
             wasm_chunk_store_metadata: Some((&item.wasm_chunk_store_metadata).into()),
             total_query_stats: Some((&item.total_query_stats).into()),
+            log_visibility: item.log_visibility.into(),
+            canister_log_records: item
+                .canister_log
+                .records()
+                .iter()
+                .map(|record| record.clone().into())
+                .collect(),
+            next_canister_log_record_idx: item.canister_log.next_idx(),
         }
     }
 }
@@ -1801,14 +1905,12 @@ impl TryFrom<pb_canister_state_bits::CanisterStateBits> for CanisterStateBits {
 
         let cycles_debit = value
             .cycles_debit
-            .map(|c| c.try_into())
-            .transpose()?
+            .map(|c| c.into())
             .unwrap_or_else(Cycles::zero);
 
         let reserved_balance = value
             .reserved_balance
-            .map(|c| c.try_into())
-            .transpose()?
+            .map(|c| c.into())
             .unwrap_or_else(Cycles::zero);
 
         let task_queue = value
@@ -1887,6 +1989,15 @@ impl TryFrom<pb_canister_state_bits::CanisterStateBits> for CanisterStateBits {
                 "CanisterStateBits::total_query_stats",
             )
             .unwrap_or_default(),
+            log_visibility: value.log_visibility.try_into()?,
+            canister_log: CanisterLog::new(
+                value.next_canister_log_record_idx,
+                value
+                    .canister_log_records
+                    .into_iter()
+                    .map(|record| record.into())
+                    .collect(),
+            ),
         })
     }
 }
@@ -1951,6 +2062,60 @@ impl TryFrom<pb_canister_state_bits::ExecutionStateBits> for ExecutionStateBits 
                     .into(),
                 None => NextScheduledMethod::default(),
             },
+        })
+    }
+}
+
+impl From<&CanisterSnapshotBits> for pb_canister_snapshot_bits::CanisterSnapshotBits {
+    fn from(item: &CanisterSnapshotBits) -> Self {
+        Self {
+            snapshot_id: item.snapshot_id.get(),
+            canister_id: Some((item.canister_id).into()),
+            taken_at_timestamp: item.taken_at_timestamp.as_nanos_since_unix_epoch(),
+            canister_version: item.canister_version,
+            binary_hash: item.binary_hash.as_ref().map(|h| h.to_vec()),
+            certified_data: item.certified_data.clone(),
+            wasm_chunk_store_metadata: Some((&item.wasm_chunk_store_metadata).into()),
+            stable_memory_size: item.stable_memory_size.get() as u64,
+            wasm_memory_size: item.wasm_memory_size.get() as u64,
+        }
+    }
+}
+
+impl TryFrom<pb_canister_snapshot_bits::CanisterSnapshotBits> for CanisterSnapshotBits {
+    type Error = ProxyDecodeError;
+    fn try_from(
+        item: pb_canister_snapshot_bits::CanisterSnapshotBits,
+    ) -> Result<Self, Self::Error> {
+        let canister_id: CanisterId =
+            try_from_option_field(item.canister_id, "CanisterSnapshotBits::canister_id")?;
+
+        let binary_hash = match item.binary_hash {
+            Some(hash) => {
+                let hash: [u8; 32] =
+                    hash.try_into()
+                        .map_err(|e| ProxyDecodeError::ValueOutOfRange {
+                            typ: "BinaryHash",
+                            err: format!("Expected a 32-byte long module hash, got {:?}", e),
+                        })?;
+                Some(hash.into())
+            }
+            None => None,
+        };
+        Ok(Self {
+            snapshot_id: SnapshotId::new(item.snapshot_id),
+            canister_id,
+            taken_at_timestamp: Time::from_nanos_since_unix_epoch(item.taken_at_timestamp),
+            canister_version: item.canister_version,
+            binary_hash,
+            certified_data: item.certified_data,
+            wasm_chunk_store_metadata: try_from_option_field(
+                item.wasm_chunk_store_metadata,
+                "CanisterSnapshotBits::wasm_chunk_store_metadata",
+            )
+            .unwrap_or_default(),
+            stable_memory_size: NumWasmPages::from(item.stable_memory_size as usize),
+            wasm_memory_size: NumWasmPages::from(item.wasm_memory_size as usize),
         })
     }
 }

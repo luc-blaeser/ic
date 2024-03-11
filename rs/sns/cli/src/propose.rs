@@ -7,8 +7,10 @@ use ic_base_types::{CanisterId, PrincipalId};
 use ic_nervous_system_common::ledger::compute_neuron_staking_subaccount_bytes;
 use ic_nns_common::pb::v1::{NeuronId, ProposalId};
 use ic_nns_constants::ROOT_CANISTER_ID;
-use ic_nns_governance::pb::v1::{manage_neuron::NeuronIdOrSubaccount, proposal::Action, Proposal};
-use ic_nns_test_utils::ids::TEST_NEURON_1_ID;
+use ic_nns_governance::{
+    init::TEST_NEURON_1_ID,
+    pb::v1::{manage_neuron::NeuronIdOrSubaccount, proposal::Action, Proposal},
+};
 use std::{
     collections::HashSet,
     fmt::{Debug, Display, Formatter},
@@ -28,7 +30,7 @@ pub struct ProposeArgs {
     network: String,
 
     /// Path to a configuration file specifying the SNS to be created.
-    #[clap(parse(from_os_str), default_value = "sns_init.yaml")]
+    #[clap(default_value = "sns_init.yaml", value_parser = clap::value_parser!(std::path::PathBuf))]
     pub init_config_file: PathBuf,
 
     /// The neuron with which to make the proposal. The current dfx identity
@@ -126,8 +128,12 @@ pub fn exec(args: ProposeArgs) {
     match result {
         Ok(MakeProposalResponse {
             proposal_id: Some(proposal_id),
+            message,
         }) => {
             println!("🚀 Success!");
+            if let Some(message) = message {
+                println!("Message from NNS governance: {:?}", message);
+            }
             if network == "ic" {
                 println!("View the proposal here:");
                 println!(

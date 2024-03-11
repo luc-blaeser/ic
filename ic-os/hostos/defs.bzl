@@ -14,13 +14,15 @@ def image_deps(mode, _malicious = False):
     Define all HostOS inputs.
 
     Args:
-      mode: Variant to be built, dev, dev-sev or prod.
+      mode: Variant to be built, dev or prod.
       _malicious: Unused, but currently needed to fit generic build structure.
     Returns:
       A dict containing inputs to build this image.
     """
 
     deps = {
+        "base_dockerfile": "//ic-os/hostos:rootfs/Dockerfile.base",
+
         # Define rootfs and bootfs
         "bootfs": {
             # base layer
@@ -35,6 +37,9 @@ def image_deps(mode, _malicious = False):
             "//publish/binaries:hostos_tool": "/opt/ic/bin/hostos_tool:0755",
             "//publish/binaries:metrics-proxy": "/opt/ic/bin/metrics-proxy:0755",
             "//ic-os:scripts/build-bootstrap-config-image.sh": "/opt/ic/bin/build-bootstrap-config-image.sh:0755",
+
+            # additional libraries to install
+            "//publish/binaries:nss_icos": "/usr/lib/x86_64-linux-gnu/libnss_icos.so.2:0644",
         },
 
         # Set various configuration values
@@ -54,8 +59,13 @@ def image_deps(mode, _malicious = False):
         "dev": {
             "build_container_filesystem_config_file": "//ic-os/hostos/envs/dev:build_container_filesystem_config.txt",
         },
-        "dev-sev": {
-            "build_container_filesystem_config_file": "//ic-os/hostos/envs/dev-sev:build_container_filesystem_config.txt",
+        "local-base-dev": {
+            # Use the non-local-base file
+            "build_container_filesystem_config_file": "//ic-os/hostos/envs/dev:build_container_filesystem_config.txt",
+        },
+        "local-base-prod": {
+            # Use the non-local-base file
+            "build_container_filesystem_config_file": "//ic-os/hostos/envs/prod:build_container_filesystem_config.txt",
         },
         "prod": {
             "build_container_filesystem_config_file": "//ic-os/hostos/envs/prod:build_container_filesystem_config.txt",
@@ -82,7 +92,7 @@ def _custom_partitions():
         pv_uuid = "eu0VQE-HlTi-EyRc-GceP-xZtn-3j6t-iqEwyv",
         # The image is pretty big, therefore it is usually much faster to just rebuild it instead of fetching from the cache.
         # TODO(IDX-2221): remove this when CI jobs and bazel infrastructure will run in the same clusters.
-        tags = ["no-remote-cache"],
+        tags = ["no-remote-cache", "manual"],
         target_compatible_with = [
             "@platforms//os:linux",
         ],

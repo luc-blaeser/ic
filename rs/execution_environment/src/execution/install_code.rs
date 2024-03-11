@@ -6,11 +6,13 @@ use std::path::{Path, PathBuf};
 use ic_base_types::{CanisterId, NumBytes, PrincipalId};
 use ic_config::flag_status::FlagStatus;
 use ic_embedders::wasm_executor::CanisterStateChanges;
-use ic_ic00_types::{CanisterChangeDetails, CanisterChangeOrigin, CanisterInstallModeV2};
 use ic_interfaces::execution_environment::{
     HypervisorError, HypervisorResult, SubnetAvailableMemoryError, WasmExecutionOutput,
 };
 use ic_logger::{error, fatal, info, warn};
+use ic_management_canister_types::{
+    CanisterChangeDetails, CanisterChangeOrigin, CanisterInstallModeV2,
+};
 use ic_replicated_state::canister_state::system_state::ReservationError;
 use ic_replicated_state::metadata_state::subnet_call_context_manager::InstallCodeCallId;
 use ic_replicated_state::{CanisterState, ExecutionState};
@@ -28,7 +30,7 @@ use crate::{
         CanisterManagerError, CanisterMgrConfig, DtsInstallCodeResult, InstallCodeResult,
     },
     canister_settings::{validate_canister_settings, CanisterSettings},
-    execution_environment::RoundContext,
+    execution_environment::{log_dirty_pages, RoundContext},
     CompilationCostHandling, RoundLimits,
 };
 
@@ -93,6 +95,9 @@ pub(crate) enum InstallCodeStep {
     HandleWasmExecution {
         canister_state_changes: Option<CanisterStateChanges>,
         output: WasmExecutionOutput,
+    },
+    ChargeForLargeWasmAssembly {
+        instructions: NumInstructions,
     },
 }
 
@@ -179,6 +184,12 @@ impl InstallCodeHelper {
             .add_canister_change(timestamp_nanos, origin, details);
     }
 
+    pub fn charge_for_large_wasm_assembly(&mut self, instructions: NumInstructions) {
+        self.steps
+            .push(InstallCodeStep::ChargeForLargeWasmAssembly { instructions });
+        self.reduce_instructions_by(instructions);
+    }
+
     pub fn execution_parameters(&self) -> &ExecutionParameters {
         &self.execution_parameters
     }
@@ -197,6 +208,12 @@ impl InstallCodeHelper {
 
     pub fn canister_message_memory_usage(&self) -> NumBytes {
         self.canister.message_memory_usage()
+    }
+
+    pub fn reduce_instructions_by(&mut self, instructions: NumInstructions) {
+        self.execution_parameters
+            .instruction_limits
+            .reduce_by(instructions);
     }
 
     /// Returns a struct with all the necessary information to replay the
@@ -425,6 +442,17 @@ impl InstallCodeHelper {
 
         let old_wasm_hash = get_wasm_hash(&clean_canister);
         let new_wasm_hash = get_wasm_hash(&self.canister);
+
+        if original.log_dirty_pages == FlagStatus::Enabled {
+            log_dirty_pages(
+                round.log,
+                &original.canister_id,
+                original.message.method_name(),
+                self.total_heap_delta.get() as usize / PAGE_SIZE,
+                instructions_used,
+            );
+        }
+
         DtsInstallCodeResult::Finished {
             canister: self.canister,
             message: original.message,
@@ -460,6 +488,7 @@ impl InstallCodeHelper {
                 memory_allocation: original.requested_memory_allocation,
                 freezing_threshold: None,
                 reserved_cycles_limit: None,
+                log_visibility: None,
             },
             self.canister.memory_usage(),
             self.canister.message_memory_usage(),
@@ -516,9 +545,7 @@ impl InstallCodeHelper {
                 memory_handling,
             });
 
-        self.execution_parameters
-            .instruction_limits
-            .reduce_by(instructions_from_compilation);
+        self.reduce_instructions_by(instructions_from_compilation);
 
         let old_memory_usage = self.canister.memory_usage();
         let old_memory_allocation = self.canister.system_state.memory_allocation;
@@ -796,6 +823,10 @@ impl InstallCodeHelper {
                     self.handle_wasm_execution(canister_state_changes, output, original, round);
                 result
             }
+            InstallCodeStep::ChargeForLargeWasmAssembly { instructions } => {
+                self.charge_for_large_wasm_assembly(instructions);
+                Ok(())
+            }
         }
     }
 }
@@ -818,6 +849,7 @@ pub(crate) struct OriginalContext {
     pub requested_memory_allocation: Option<MemoryAllocation>,
     pub sender: PrincipalId,
     pub canister_id: CanisterId,
+    pub log_dirty_pages: FlagStatus,
 }
 
 pub(crate) fn validate_controller(

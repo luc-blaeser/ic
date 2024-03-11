@@ -10,10 +10,10 @@ documentation.workspace = true
 async-trait = "0.1.41"
 ic-types = { path = "../../types/types" }
 ic-protobuf = { path = "../../protobuf" }
-ic-crypto-sha2 = { path = "../sha2" }
 serde = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-rustls = "0.24.0"
+tokio-rustls = { workspace = true }
 x509-parser = "0.15.1"
 
 [dev-dependencies]

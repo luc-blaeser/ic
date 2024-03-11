@@ -24,8 +24,10 @@ use crate::driver::{
     pot_dsl::{PotSetupFn, SysTestFn},
     test_env::{TestEnv, TestEnvAttribute},
     test_env_api::HasIcDependencies,
-    test_setup::GroupSetup,
+    test_setup::{GroupSetup, InfraProvider},
 };
+use crate::k8s::tnet::TNet;
+use crate::util::block_on;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -543,7 +545,7 @@ impl SystemTestGroup {
         };
 
         let uvms_logs_stream_task_id = TaskId::Test(String::from(UVMS_LOGS_STREAM_TASK_NAME));
-        let uvms_logs_stream_task = {
+        let uvms_logs_stream_task = if !group_ctx.k8s {
             Box::from(subproc(
                 uvms_logs_stream_task_id,
                 {
@@ -600,11 +602,13 @@ impl SystemTestGroup {
                 },
                 &mut compose_ctx,
             )) as Box<dyn Task>
+        } else {
+            Box::from(EmptyTask::new(uvms_logs_stream_task_id)) as Box<dyn Task>
         };
 
         // The ID of the root task is needed outside this function for awaiting when the plan execution finishes.
         let keepalive_task_id = TaskId::Test(String::from(KEEPALIVE_TASK_NAME));
-        let keepalive_task = if self.with_farm && !group_ctx.no_farm_keepalive {
+        let keepalive_task = if self.with_farm && !group_ctx.k8s && !group_ctx.no_farm_keepalive {
             Box::from(subproc(
                 keepalive_task_id.clone(),
                 {
@@ -683,6 +687,7 @@ impl SystemTestGroup {
             )
         };
 
+        // TODO: k8s
         // normal case: no debugkeepalive, overall timeout is active
         if !group_ctx.debug_keepalive {
             let keepalive_plan = compose(
@@ -703,6 +708,7 @@ impl SystemTestGroup {
                 &mut compose_ctx,
             );
 
+            // TODO: k8s
             let uvms_stream_plan = compose(
                 Some(uvms_logs_stream_task),
                 EvalOrder::Sequential,
@@ -710,6 +716,7 @@ impl SystemTestGroup {
                 &mut compose_ctx,
             );
 
+            // TODO: k8s
             let report_plan = Ok(compose(
                 Some(Box::new(EmptyTask::new(TaskId::Test(
                     REPORT_TASK_NAME.to_string(),
@@ -730,6 +737,7 @@ impl SystemTestGroup {
             return report_plan;
         }
 
+        // TODO: k8s
         // otherwise: keepalive needs to be above report task. no overall timeout.
         let keepalive_plan: Plan<Box<dyn Task>> = Plan::Leaf {
             task: Box::new(DebugKeepaliveTask::new(
@@ -739,6 +747,7 @@ impl SystemTestGroup {
             )),
         };
 
+        // TODO: k8s
         let uvms_stream_plan = compose(
             Some(uvms_logs_stream_task),
             EvalOrder::Sequential,
@@ -746,6 +755,7 @@ impl SystemTestGroup {
             &mut compose_ctx,
         );
 
+        // TODO: k8s
         let report_plan = compose(
             Some(Box::new(EmptyTask::new(TaskId::Test(
                 REPORT_TASK_NAME.to_string(),
@@ -794,19 +804,27 @@ impl SystemTestGroup {
             args.debug_keepalive,
             args.no_farm_keepalive,
             args.group_base_name,
+            args.k8s,
         )?;
+
+        let with_farm = self.with_farm && !args.k8s;
+
         if is_parent_process {
             let root_env = group_ctx.get_root_env().unwrap();
             FarmBaseUrl::new_or_default(args.farm_base_url).write_attribute(&root_env);
             if let Some(required_args) = args.required_host_features {
                 required_args.write_attribute(&root_env);
             }
-            if self.with_farm {
+            if args.k8s {
+                InfraProvider::K8s.write_attribute(&root_env);
+            } else {
+                InfraProvider::Farm.write_attribute(&root_env);
+            }
+            if with_farm || args.k8s {
                 root_env.create_group_setup(group_ctx.group_base_name.clone());
             }
             debug!(group_ctx.log(), "Created group context: {:?}", group_ctx);
         }
-        let with_farm = self.with_farm;
 
         // create the runtime that lives until this variable is dropped.
         // Note: having only a runtime handle does not guarantee that the runtime is alive.
@@ -906,6 +924,9 @@ impl SystemTestGroup {
                 if with_farm && !args.no_delete_farm_group {
                     Self::delete_farm_group(group_ctx.clone());
                 }
+                if args.k8s && !args.debug_keepalive {
+                    Self::delete_tnet(group_ctx.clone());
+                }
                 if report.failure.is_empty() {
                     Ok(Outcome::FromParentProcess(report))
                 } else {
@@ -947,6 +968,13 @@ impl SystemTestGroup {
         let farm = Farm::new(farm_url, env.logger());
         let group_name = group_setup.infra_group_name;
         farm.delete_group(&group_name);
+    }
+
+    fn delete_tnet(ctx: GroupContext) {
+        info!(ctx.log(), "Deleting k8s tnet.");
+        let env = ensure_setup_env(ctx);
+        let tnet = TNet::read_attribute(&env);
+        block_on(tnet.delete()).expect("deleting tnet");
     }
 }
 

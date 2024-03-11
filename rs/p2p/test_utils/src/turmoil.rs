@@ -25,8 +25,9 @@ use ic_interfaces::{
 };
 use ic_logger::ReplicaLogger;
 use ic_metrics::MetricsRegistry;
-use ic_peer_manager::SubnetTopology;
+use ic_quic_transport::SubnetTopology;
 use ic_quic_transport::{QuicTransport, Transport};
+use ic_state_manager::state_sync::types::StateSyncMessage;
 use ic_types::{artifact::UnvalidatedArtifactMutation, NodeId, RegistryVersion};
 use ic_types_test_utils::ids::SUBNET_1;
 use quinn::{
@@ -216,6 +217,7 @@ pub fn add_peer_manager_to_sim(
     RegistryConsensusHandle,
 ) {
     let (peer_manager_sender, mut peer_manager_receiver) = oneshot::channel();
+    #[allow(clippy::disallowed_methods)]
     let (peer_manager_cmd_sender, mut peer_manager_cmd_receiver) = mpsc::unbounded_channel();
     sim.client("peer-manager", async move {
         let rt = tokio::runtime::Handle::current();
@@ -271,7 +273,7 @@ pub fn add_transport_to_sim<F>(
     conn_checker: Option<Router>,
     crypto: Option<Arc<dyn TlsConfig + Send + Sync>>,
     sev: Option<Arc<dyn ValidateAttestedStream<Box<dyn TlsStream>> + Send + Sync>>,
-    state_sync_client: Option<Arc<dyn StateSyncClient>>,
+    state_sync_client: Option<Arc<dyn StateSyncClient<Message = StateSyncMessage>>>,
     consensus_manager: Option<TestConsensus<U64Artifact>>,
     post_setup_future: F,
 ) where
@@ -304,7 +306,7 @@ pub fn add_transport_to_sim<F>(
         let consensus_manager_clone = consensus_manager.clone();
 
         async move {
-            let metrics_registry = &MetricsRegistry::default();
+            let metrics_registry = MetricsRegistry::default();
             let mut consensus_builder = ic_consensus_manager::ConsensusManagerBuilder::new(
                 log.clone(),
                 tokio::runtime::Handle::current(),
@@ -365,7 +367,7 @@ pub fn add_transport_to_sim<F>(
 
             if let Some(state_sync_rx) = state_sync_rx {
                 ic_state_sync_manager::start_state_sync_manager(
-                    log.clone(),
+                    &log,
                     &MetricsRegistry::default(),
                     &tokio::runtime::Handle::current(),
                     transport.clone(),
@@ -398,8 +400,8 @@ pub fn start_test_processor(
     change_set_producer: TestConsensus<U64Artifact>,
 ) -> (
     Box<dyn JoinGuard>,
-    tokio::sync::mpsc::Receiver<ArtifactProcessorEvent<U64Artifact>>,
-    crossbeam_channel::Sender<UnvalidatedArtifactMutation<U64Artifact>>,
+    mpsc::Receiver<ArtifactProcessorEvent<U64Artifact>>,
+    mpsc::UnboundedSender<UnvalidatedArtifactMutation<U64Artifact>>,
 ) {
     let (tx, rx) = tokio::sync::mpsc::channel(1000);
     let time_source = Arc::new(SysTimeSource::new());

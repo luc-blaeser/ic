@@ -1,8 +1,8 @@
 //! This module contains a collection of types and structs that define the
 //! various types of methods in the IC.
 
-use crate::{messages::CallContextId, Cycles};
-use ic_base_types::CanisterId;
+use crate::{messages::CallContextId, time::CoarseTime, Cycles};
+use ic_base_types::{CanisterId, PrincipalId};
 use ic_protobuf::proxy::{try_from_option_field, ProxyDecodeError};
 use ic_protobuf::state::{canister_state_bits::v1 as pb, queues::v1::Cycles as PbCycles};
 use ic_protobuf::types::v1 as pb_types;
@@ -105,7 +105,6 @@ impl From<&WasmMethod> for pb::WasmMethod {
                     SystemMethod::CanisterPostUpgrade => PbSystemMethod::CanisterPostUpgrade,
                     SystemMethod::CanisterInspectMessage => PbSystemMethod::CanisterInspectMessage,
                     SystemMethod::CanisterHeartbeat => PbSystemMethod::CanisterHeartbeat,
-                    SystemMethod::Empty => PbSystemMethod::Empty,
                     SystemMethod::CanisterGlobalTimer => PbSystemMethod::CanisterGlobalTimer,
                 } as i32)),
             },
@@ -140,7 +139,6 @@ impl TryFrom<pb::WasmMethod> for WasmMethod {
                     PbSystemMethod::CanisterPostUpgrade => SystemMethod::CanisterPostUpgrade,
                     PbSystemMethod::CanisterInspectMessage => SystemMethod::CanisterInspectMessage,
                     PbSystemMethod::CanisterHeartbeat => SystemMethod::CanisterHeartbeat,
-                    PbSystemMethod::Empty => SystemMethod::Empty,
                     PbSystemMethod::CanisterGlobalTimer => SystemMethod::CanisterGlobalTimer,
                 }))
             }
@@ -166,12 +164,6 @@ pub enum SystemMethod {
     CanisterHeartbeat,
     /// A system method that is run after a specified time.
     CanisterGlobalTimer,
-    /// This is introduced as temporary scaffolding to aid in construction of
-    /// the initial ExecutionState. This isn't used to execute any actual wasm
-    /// but as a way to get to the wasm embedder from execution. Eventually, we
-    /// need to rethink some of the API between execution and wasm embedder so
-    /// that this is not needed.
-    Empty,
 }
 
 impl TryFrom<&str> for SystemMethod {
@@ -186,7 +178,6 @@ impl TryFrom<&str> for SystemMethod {
             "canister_inspect_message" => Ok(SystemMethod::CanisterInspectMessage),
             "canister_heartbeat" => Ok(SystemMethod::CanisterHeartbeat),
             "canister_global_timer" => Ok(SystemMethod::CanisterGlobalTimer),
-            "empty" => Ok(SystemMethod::Empty),
             _ => Err(format!("Cannot convert {} to SystemMethod.", value)),
         }
     }
@@ -201,7 +192,6 @@ impl fmt::Display for SystemMethod {
             Self::CanisterStart => write!(f, "canister_start"),
             Self::CanisterInspectMessage => write!(f, "canister_inspect_message"),
             Self::CanisterHeartbeat => write!(f, "canister_heartbeat"),
-            Self::Empty => write!(f, "empty"),
             Self::CanisterGlobalTimer => write!(f, "canister_global_timer"),
         }
     }
@@ -220,27 +210,32 @@ impl WasmClosure {
     }
 }
 
+/// A placeholder `CanisterId` for the `Callback::originator` and
+/// `Callback::respondent` fields, if the callback was created before February
+/// 2022 (i.e. before originator and respondent were recorded).
+pub const UNKNOWN_CANISTER_ID: CanisterId =
+    CanisterId::unchecked_from_principal(PrincipalId::new_anonymous());
+
 /// Callback holds references to functions executed when a response is received.
 /// It also tracks information about the origin of the request.
 /// This information is used to validate the response when it is received.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Callback {
     pub call_context_id: CallContextId,
-    // (EXC-877) Once this is deployed in production,
-    // it's safe to make `respondent` and `originator` non-optional.
-    // Currently optional to ensure backwards compatibility.
-    /// The request's sender id.
-    pub originator: Option<CanisterId>,
-    /// The id of the principal that the request was addressed to.
-    pub respondent: Option<CanisterId>,
+    /// The request sender's ID.
+    pub originator: CanisterId,
+    /// The ID of the principal that the request was addressed to.
+    pub respondent: CanisterId,
     /// The number of cycles that were sent in the original request.
     pub cycles_sent: Cycles,
     /// Cycles prepaid by the caller for response execution.
-    /// The field is optional for backwards compatibility.
-    pub prepayment_for_response_execution: Option<Cycles>,
+    ///
+    /// `Cycles::zero()` if the `Callback` was created before February 2022.
+    pub prepayment_for_response_execution: Cycles,
     /// Cycles prepaid by the caller for response transimission.
-    /// The field is optional for backwards compatibility.
-    pub prepayment_for_response_transmission: Option<Cycles>,
+    ///
+    /// `Cycles::zero()` if the `Callback` was created before February 2022.
+    pub prepayment_for_response_transmission: Cycles,
     /// A closure to be executed if the call succeeded.
     pub on_reply: WasmClosure,
     /// A closure to be executed if the call was rejected.
@@ -248,19 +243,22 @@ pub struct Callback {
     /// An optional closure to be executed if the execution of `on_reply` or
     /// `on_reject` traps.
     pub on_cleanup: Option<WasmClosure>,
+    /// If non-zero, this is a best-effort call.
+    pub deadline: CoarseTime,
 }
 
 impl Callback {
     pub fn new(
         call_context_id: CallContextId,
-        originator: Option<CanisterId>,
-        respondent: Option<CanisterId>,
+        originator: CanisterId,
+        respondent: CanisterId,
         cycles_sent: Cycles,
-        prepayment_for_response_execution: Option<Cycles>,
-        prepayment_for_response_transmission: Option<Cycles>,
+        prepayment_for_response_execution: Cycles,
+        prepayment_for_response_transmission: Cycles,
         on_reply: WasmClosure,
         on_reject: WasmClosure,
         on_cleanup: Option<WasmClosure>,
+        deadline: CoarseTime,
     ) -> Self {
         Self {
             call_context_id,
@@ -272,6 +270,7 @@ impl Callback {
             on_reply,
             on_reject,
             on_cleanup,
+            deadline,
         }
     }
 }
@@ -280,21 +279,13 @@ impl From<&Callback> for pb::Callback {
     fn from(item: &Callback) -> Self {
         Self {
             call_context_id: item.call_context_id.get(),
-            originator: item
-                .originator
-                .as_ref()
-                .map(|originator| pb_types::CanisterId::from(*originator)),
-            respondent: item
-                .respondent
-                .as_ref()
-                .map(|respondent| pb_types::CanisterId::from(*respondent)),
+            originator: Some(pb_types::CanisterId::from(item.originator)),
+            respondent: Some(pb_types::CanisterId::from(item.respondent)),
             cycles_sent: Some(item.cycles_sent.into()),
-            prepayment_for_response_execution: item
-                .prepayment_for_response_execution
-                .map(|cycles| cycles.into()),
-            prepayment_for_response_transmission: item
-                .prepayment_for_response_transmission
-                .map(|cycles| cycles.into()),
+            prepayment_for_response_execution: Some(item.prepayment_for_response_execution.into()),
+            prepayment_for_response_transmission: Some(
+                item.prepayment_for_response_transmission.into(),
+            ),
             on_reply: Some(pb::WasmClosure {
                 func_idx: item.on_reply.func_idx,
                 env: item.on_reply.env,
@@ -307,6 +298,7 @@ impl From<&Callback> for pb::Callback {
                 func_idx: on_cleanup.func_idx,
                 env: on_cleanup.env,
             }),
+            deadline_seconds: item.deadline.as_secs_since_unix_epoch(),
         }
     }
 }
@@ -322,20 +314,19 @@ impl TryFrom<pb::Callback> for Callback {
         let cycles_sent: PbCycles =
             try_from_option_field(value.cycles_sent, "Callback::cycles_sent")?;
 
-        let prepayment_for_response_execution = value
-            .prepayment_for_response_execution
-            .map(|c| c.try_into())
-            .transpose()?;
-
-        let prepayment_for_response_transmission = value
-            .prepayment_for_response_transmission
-            .map(|c| c.try_into())
-            .transpose()?;
+        let prepayment_for_response_execution = try_from_option_field(
+            value.prepayment_for_response_execution,
+            "Callback::prepayment_for_response_execution",
+        )?;
+        let prepayment_for_response_transmission = try_from_option_field(
+            value.prepayment_for_response_transmission,
+            "Callback::prepayment_for_response_transmission",
+        )?;
 
         Ok(Self {
             call_context_id: CallContextId::from(value.call_context_id),
-            originator: try_from_option_field(value.originator, "Callback::originator").ok(),
-            respondent: try_from_option_field(value.respondent, "Callback::respondent").ok(),
+            originator: try_from_option_field(value.originator, "Callback::originator")?,
+            respondent: try_from_option_field(value.respondent, "Callback::respondent")?,
             cycles_sent: Cycles::from(cycles_sent),
             prepayment_for_response_execution,
             prepayment_for_response_transmission,
@@ -351,6 +342,7 @@ impl TryFrom<pb::Callback> for Callback {
                 func_idx: on_cleanup.func_idx,
                 env: on_cleanup.env,
             }),
+            deadline: CoarseTime::from_secs_since_unix_epoch(value.deadline_seconds),
         })
     }
 }

@@ -81,6 +81,7 @@ fn fake_complete() -> DownloadState {
         manifest,
         meta_manifest: Arc::new(meta_manifest),
         state_sync_file_group: Default::default(),
+        malicious_flags: Default::default(),
     };
     DownloadState::Complete(Box::new(artifact))
 }
@@ -114,7 +115,7 @@ fn incomplete_state_for_tests(
         active: Arc::new(parking_lot::RwLock::new(Default::default())),
         cache: Arc::clone(&env.cache),
     };
-    let mut result = IncompleteState::new(
+    let mut result = IncompleteState::try_new(
         env.log.clone(),
         height,
         hash,
@@ -126,7 +127,8 @@ fn incomplete_state_for_tests(
         state_sync_refs,
         Arc::new(TestPageAllocatorFileDescriptorImpl::new()),
         MaliciousFlags::default(),
-    );
+    )
+    .expect("there exists an ongoing state sync");
 
     // The constructor doesn't create the directory, it gets created when we receive
     // a manifest (in production), or later in this function (in tests)

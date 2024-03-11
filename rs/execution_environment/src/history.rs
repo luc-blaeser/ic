@@ -5,12 +5,13 @@ use ic_interfaces::execution_environment::{
 };
 use ic_interfaces_state_manager::{StateManagerError, StateReader};
 use ic_logger::{fatal, ReplicaLogger};
-use ic_metrics::{buckets::decimal_buckets, MetricsRegistry, Timer};
+use ic_metrics::{buckets::decimal_buckets, MetricsRegistry};
 use ic_replicated_state::ReplicatedState;
 use ic_types::{ingress::IngressState, ingress::IngressStatus, messages::MessageId, Height, Time};
 use prometheus::{Histogram, HistogramVec};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 /// Struct that implements the ingress history reader trait. Consumers of this
 /// trait can use this to inspect the ingress history.
@@ -69,7 +70,7 @@ impl IngressHistoryReader for IngressHistoryReaderImpl {
 /// clock" or "absolute time").
 struct TransitionStartTime {
     ic_time: Time,
-    system_time: Timer,
+    system_time: Instant,
 }
 
 /// Struct that implements the ingress history writer trait. Consumers of this
@@ -158,7 +159,7 @@ impl IngressHistoryWriter for IngressHistoryWriterImpl {
                     message_id.clone(),
                     TransitionStartTime {
                         ic_time: time,
-                        system_time: Timer::start(),
+                        system_time: Instant::now(),
                     },
                 );
             }
@@ -209,19 +210,13 @@ impl IngressHistoryWriter for IngressHistoryWriterImpl {
 impl IngressHistoryWriterImpl {
     /// Return an Option<(ic_time_duration, wall_clock_duration)>.
     fn calculate_durations(&self, message_id: &MessageId, time: Time) -> Option<(f64, f64)> {
-        let timer: Option<TransitionStartTime>;
-        {
-            let mut map = self.received_time.write().unwrap();
-            timer = map.remove(message_id)
-        }
-        if let Some(timer) = timer {
-            Some((
-                (time.saturating_sub(timer.ic_time)).as_secs_f64(),
-                timer.system_time.elapsed(),
-            ))
-        } else {
-            None
-        }
+        let mut map = self.received_time.write().unwrap();
+        map.remove(message_id).map(|timer| {
+            (
+                (time.saturating_duration_since(timer.ic_time)).as_secs_f64(),
+                timer.system_time.elapsed().as_secs_f64(),
+            )
+        })
     }
 }
 
@@ -231,62 +226,84 @@ fn dashboard_label_value_from(code: ErrorCode) -> &'static str {
     // to aggregate data on monitoring dashboards. If you plan to change one
     // of these values you will need to plan to change dashboards as well.
     match code {
+        // 1xx -- `RejectCode::SysFatal`
         SubnetOversubscribed => "Subnet Oversubscribed",
         MaxNumberOfCanistersReached => "Max Number of Canisters Reached",
+        // 2xx -- `RejectCode::SysTransient`
+        CanisterQueueFull => "Canister Queue Full",
+        IngressMessageTimeout => "Ingress Message Timeout",
+        CanisterQueueNotEmpty => "Canister Queues Not Empty",
         IngressHistoryFull => "Ingress History Full",
-        CanisterInvalidController => "Canister Invalid Controller",
         CanisterIdAlreadyExists => "Canister ID already exists",
+        StopCanisterRequestTimeout => "Stop canister request timed out",
+        CanisterOutOfCycles => "Canister Out Of Cycles",
+        CertifiedStateUnavailable => "Certified State Unavailable",
+        CanisterInstallCodeRateLimited => {
+            "Canister is rate limited because it executed too many instructions \
+                in the previous install_code messages"
+        }
+        // 3xx -- `RejectCode::DestinationInvalid`
         CanisterNotFound => "Canister Not Found",
         CanisterMethodNotFound => "Canister Method Not Found",
-        CanisterFunctionNotFound => "Canister Function Not Found",
         CanisterAlreadyInstalled => "Canister Already Installed",
         CanisterWasmModuleNotFound => "Canister WASM Module Not Found",
-        CanisterNonEmpty => "Canister Non-Empty",
-        CanisterOutOfCycles => "Canister Out Of Cycles",
+        // 4xx -- `RejectCode::CanisterReject`
+        InsufficientMemoryAllocation => "Insufficient memory allocation given to canister",
+        InsufficientCyclesForCreateCanister => "Insufficient Cycles for Create Canister Request",
+        SubnetNotFound => "Subnet not found",
+        CanisterNotHostedBySubnet => "Canister is not hosted by subnet",
+        CanisterRejectedMessage => "Canister rejected the message",
+        UnknownManagementMessage => "Unknown management method",
+        InvalidManagementPayload => "Invalid management message payload",
+        // 5xx -- `RejectCode::CanisterError`
         CanisterTrapped => "Canister Trapped",
         CanisterCalledTrap => "Canister Called Trap",
         CanisterContractViolation => "Canister Contract Violation",
         CanisterInvalidWasm => "Canister Invalid WASM",
         CanisterDidNotReply => "Canister Did Not Reply",
-        CanisterQueueFull => "Canister Queue Full",
-        CanisterQueueNotEmpty => "Canister Queues Not Empty",
         CanisterOutOfMemory => "Canister Out Of Memory",
         CanisterStopped => "Canister Stopped",
         CanisterStopping => "Canister Stopping",
         CanisterNotStopped => "Canister Not Stopped",
-        IngressMessageTimeout => "Ingress Message Timeout",
         CanisterStoppingCancelled => "Canister Stopping Cancelled",
-        InsufficientCyclesForCreateCanister => "Insufficient Cycles for Create Canister Request",
-        CertifiedStateUnavailable => "Certified State Unavailable",
-        InsufficientMemoryAllocation => "Insufficient memory allocation given to canister",
-        SubnetNotFound => "Subnet not found",
-        CanisterRejectedMessage => "Canister rejected the message",
+        CanisterInvalidController => "Canister Invalid Controller",
+        CanisterFunctionNotFound => "Canister Function Not Found",
+        CanisterNonEmpty => "Canister Non-Empty",
         QueryCallGraphLoopDetected => "Loop in inter-canister query call graph",
-        UnknownManagementMessage => "Unknown management method",
-        InvalidManagementPayload => "Invalid management message payload",
         InsufficientCyclesInCall => "Canister tried to keep more cycles than available in the call",
         CanisterWasmEngineError => "Wasm engine error",
         CanisterInstructionLimitExceeded => {
             "Canister exceeded the instruction limit for single message execution"
         }
-        CanisterInstallCodeRateLimited => {
-            "Canister is rate limited because it executed too many instructions in the previous install_code messages"
-        }
+
         CanisterMemoryAccessLimitExceeded => {
-            "Canister exceeded the limit for the number of modified stable memory pages for a single message execution"
+            "Canister exceeded the limit for the number of modified stable memory pages \
+                for a single message execution"
         }
         QueryCallGraphTooDeep => "Query call graph contains too many nested calls",
-        QueryCallGraphTotalInstructionLimitExceeded => "Total instructions limit exceeded for query call graph",
-        CompositeQueryCalledInReplicatedMode => "Composite query cannot be called in replicated mode",
-        CanisterNotHostedBySubnet => "Canister is not hosted by subnet",
+        QueryCallGraphTotalInstructionLimitExceeded => {
+            "Total instructions limit exceeded for query call graph"
+        }
+        CompositeQueryCalledInReplicatedMode => {
+            "Composite query cannot be called in replicated mode"
+        }
         QueryTimeLimitExceeded => "Canister exceeded the time limit for composite query execution",
         QueryCallGraphInternal => "System error while executing a composite query",
-        InsufficientCyclesInComputeAllocation => "Canister does not have enough cycles to increase its compute allocation",
-        InsufficientCyclesInMemoryAllocation => "Canister does not have enough cycles to increase its memory allocation",
+        InsufficientCyclesInComputeAllocation => {
+            "Canister does not have enough cycles to increase its compute allocation"
+        }
+        InsufficientCyclesInMemoryAllocation => {
+            "Canister does not have enough cycles to increase its memory allocation"
+        }
         InsufficientCyclesInMemoryGrow => "Canister does not have enough cycles to grow memory",
-        ReservedCyclesLimitExceededInMemoryAllocation => "Canister cannot increase memory allocation due to its reserved cycles limit",
-        ReservedCyclesLimitExceededInMemoryGrow => "Canister cannot grow memory due to its reserved cycles limit",
-        InsufficientCyclesInMessageMemoryGrow => "Canister does not have enough cycles to grow message memory",
-        StopCanisterRequestTimeout => "Stop canister request timed out",
+        ReservedCyclesLimitExceededInMemoryAllocation => {
+            "Canister cannot increase memory allocation due to its reserved cycles limit"
+        }
+        ReservedCyclesLimitExceededInMemoryGrow => {
+            "Canister cannot grow memory due to its reserved cycles limit"
+        }
+        InsufficientCyclesInMessageMemoryGrow => {
+            "Canister does not have enough cycles to grow message memory"
+        }
     }
 }

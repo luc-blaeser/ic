@@ -1,18 +1,16 @@
 use super::*;
-use crate::message_routing::CRITICAL_ERROR_BATCH_TIME_REGRESSION;
+use crate::message_routing::CRITICAL_ERROR_NON_INCREASING_BATCH_TIME;
 use crate::{
     routing::demux::MockDemux, routing::stream_builder::MockStreamBuilder,
     state_machine::StateMachineImpl,
 };
-use ic_base_types::NodeId;
-use ic_ic00_types::EcdsaKeyId;
 use ic_interfaces::execution_environment::Scheduler;
 use ic_interfaces_state_manager::StateManager;
+use ic_management_canister_types::EcdsaKeyId;
 use ic_metrics::MetricsRegistry;
 use ic_registry_subnet_features::SubnetFeatures;
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::{ReplicatedState, SubnetTopology};
-use ic_test_utilities::types::ids::canister_test_id;
 use ic_test_utilities::{
     state_manager::FakeStateManager, types::batch::BatchBuilder, types::ids::subnet_test_id,
     types::messages::SignedIngressBuilder,
@@ -20,10 +18,10 @@ use ic_test_utilities::{
 use ic_test_utilities_execution_environment::test_registry_settings;
 use ic_test_utilities_logger::with_test_replica_logger;
 use ic_test_utilities_metrics::fetch_int_counter_vec;
-use ic_types::batch::{CanisterQueryStats, QueryStats, QueryStatsPayload};
+use ic_types::consensus::ecdsa::QuadrupleId;
 use ic_types::messages::SignedIngress;
 use ic_types::{batch::BatchMessages, crypto::canister_threshold_sig::MasterEcdsaPublicKey};
-use ic_types::{Height, PrincipalId, QueryStatsEpoch, SubnetId, Time};
+use ic_types::{Height, PrincipalId, SubnetId, Time};
 use maplit::btreemap;
 use mockall::{mock, predicate::*, Sequence};
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,6 +35,7 @@ mock! {
             state: ic_replicated_state::ReplicatedState,
             randomness: ic_types::Randomness,
             ecdsa_subnet_public_keys: BTreeMap<EcdsaKeyId, MasterEcdsaPublicKey>,
+            ecdsa_quadruple_ids: BTreeMap<EcdsaKeyId, BTreeSet<QuadrupleId>>,
             current_round: ExecutionRound,
             current_round_type: ExecutionRoundType,
             registry_settings: &RegistryExecutionSettings,
@@ -91,11 +90,12 @@ fn test_fixture(provided_batch: &Batch) -> StateMachineTestFixture {
             always(),
             eq(provided_batch.randomness),
             eq(provided_batch.ecdsa_subnet_public_keys.clone()),
+            eq(provided_batch.ecdsa_quadruple_ids.clone()),
             eq(round),
             eq(round_type),
             eq(test_registry_settings()),
         )
-        .returning(|state, _, _, _, _, _| state);
+        .returning(|state, _, _, _, _, _, _| state);
 
     let mut stream_builder = Box::new(MockStreamBuilder::new());
     stream_builder
@@ -156,6 +156,7 @@ fn state_machine_populates_network_topology() {
             fixture.stream_builder,
             log,
             fixture.metrics,
+            ic_config::execution_environment::QUERY_STATS_EPOCH_LENGTH,
         ));
 
         assert_ne!(
@@ -169,6 +170,7 @@ fn state_machine_populates_network_topology() {
             provided_batch,
             Default::default(),
             &test_registry_settings(),
+            Default::default(),
             Default::default(),
         );
 
@@ -189,6 +191,7 @@ fn test_delivered_batch(provided_batch: Batch) -> ReplicatedState {
             fixture.stream_builder,
             log,
             fixture.metrics,
+            ic_config::execution_environment::QUERY_STATS_EPOCH_LENGTH,
         ));
 
         state_machine.execute_round(
@@ -197,6 +200,7 @@ fn test_delivered_batch(provided_batch: Batch) -> ReplicatedState {
             provided_batch,
             Default::default(),
             &test_registry_settings(),
+            Default::default(),
             Default::default(),
         )
     })
@@ -232,15 +236,53 @@ fn test_delivered_batch_interface() {
 
 #[test]
 fn test_batch_time_regression() {
-    // Batch with a batch_time of 1.
+    test_batch_time_impl(
+        Time::from_nanos_since_unix_epoch(2),
+        Time::from_nanos_since_unix_epoch(1),
+        Time::from_nanos_since_unix_epoch(2),
+        1,
+    );
+}
+
+#[test]
+fn test_batch_time_same() {
+    test_batch_time_impl(
+        Time::from_nanos_since_unix_epoch(2),
+        Time::from_nanos_since_unix_epoch(2),
+        Time::from_nanos_since_unix_epoch(2),
+        1,
+    );
+}
+
+#[test]
+fn test_batch_time_advance() {
+    test_batch_time_impl(
+        Time::from_nanos_since_unix_epoch(2),
+        Time::from_nanos_since_unix_epoch(3),
+        Time::from_nanos_since_unix_epoch(3),
+        0,
+    );
+}
+
+/// Executes a batch with the given `batch_time` on a state with the given
+/// `state_batch_time`. Tests the resulting state's `batch_time` against
+/// `expected_batch_time`, as well as the `mr_non_increasing_batch_time`
+/// critical error counter.
+fn test_batch_time_impl(
+    state_batch_time: Time,
+    batch_time: Time,
+    expected_batch_time: Time,
+    expected_regression_count: u64,
+) {
+    // Batch with the provided `batch_time`.
     let provided_batch = BatchBuilder::new()
         .batch_number(Height::new(1))
-        .time(Time::from_nanos_since_unix_epoch(1))
+        .time(batch_time)
         .build();
 
-    // Fixture wrapping a state with a batch_time 2 (ahead of the batch).
+    // Fixture wrapping a state with the given `state_time` as `batch_time`.
     let mut fixture = test_fixture(&provided_batch);
-    fixture.initial_state.metadata.batch_time = Time::from_nanos_since_unix_epoch(2);
+    fixture.initial_state.metadata.batch_time = state_batch_time;
 
     with_test_replica_logger(|log| {
         let _ = &fixture;
@@ -250,16 +292,14 @@ fn test_batch_time_regression() {
             fixture.stream_builder,
             log,
             fixture.metrics,
+            ic_config::execution_environment::QUERY_STATS_EPOCH_LENGTH,
         );
 
         assert_eq!(
             Some(0),
-            fetch_critical_error_batch_time_regression_count(&fixture.metrics_registry)
+            fetch_critical_error_non_increasing_batch_time_count(&fixture.metrics_registry)
         );
-        assert_eq!(
-            Time::from_nanos_since_unix_epoch(2),
-            fixture.initial_state.metadata.batch_time,
-        );
+        assert_eq!(state_batch_time, fixture.initial_state.metadata.batch_time,);
 
         let state = state_machine.execute_round(
             fixture.initial_state,
@@ -268,69 +308,21 @@ fn test_batch_time_regression() {
             Default::default(),
             &test_registry_settings(),
             Default::default(),
+            Default::default(),
         );
 
         assert_eq!(
-            Some(1),
-            fetch_critical_error_batch_time_regression_count(&fixture.metrics_registry)
+            Some(expected_regression_count),
+            fetch_critical_error_non_increasing_batch_time_count(&fixture.metrics_registry)
         );
-        assert_eq!(
-            Time::from_nanos_since_unix_epoch(2),
-            state.metadata.batch_time,
-        );
+        assert_eq!(expected_batch_time, state.metadata.batch_time,);
     });
 }
 
-fn fetch_critical_error_batch_time_regression_count(
+fn fetch_critical_error_non_increasing_batch_time_count(
     metrics_registry: &MetricsRegistry,
 ) -> Option<u64> {
     fetch_int_counter_vec(metrics_registry, "critical_errors")
-        .get(&btreemap! { "error".to_string() => CRITICAL_ERROR_BATCH_TIME_REGRESSION.to_string() })
+        .get(&btreemap! { "error".to_string() => CRITICAL_ERROR_NON_INCREASING_BATCH_TIME.to_string() })
         .cloned()
-}
-
-/// Tests that we correctly collect temporary query stats in the replicated state throughout an epoch.
-#[test]
-pub fn test_query_stats() {
-    let test_canister_stats = QueryStats {
-        num_calls: 1,
-        num_instructions: 2,
-        ingress_payload_size: 3,
-        egress_payload_size: 4,
-    };
-    let uninstalled_canister = canister_test_id(1);
-    let proposer = NodeId::from(PrincipalId::new_node_test_id(1));
-    let provided_batch = BatchBuilder::new()
-        .batch_number(Height::new(1))
-        .time(Time::from_nanos_since_unix_epoch(1))
-        .messages(BatchMessages {
-            query_stats: Some(QueryStatsPayload {
-                epoch: QueryStatsEpoch::from(1),
-                proposer,
-                stats: vec![CanisterQueryStats {
-                    canister_id: uninstalled_canister,
-                    stats: test_canister_stats.clone(),
-                }],
-            }),
-            ..BatchMessages::default()
-        })
-        .build();
-
-    // Check that query stats are added to replciated state
-    let state = test_delivered_batch(provided_batch);
-    assert!(state.epoch_query_stats.epoch.is_some());
-    assert!(state
-        .epoch_query_stats
-        .stats
-        .contains_key(&uninstalled_canister));
-    assert_eq!(
-        state
-            .epoch_query_stats
-            .stats
-            .get(&uninstalled_canister)
-            .unwrap()
-            .get(&proposer)
-            .unwrap(),
-        &test_canister_stats
-    );
 }

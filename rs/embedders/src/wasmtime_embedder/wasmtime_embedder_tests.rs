@@ -16,9 +16,12 @@ use ic_system_api::{
     ExecutionParameters, InstructionLimits, SystemApiImpl,
 };
 use ic_test_utilities::{
-    cycles_account_manager::CyclesAccountManagerBuilder, mock_time, types::ids::canister_test_id,
+    cycles_account_manager::CyclesAccountManagerBuilder, types::ids::canister_test_id,
 };
-use ic_types::{ComputeAllocation, MemoryAllocation, NumBytes, NumInstructions};
+use ic_types::{
+    messages::RequestMetadata, time::UNIX_EPOCH, ComputeAllocation, MemoryAllocation, NumBytes,
+    NumInstructions,
+};
 use ic_wasm_types::BinaryEncodedWasm;
 
 use lazy_static::lazy_static;
@@ -44,18 +47,21 @@ fn test_wasmtime_system_api() {
     let canister_id = canister_test_id(53);
     let system_state =
         SystemState::new_for_start(canister_id, Arc::new(TestPageAllocatorFileDescriptorImpl));
+    let api_type = ApiType::start(UNIX_EPOCH);
     let sandbox_safe_system_state = SandboxSafeSystemState::new(
         &system_state,
         CyclesAccountManagerBuilder::new().build(),
         &NetworkTopology::default(),
         SchedulerConfig::application_subnet().dirty_page_overhead,
         ComputeAllocation::default(),
+        RequestMetadata::new(0, UNIX_EPOCH),
+        api_type.caller(),
     );
     let canister_memory_limit = NumBytes::from(4 << 30);
     let canister_current_memory_usage = NumBytes::from(0);
     let canister_current_message_memory_usage = NumBytes::from(0);
     let system_api = SystemApiImpl::new(
-        ApiType::start(mock_time()),
+        api_type,
         sandbox_safe_system_state,
         canister_current_memory_usage,
         canister_current_message_memory_usage,

@@ -7,7 +7,6 @@ use crate::{CanisterState, SchedulerState, SystemState};
 use assert_matches::assert_matches;
 use ic_base_types::NumSeconds;
 use ic_test_utilities::{
-    mock_time,
     state::arb_num_receivers,
     types::{
         arbitrary,
@@ -16,8 +15,9 @@ use ic_test_utilities::{
     },
 };
 use ic_types::{
-    messages::{CallbackId, CanisterMessage},
+    messages::{CallbackId, CanisterMessage, NO_DEADLINE},
     time::expiry_time_from_now,
+    time::UNIX_EPOCH,
 };
 use maplit::btreemap;
 use proptest::prelude::*;
@@ -74,7 +74,7 @@ impl CanisterQueuesFixture {
                     .receiver(self.other)
                     .build(),
             ),
-            mock_time(),
+            UNIX_EPOCH,
         )
     }
 
@@ -398,7 +398,7 @@ impl CanisterQueuesMultiFixture {
                     .receiver(other)
                     .build(),
             ),
-            mock_time(),
+            UNIX_EPOCH,
         )
     }
 
@@ -580,7 +580,7 @@ fn test_split_input_schedules() {
     // After the split we only have `other_1` (and `this`) on the subnet.
     let system_state =
         SystemState::new_running_for_testing(other_1, other_1.get(), Cycles::zero(), 0.into());
-    let scheduler_state = SchedulerState::new(mock_time());
+    let scheduler_state = SchedulerState::new(UNIX_EPOCH);
     let local_canisters = btreemap! {
         other_1 => CanisterState::new(system_state, None, scheduler_state)
     };
@@ -641,7 +641,7 @@ fn test_peek_round_robin() {
     // Due to the round-robin across Local, Ingress, and Remote Subnet messages,
     // the peek order should be:
     // 1. Local Subnet request (index 0)
-    let peeked_input = CanisterMessage::Request(Arc::new(local_requests.get(0).unwrap().clone()));
+    let peeked_input = CanisterMessage::Request(Arc::new(local_requests.first().unwrap().clone()));
     assert_eq!(queues.peek_input().unwrap(), peeked_input);
     // Peeking again the queues would return the same result.
     assert_eq!(queues.peek_input().unwrap(), peeked_input);
@@ -653,7 +653,7 @@ fn test_peek_round_robin() {
     assert_eq!(queues.pop_input().unwrap(), peeked_input);
 
     // 3. Remote Subnet request (index 0)
-    let peeked_input = CanisterMessage::Request(Arc::new(remote_requests.get(0).unwrap().clone()));
+    let peeked_input = CanisterMessage::Request(Arc::new(remote_requests.first().unwrap().clone()));
     assert_eq!(queues.peek_input().unwrap(), peeked_input);
     assert_eq!(queues.pop_input().unwrap(), peeked_input);
 
@@ -718,14 +718,14 @@ fn test_skip_round_robin() {
     let mut loop_detector = CanisterQueuesLoopDetector::default();
 
     // Pop local queue.
-    let peeked_input = CanisterMessage::Request(Arc::new(local_requests.get(0).unwrap().clone()));
+    let peeked_input = CanisterMessage::Request(Arc::new(local_requests.first().unwrap().clone()));
     assert_eq!(queues.peek_input().unwrap(), peeked_input);
     assert_eq!(queues.pop_input().unwrap(), peeked_input);
 
     // Skip ingress.
     assert_eq!(queues.peek_input().unwrap(), ingress_input);
     queues.skip_input(&mut loop_detector);
-    assert!(loop_detector.skipped_ingress_queue);
+    assert_eq!(loop_detector.ingress_queue_skip_count, 1);
     assert!(!loop_detector.detected_loop(&queues));
 
     let peeked_input = CanisterMessage::Request(Arc::new(local_requests.get(1).unwrap().clone()));
@@ -736,12 +736,13 @@ fn test_skip_round_robin() {
     assert_eq!(queues.peek_input().unwrap(), ingress_input);
     queues.skip_input(&mut loop_detector);
     assert!(!loop_detector.detected_loop(&queues));
+    assert_eq!(loop_detector.ingress_queue_skip_count, 2);
 
     // Skip local.
     let peeked_input = CanisterMessage::Request(Arc::new(local_requests.get(2).unwrap().clone()));
     assert_eq!(queues.peek_input().unwrap(), peeked_input);
     queues.skip_input(&mut loop_detector);
-    assert!(loop_detector.skipped_ingress_queue);
+    assert_eq!(loop_detector.ingress_queue_skip_count, 2);
     assert!(loop_detector.detected_loop(&queues));
 }
 
@@ -766,7 +767,7 @@ fn test_output_into_iter() {
                     .method_payload(vec![i as u8])
                     .build()
                     .into(),
-                mock_time(),
+                UNIX_EPOCH,
             )
             .expect("could not push");
     }
@@ -878,13 +879,13 @@ fn test_peek_canister_input_does_not_affect_schedule() {
         queues
             .peek_canister_input(InputQueueType::RemoteSubnet)
             .unwrap(),
-        CanisterMessage::Request(Arc::new(remote_requests.get(0).unwrap().clone()))
+        CanisterMessage::Request(Arc::new(remote_requests.first().unwrap().clone()))
     );
     assert_eq!(
         queues
             .peek_canister_input(InputQueueType::LocalSubnet)
             .unwrap(),
-        CanisterMessage::Request(Arc::new(local_requests.get(0).unwrap().clone()))
+        CanisterMessage::Request(Arc::new(local_requests.first().unwrap().clone()))
     );
 
     // Schedules are not changed.
@@ -928,13 +929,13 @@ fn test_skip_canister_input() {
         queues
             .peek_canister_input(InputQueueType::RemoteSubnet)
             .unwrap(),
-        CanisterMessage::Request(Arc::new(remote_requests.get(0).unwrap().clone()))
+        CanisterMessage::Request(Arc::new(remote_requests.first().unwrap().clone()))
     );
     assert_eq!(
         queues
             .peek_canister_input(InputQueueType::LocalSubnet)
             .unwrap(),
-        CanisterMessage::Request(Arc::new(local_requests.get(0).unwrap().clone()))
+        CanisterMessage::Request(Arc::new(local_requests.first().unwrap().clone()))
     );
 
     queues.skip_canister_input(InputQueueType::RemoteSubnet);
@@ -1067,7 +1068,7 @@ fn test_stats() {
         .payment(Cycles::new(5))
         .build();
     msg_size[4] = msg.count_bytes();
-    queues.push_output_request(msg.into(), mock_time()).unwrap();
+    queues.push_output_request(msg.into(), UNIX_EPOCH).unwrap();
     // One more reserved slot, no reserved response bytes, oversized request.
     expected_iq_stats.reserved_slots += 1;
     expected_mu_stats.reserved_slots += 1;
@@ -1250,7 +1251,7 @@ fn test_stats_induct_message_to_self() {
         .build();
     let request_size = request.count_bytes();
     queues
-        .push_output_request(request.into(), mock_time())
+        .push_output_request(request.into(), UNIX_EPOCH)
         .expect("could not push");
 
     // New input queue was created, with one reservation.
@@ -1371,7 +1372,7 @@ fn test_garbage_collect() {
 
     // Push output request.
     queues
-        .push_output_request(request.into(), mock_time())
+        .push_output_request(request.into(), UNIX_EPOCH)
         .unwrap();
     // No-op.
     queues.garbage_collect();
@@ -1499,16 +1500,16 @@ fn test_output_queues_for_each() {
 
     let mut queues = CanisterQueues::default();
     queues
-        .push_output_request(request_1.into(), mock_time())
+        .push_output_request(request_1.into(), UNIX_EPOCH)
         .unwrap();
     queues
-        .push_output_request(request_2.into(), mock_time())
+        .push_output_request(request_2.into(), UNIX_EPOCH)
         .unwrap();
     queues
-        .push_output_request(request_3.into(), mock_time())
+        .push_output_request(request_3.into(), UNIX_EPOCH)
         .unwrap();
     queues
-        .push_output_request(request_4.into(), mock_time())
+        .push_output_request(request_4.into(), UNIX_EPOCH)
         .unwrap();
 
     // Should have 2 queue pairs (one for `other_1`, one for `other_2`).
@@ -1810,6 +1811,7 @@ fn time_out_requests_pushes_correct_reject_responses() {
                     method_name: "No-Op".to_string(),
                     method_payload: vec![],
                     metadata: None,
+                    deadline: NO_DEADLINE,
                 }),
                 deadline,
             )
@@ -1865,7 +1867,8 @@ fn time_out_requests_pushes_correct_reject_responses() {
                     RejectCode::SysTransient,
                     "Request timed out.",
                     MR_SYNTHETIC_REJECT_MESSAGE_MAX_LEN
-                ))
+                )),
+                deadline: NO_DEADLINE,
             }),
             *reject_response,
         );

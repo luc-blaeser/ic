@@ -271,7 +271,7 @@ fn check_memo() {
             fee: None,
             created_at_time: None,
             memo: Some(Memo(ByteBuf::from(vec![0; memo_size_bytes]))),
-            amount: 100_000_000.into(),
+            amount: 100_000_000_u32.into(),
         };
         let req = Encode!(&req).unwrap();
         env.execute_ingress_as(PrincipalId(MINTER.owner), ledger_id, "icrc1_transfer", req)
@@ -331,6 +331,7 @@ fn check_query_blocks_coherence() {
             node_max_memory_size_bytes: None,
             max_message_size_bytes: None,
             controller_id: PrincipalId::new_anonymous(),
+            more_controller_ids: None,
             cycles_for_archive_creation: None,
             max_transactions_per_response: None,
         })
@@ -733,6 +734,7 @@ fn test_query_archived_blocks() {
             node_max_memory_size_bytes: None,
             max_message_size_bytes: None,
             controller_id: PrincipalId::new_anonymous(),
+            more_controller_ids: None,
             cycles_for_archive_creation: None,
             max_transactions_per_response: None,
         })
@@ -760,7 +762,7 @@ fn test_query_archived_blocks() {
         &ApproveArgs {
             from_subaccount: None,
             spender: user1.into(),
-            amount: 100_000_000.into(),
+            amount: 100_000_000_u32.into(),
             expected_allowance: None,
             expires_at: None,
             fee: None,
@@ -778,7 +780,7 @@ fn test_query_archived_blocks() {
         start,
         length,
         callback,
-    } = res.archived_blocks.get(0).unwrap();
+    } = res.archived_blocks.first().unwrap();
     // query the archive
     let block_range = Decode!(
         &env.query(

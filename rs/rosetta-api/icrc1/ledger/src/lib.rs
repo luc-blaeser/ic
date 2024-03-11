@@ -8,6 +8,7 @@ use candid::{
     types::number::{Int, Nat},
     CandidType, Principal,
 };
+use ic_canister_log::{log, Sink};
 use ic_crypto_tree_hash::{Label, MixedHashTree};
 use ic_icrc1::blocks::encoded_block_to_generic_block;
 use ic_icrc1::{Block, LedgerBalances, Transaction};
@@ -104,6 +105,7 @@ impl From<Value> for StoredValue {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct InitArgsBuilder(InitArgs);
 
 impl InitArgsBuilder {
@@ -123,7 +125,7 @@ impl InitArgsBuilder {
             },
             fee_collector_account: None,
             initial_balances: vec![],
-            transfer_fee: 10_000.into(),
+            transfer_fee: 10_000_u32.into(),
             decimals: None,
             token_name: "Test Token".to_string(),
             token_symbol: "XTK".to_string(),
@@ -134,6 +136,7 @@ impl InitArgsBuilder {
                 node_max_memory_size_bytes: None,
                 max_message_size_bytes: None,
                 controller_id: default_owner.into(),
+                more_controller_ids: None,
                 cycles_for_archive_creation: None,
                 max_transactions_per_response: None,
             },
@@ -265,6 +268,7 @@ pub struct UpgradeArgs {
 }
 
 #[derive(Deserialize, CandidType, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum LedgerArgument {
     Init(InitArgs),
     Upgrade(Option<UpgradeArgs>),
@@ -318,7 +322,7 @@ pub struct FeatureFlags {
 
 impl FeatureFlags {
     const fn const_default() -> Self {
-        Self { icrc2: false }
+        Self { icrc2: true }
     }
 }
 
@@ -338,6 +342,7 @@ fn default_decimals() -> u8 {
 
 impl<Tokens: TokensType> Ledger<Tokens> {
     pub fn from_init_args(
+        sink: impl Sink + Clone,
         InitArgs {
             minting_account,
             initial_balances,
@@ -355,6 +360,12 @@ impl<Tokens: TokensType> Ledger<Tokens> {
         }: InitArgs,
         now: TimeStamp,
     ) -> Self {
+        if feature_flags.as_ref().map(|ff| ff.icrc2) == Some(false) {
+            log!(
+                sink,
+                "[ledger] feature flag icrc2 is deprecated and won't disable ICRC-2 anymore"
+            );
+        }
         let mut ledger = Self {
             balances: LedgerBalances::default(),
             approvals: Default::default(),
@@ -521,7 +532,7 @@ impl<Tokens: TokensType> Ledger<Tokens> {
     }
 
     pub fn transfer_fee(&self) -> Tokens {
-        self.transfer_fee
+        self.transfer_fee.clone()
     }
 
     pub fn max_memo_length(&self) -> u16 {
@@ -554,7 +565,7 @@ impl<Tokens: TokensType> Ledger<Tokens> {
         &self.feature_flags
     }
 
-    pub fn upgrade(&mut self, args: UpgradeArgs) {
+    pub fn upgrade(&mut self, sink: impl Sink + Clone, args: UpgradeArgs) {
         if let Some(upgrade_metadata_args) = args.metadata {
             self.metadata = upgrade_metadata_args
                 .into_iter()
@@ -591,6 +602,12 @@ impl<Tokens: TokensType> Ledger<Tokens> {
             }
         }
         if let Some(feature_flags) = args.feature_flags {
+            if !feature_flags.icrc2 {
+                log!(
+                    sink,
+                    "[ledger] feature flag icrc2 is deprecated and won't disable ICRC-2 anymore"
+                );
+            }
             self.feature_flags = feature_flags;
         }
         if let Some(maximum_number_of_accounts) = args.maximum_number_of_accounts {

@@ -10,16 +10,25 @@ use ic_consensus_utils::crypto::ConsensusCrypto;
 use ic_crypto_temp_crypto::TempCryptoComponent;
 use ic_crypto_test_utils_canister_threshold_sigs::dummy_values::dummy_idkg_dealing_for_tests;
 use ic_crypto_test_utils_canister_threshold_sigs::{
-    generate_key_transcript, CanisterThresholdSigTestEnvironment, IDkgParticipants, IntoBuilder,
+    generate_key_transcript, setup_masked_random_params, CanisterThresholdSigTestEnvironment,
+    IDkgParticipants, IntoBuilder,
 };
 use ic_crypto_test_utils_reproducible_rng::ReproducibleRng;
-use ic_ic00_types::EcdsaKeyId;
+use ic_crypto_tree_hash::{LabeledTree, MixedHashTree};
 use ic_interfaces::ecdsa::{EcdsaChangeAction, EcdsaPool};
+use ic_interfaces_state_manager::{CertifiedStateSnapshot, Labeled};
 use ic_logger::ReplicaLogger;
+use ic_management_canister_types::EcdsaKeyId;
 use ic_metrics::MetricsRegistry;
-use ic_test_utilities::consensus::fake::*;
+use ic_replicated_state::metadata_state::subnet_call_context_manager::SignWithEcdsaContext;
+use ic_replicated_state::ReplicatedState;
+use ic_test_artifact_pool::consensus_pool::TestConsensusPool;
+use ic_test_utilities::consensus::{fake::*, EcdsaStatsNoOp};
+use ic_test_utilities::state::ReplicatedStateBuilder;
 use ic_test_utilities::types::ids::{node_test_id, NODE_1, NODE_2};
+use ic_test_utilities::types::messages::RequestBuilder;
 use ic_types::artifact::EcdsaMessageId;
+use ic_types::consensus::certification::Certification;
 use ic_types::consensus::ecdsa::{
     self, EcdsaArtifactId, EcdsaBlockReader, EcdsaComplaint, EcdsaComplaintContent,
     EcdsaKeyTranscript, EcdsaMessage, EcdsaOpening, EcdsaOpeningContent, EcdsaPayload,
@@ -39,14 +48,17 @@ use ic_types::crypto::canister_threshold_sig::{
     ThresholdEcdsaSigShare,
 };
 use ic_types::crypto::AlgorithmId;
-use ic_types::malicious_behaviour::MaliciousBehaviour;
+use ic_types::messages::{CallbackId, NO_DEADLINE};
 use ic_types::signature::*;
-use ic_types::{Height, NodeId, PrincipalId, Randomness, RegistryVersion, SubnetId};
+use ic_types::time::UNIX_EPOCH;
+use ic_types::{Height, NodeId, PrincipalId, Randomness, RegistryVersion, SubnetId, Time};
 use rand::{CryptoRng, Rng};
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryFrom;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+
+use super::utils::get_context_request_id;
 
 pub(crate) fn empty_response() -> ic_types::messages::Response {
     ic_types::messages::Response {
@@ -58,6 +70,118 @@ pub(crate) fn empty_response() -> ic_types::messages::Response {
         // be refunded to the canister.
         refund: ic_types::Cycles::new(0),
         response_payload: ic_types::messages::Payload::Data(vec![]),
+        deadline: NO_DEADLINE,
+    }
+}
+
+pub fn fake_sign_with_ecdsa_context(
+    key_id: EcdsaKeyId,
+    pseudo_random_id: [u8; 32],
+) -> SignWithEcdsaContext {
+    fake_sign_with_ecdsa_context_with_batch_time(key_id, pseudo_random_id, UNIX_EPOCH)
+}
+
+pub fn fake_sign_with_ecdsa_context_with_batch_time(
+    key_id: EcdsaKeyId,
+    pseudo_random_id: [u8; 32],
+    batch_time: Time,
+) -> SignWithEcdsaContext {
+    SignWithEcdsaContext {
+        request: RequestBuilder::new().build(),
+        message_hash: [0; 32],
+        derivation_path: vec![],
+        batch_time,
+        key_id,
+        pseudo_random_id,
+        matched_quadruple: None,
+        nonce: None,
+    }
+}
+
+pub fn fake_sign_with_ecdsa_context_with_quadruple(
+    id: u8,
+    key_id: EcdsaKeyId,
+    quadruple: Option<QuadrupleId>,
+) -> (CallbackId, SignWithEcdsaContext) {
+    let context = SignWithEcdsaContext {
+        request: RequestBuilder::new().build(),
+        message_hash: [0; 32],
+        derivation_path: vec![],
+        batch_time: UNIX_EPOCH,
+        key_id,
+        pseudo_random_id: [id; 32],
+        matched_quadruple: quadruple.map(|qid| (qid, Height::from(1))),
+        nonce: None,
+    };
+    (CallbackId::from(id as u64), context)
+}
+
+pub fn fake_completed_sign_with_ecdsa_context(
+    id: u8,
+    quadruple_id: QuadrupleId,
+) -> (CallbackId, SignWithEcdsaContext) {
+    fake_sign_with_ecdsa_context_from_request_id(&RequestId {
+        quadruple_id,
+        pseudo_random_id: [id; 32],
+        height: Height::from(1),
+    })
+}
+
+pub fn fake_sign_with_ecdsa_context_from_request_id(
+    request_id: &RequestId,
+) -> (CallbackId, SignWithEcdsaContext) {
+    let height = request_id.height;
+    let quadruple_id = request_id.quadruple_id.clone();
+    let callback_id = CallbackId::from(quadruple_id.0);
+    let context = SignWithEcdsaContext {
+        request: RequestBuilder::new().build(),
+        message_hash: [0; 32],
+        derivation_path: vec![],
+        batch_time: UNIX_EPOCH,
+        key_id: quadruple_id.key_id().unwrap().clone(),
+        pseudo_random_id: request_id.pseudo_random_id,
+        matched_quadruple: Some((quadruple_id, height)),
+        nonce: Some([0; 32]),
+    };
+    (callback_id, context)
+}
+
+pub fn fake_state_with_ecdsa_contexts<T>(
+    height: Height,
+    contexts: T,
+) -> Labeled<Arc<ReplicatedState>>
+where
+    T: IntoIterator<Item = (CallbackId, SignWithEcdsaContext)>,
+{
+    let mut state = ReplicatedStateBuilder::default().build();
+    state
+        .metadata
+        .subnet_call_context_manager
+        .sign_with_ecdsa_contexts = BTreeMap::from_iter(contexts);
+
+    Labeled::new(height, Arc::new(state))
+}
+
+pub fn insert_test_sig_inputs<T>(
+    block_reader: &mut TestEcdsaBlockReader,
+    ecdsa_payload: &mut EcdsaPayload,
+    inputs: T,
+) where
+    T: IntoIterator<Item = (QuadrupleId, TestSigInputs)>,
+{
+    for (quadruple_id, inputs) in inputs {
+        inputs
+            .idkg_transcripts
+            .iter()
+            .for_each(|(transcript_ref, transcript)| {
+                block_reader.add_transcript(*transcript_ref, transcript.clone())
+            });
+        ecdsa_payload.available_quadruples.insert(
+            quadruple_id.clone(),
+            inputs.sig_inputs_ref.presig_quadruple_ref.clone(),
+        );
+        block_reader
+            .add_available_quadruple(quadruple_id, inputs.sig_inputs_ref.presig_quadruple_ref);
     }
 }
 
@@ -80,6 +204,9 @@ impl From<&IDkgTranscriptParams> for TestTranscriptParams {
                 algorithm_id: params.algorithm_id(),
                 operation_type_ref: match params.operation_type() {
                     IDkgTranscriptOperation::Random => IDkgTranscriptOperationRef::Random,
+                    IDkgTranscriptOperation::RandomUnmasked => {
+                        IDkgTranscriptOperationRef::RandomUnmasked
+                    }
                     IDkgTranscriptOperation::ReshareOfMasked(t) => {
                         IDkgTranscriptOperationRef::ReshareOfMasked(
                             MaskedTranscript::try_from((h, t)).unwrap(),
@@ -102,6 +229,7 @@ impl From<&IDkgTranscriptParams> for TestTranscriptParams {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct TestSigInputs {
     pub(crate) idkg_transcripts: BTreeMap<TranscriptRef, IDkgTranscript>,
     pub(crate) sig_inputs_ref: ThresholdEcdsaSigInputsRef,
@@ -139,6 +267,7 @@ impl From<&ThresholdEcdsaSigInputs> for TestSigInputs {
                 .unwrap(),
                 key_times_lambda_ref: MaskedTranscript::try_from((height, quad.key_times_lambda()))
                     .unwrap(),
+                key_unmasked_ref: UnmaskedTranscript::try_from((height, key)).unwrap(),
             },
             key_transcript_ref: UnmaskedTranscript::try_from((height, key)).unwrap(),
         };
@@ -157,6 +286,7 @@ pub(crate) struct TestEcdsaBlockReader {
     source_subnet_xnet_transcripts: Vec<IDkgTranscriptParamsRef>,
     target_subnet_xnet_transcripts: Vec<IDkgTranscriptParamsRef>,
     requested_signatures: Vec<(RequestId, ThresholdEcdsaSigInputsRef)>,
+    available_quadruples: BTreeMap<QuadrupleId, PreSignatureQuadrupleRef>,
     idkg_transcripts: BTreeMap<TranscriptRef, IDkgTranscript>,
     fail_to_resolve: bool,
 }
@@ -193,16 +323,22 @@ impl TestEcdsaBlockReader {
     ) -> Self {
         let mut idkg_transcripts = BTreeMap::new();
         let mut requested_signatures = Vec::new();
+        let mut available_quadruples = BTreeMap::new();
         for (request_id, sig_inputs) in sig_inputs {
             for (transcript_ref, transcript) in sig_inputs.idkg_transcripts {
                 idkg_transcripts.insert(transcript_ref, transcript);
             }
+            available_quadruples.insert(
+                request_id.quadruple_id.clone(),
+                sig_inputs.sig_inputs_ref.presig_quadruple_ref.clone(),
+            );
             requested_signatures.push((request_id, sig_inputs.sig_inputs_ref));
         }
 
         Self {
             height,
             requested_signatures,
+            available_quadruples,
             idkg_transcripts,
             ..Default::default()
         }
@@ -252,6 +388,14 @@ impl TestEcdsaBlockReader {
     ) {
         self.idkg_transcripts.insert(transcript_ref, transcript);
     }
+
+    pub(crate) fn add_available_quadruple(
+        &mut self,
+        quadruple_id: QuadrupleId,
+        quadruple: PreSignatureQuadrupleRef,
+    ) {
+        self.available_quadruples.insert(quadruple_id, quadruple);
+    }
 }
 
 impl EcdsaBlockReader for TestEcdsaBlockReader {
@@ -271,10 +415,17 @@ impl EcdsaBlockReader for TestEcdsaBlockReader {
         &self,
     ) -> Box<dyn Iterator<Item = (&RequestId, &ThresholdEcdsaSigInputsRef)> + '_> {
         Box::new(
+            // False positive `map_identity` warning.
+            // See: https://github.com/rust-lang/rust-clippy/pull/11792 (merged)
+            #[allow(clippy::map_identity)]
             self.requested_signatures
                 .iter()
                 .map(|(id, sig_inputs)| (id, sig_inputs)),
         )
+    }
+
+    fn available_quadruple(&self, id: &QuadrupleId) -> Option<&PreSignatureQuadrupleRef> {
+        self.available_quadruples.get(id)
     }
 
     fn source_subnet_xnet_transcripts(
@@ -440,6 +591,47 @@ impl EcdsaSignatureBuilder for TestEcdsaSignatureBuilder {
     ) -> Option<ThresholdEcdsaCombinedSignature> {
         self.signatures.get(request_id).cloned()
     }
+
+    fn get_completed_signature_from_context(
+        &self,
+        context: &SignWithEcdsaContext,
+    ) -> Option<ThresholdEcdsaCombinedSignature> {
+        let request_id = get_context_request_id(context)?;
+        self.signatures.get(&request_id).cloned()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct FakeCertifiedStateSnapshot {
+    pub height: Height,
+    pub state: Arc<ReplicatedState>,
+}
+
+impl CertifiedStateSnapshot for FakeCertifiedStateSnapshot {
+    type State = ReplicatedState;
+
+    fn get_state(&self) -> &Self::State {
+        &self.state
+    }
+
+    fn get_height(&self) -> Height {
+        self.height
+    }
+
+    fn read_certified_state(
+        &self,
+        _paths: &LabeledTree<()>,
+    ) -> Option<(MixedHashTree, Certification)> {
+        None
+    }
+}
+
+pub(crate) fn create_ecdsa_pool(
+    config: ArtifactPoolConfig,
+    log: ReplicaLogger,
+    metrics_registry: MetricsRegistry,
+) -> EcdsaPoolImpl {
+    EcdsaPoolImpl::new(config, log, metrics_registry, Box::new(EcdsaStatsNoOp {}))
 }
 
 // Sets up the dependencies and creates the pre signer
@@ -449,14 +641,7 @@ pub(crate) fn create_pre_signer_dependencies_with_crypto(
     consensus_crypto: Option<Arc<dyn ConsensusCrypto>>,
 ) -> (EcdsaPoolImpl, EcdsaPreSignerImpl) {
     let metrics_registry = MetricsRegistry::new();
-    let Dependencies {
-        pool,
-        replica_config: _,
-        membership: _,
-        registry: _,
-        crypto,
-        ..
-    } = dependencies(pool_config.clone(), 1);
+    let Dependencies { pool, crypto, .. } = dependencies(pool_config.clone(), 1);
 
     // need to make sure subnet matches the transcript
     let pre_signer = EcdsaPreSignerImpl::new(
@@ -465,11 +650,30 @@ pub(crate) fn create_pre_signer_dependencies_with_crypto(
         consensus_crypto.unwrap_or(crypto),
         metrics_registry.clone(),
         logger.clone(),
-        MaliciousBehaviour::new(false).malicious_flags,
     );
-    let ecdsa_pool = EcdsaPoolImpl::new(pool_config, logger, metrics_registry);
+    let ecdsa_pool = create_ecdsa_pool(pool_config, logger, metrics_registry);
 
     (ecdsa_pool, pre_signer)
+}
+
+// Sets up the dependencies and creates the pre signer
+pub(crate) fn create_pre_signer_dependencies_and_pool(
+    pool_config: ArtifactPoolConfig,
+    logger: ReplicaLogger,
+) -> (EcdsaPoolImpl, EcdsaPreSignerImpl, TestConsensusPool) {
+    let metrics_registry = MetricsRegistry::new();
+    let Dependencies { pool, crypto, .. } = dependencies(pool_config.clone(), 1);
+
+    let pre_signer = EcdsaPreSignerImpl::new(
+        NODE_1,
+        pool.get_block_cache(),
+        crypto,
+        metrics_registry.clone(),
+        logger.clone(),
+    );
+    let ecdsa_pool = create_ecdsa_pool(pool_config, logger, metrics_registry);
+
+    (ecdsa_pool, pre_signer, pool)
 }
 
 // Sets up the dependencies and creates the pre signer
@@ -489,10 +693,8 @@ pub(crate) fn create_signer_dependencies_with_crypto(
     let metrics_registry = MetricsRegistry::new();
     let Dependencies {
         pool,
-        replica_config: _,
-        membership: _,
-        registry: _,
         crypto,
+        state_manager,
         ..
     } = dependencies(pool_config.clone(), 1);
 
@@ -500,10 +702,11 @@ pub(crate) fn create_signer_dependencies_with_crypto(
         NODE_1,
         pool.get_block_cache(),
         consensus_crypto.unwrap_or(crypto),
+        state_manager as Arc<_>,
         metrics_registry.clone(),
         logger.clone(),
     );
-    let ecdsa_pool = EcdsaPoolImpl::new(pool_config, logger, metrics_registry);
+    let ecdsa_pool = create_ecdsa_pool(pool_config, logger, metrics_registry);
 
     (ecdsa_pool, signer)
 }
@@ -516,6 +719,50 @@ pub(crate) fn create_signer_dependencies(
     create_signer_dependencies_with_crypto(pool_config, logger, None)
 }
 
+pub(crate) fn create_signer_dependencies_with_state(
+    pool_config: ArtifactPoolConfig,
+    logger: ReplicaLogger,
+    state: Labeled<Arc<ReplicatedState>>,
+) -> (EcdsaPoolImpl, EcdsaSignerImpl) {
+    create_signer_dependencies_with_state_and_crypto(pool_config, logger, state, None)
+}
+
+pub(crate) fn create_signer_dependencies_with_state_and_crypto(
+    pool_config: ArtifactPoolConfig,
+    logger: ReplicaLogger,
+    state: Labeled<Arc<ReplicatedState>>,
+    consensus_crypto: Option<Arc<dyn ConsensusCrypto>>,
+) -> (EcdsaPoolImpl, EcdsaSignerImpl) {
+    let metrics_registry = MetricsRegistry::new();
+    let Dependencies {
+        pool,
+        crypto,
+        state_manager,
+        ..
+    } = dependencies(pool_config.clone(), 1);
+
+    let snapshot = Box::new(FakeCertifiedStateSnapshot {
+        height: state.height(),
+        state: state.take(),
+    });
+    state_manager
+        .get_mut()
+        .expect_get_certified_state_snapshot()
+        .returning(move || Some(snapshot.clone() as Box<_>));
+
+    let signer = EcdsaSignerImpl::new(
+        NODE_1,
+        pool.get_block_cache(),
+        consensus_crypto.unwrap_or(crypto),
+        state_manager.clone(),
+        metrics_registry.clone(),
+        logger.clone(),
+    );
+    let ecdsa_pool = create_ecdsa_pool(pool_config, logger, metrics_registry);
+
+    (ecdsa_pool, signer)
+}
+
 // Sets up the dependencies and creates the complaint handler
 pub(crate) fn create_complaint_dependencies_with_crypto_and_node_id(
     pool_config: ArtifactPoolConfig,
@@ -524,14 +771,7 @@ pub(crate) fn create_complaint_dependencies_with_crypto_and_node_id(
     node_id: NodeId,
 ) -> (EcdsaPoolImpl, EcdsaComplaintHandlerImpl) {
     let metrics_registry = MetricsRegistry::new();
-    let Dependencies {
-        pool,
-        replica_config: _,
-        membership: _,
-        registry: _,
-        crypto,
-        ..
-    } = dependencies(pool_config.clone(), 1);
+    let Dependencies { pool, crypto, .. } = dependencies(pool_config.clone(), 1);
 
     let complaint_handler = EcdsaComplaintHandlerImpl::new(
         node_id,
@@ -540,9 +780,29 @@ pub(crate) fn create_complaint_dependencies_with_crypto_and_node_id(
         metrics_registry.clone(),
         logger.clone(),
     );
-    let ecdsa_pool = EcdsaPoolImpl::new(pool_config, logger, metrics_registry);
+    let ecdsa_pool = create_ecdsa_pool(pool_config, logger, metrics_registry);
 
     (ecdsa_pool, complaint_handler)
+}
+
+// Sets up the dependencies and creates the complaint handler
+pub(crate) fn create_complaint_dependencies_and_pool(
+    pool_config: ArtifactPoolConfig,
+    logger: ReplicaLogger,
+) -> (EcdsaPoolImpl, EcdsaComplaintHandlerImpl, TestConsensusPool) {
+    let metrics_registry = MetricsRegistry::new();
+    let Dependencies { pool, crypto, .. } = dependencies(pool_config.clone(), 1);
+
+    let complaint_handler = EcdsaComplaintHandlerImpl::new(
+        NODE_1,
+        pool.get_block_cache(),
+        crypto,
+        metrics_registry.clone(),
+        logger.clone(),
+    );
+    let ecdsa_pool = create_ecdsa_pool(pool_config, logger, metrics_registry);
+
+    (ecdsa_pool, complaint_handler, pool)
 }
 
 pub(crate) fn create_complaint_dependencies(
@@ -681,17 +941,22 @@ pub(crate) fn create_valid_transcript<R: Rng + CryptoRng>(
 ) -> (NodeId, IDkgTranscriptParams, IDkgTranscript) {
     let (dealers, receivers) =
         env.choose_dealers_and_receivers(&IDkgParticipants::AllNodesAsDealersAndReceivers, rng);
-    let params = env.params_for_random_sharing(
+    let params = setup_masked_random_params(
+        env,
+        AlgorithmId::ThresholdEcdsaSecp256k1,
         &dealers,
         &receivers,
-        AlgorithmId::ThresholdEcdsaSecp256k1,
         rng,
     );
     let dealings = env.nodes.create_and_verify_signed_dealings(&params);
     let dealings = env
         .nodes
         .support_dealings_from_all_receivers(dealings, &params);
-    let dealer = env.nodes.dealers(&params).next().expect("Empty dealers");
+    let dealer = env
+        .nodes
+        .filter_by_dealers(&params)
+        .next()
+        .expect("Empty dealers");
     let idkg_transcript = dealer.create_transcript_or_panic(&params, &dealings);
     (dealer.id(), params, idkg_transcript)
 }
@@ -722,7 +987,7 @@ pub(crate) fn get_dealings_and_support(
     let supports = dealings
         .iter()
         .flat_map(|(_, dealing)| {
-            env.nodes.receivers(&params).map(|signer| {
+            env.nodes.filter_by_receivers(&params).map(|signer| {
                 let c: Arc<dyn ConsensusCrypto> = signer.crypto();
                 let sig_share = c
                     .sign(dealing, signer.id(), params.registry_version())
@@ -768,13 +1033,14 @@ pub(crate) fn create_dealing_with_payload<R: Rng + CryptoRng>(
     let env = CanisterThresholdSigTestEnvironment::new(2, rng);
     let (dealers, receivers) =
         env.choose_dealers_and_receivers(&IDkgParticipants::AllNodesAsDealersAndReceivers, rng);
-    let params = env.params_for_random_sharing(
+    let params = setup_masked_random_params(
+        &env,
+        AlgorithmId::ThresholdEcdsaSecp256k1,
         &dealers,
         &receivers,
-        AlgorithmId::ThresholdEcdsaSecp256k1,
         rng,
     );
-    let dealer = env.nodes.dealers(&params).next().unwrap();
+    let dealer = env.nodes.filter_by_dealers(&params).next().unwrap();
     let dealing = dealer.create_dealing_or_panic(&params);
     let mut content = create_dealing_content(transcript_id);
     content.internal_dealing_raw = dealing.content.internal_dealing_raw;
@@ -928,6 +1194,7 @@ pub(crate) fn create_sig_inputs_with_args(
         lambda_masked_ref,
         kappa_unmasked_times_lambda_masked_ref,
         key_unmasked_times_lambda_masked_ref,
+        key_unmasked_ref,
     );
     let sig_inputs_ref = ThresholdEcdsaSigInputsRef::new(
         ExtendedDerivationPath {
@@ -1206,14 +1473,18 @@ pub(crate) fn empty_ecdsa_payload(subnet_id: SubnetId) -> EcdsaPayload {
         key_transcript: EcdsaKeyTranscript {
             current: None,
             next_in_creation: KeyTranscriptCreation::Begin,
-            key_id: EcdsaKeyId::from_str("Secp256k1:some_key").unwrap(),
+            key_id: fake_ecdsa_key_id(),
         },
     }
 }
 
+pub(crate) fn fake_ecdsa_key_id() -> EcdsaKeyId {
+    EcdsaKeyId::from_str("Secp256k1:some_key").unwrap()
+}
+
 pub(crate) fn create_reshare_request(num_nodes: u64, registry_version: u64) -> EcdsaReshareRequest {
     EcdsaReshareRequest {
-        key_id: EcdsaKeyId::from_str("Secp256k1:some_key").unwrap(),
+        key_id: fake_ecdsa_key_id(),
         receiving_node_ids: (0..num_nodes).map(node_test_id).collect::<Vec<_>>(),
         registry_version: RegistryVersion::from(registry_version),
     }
@@ -1221,6 +1492,24 @@ pub(crate) fn create_reshare_request(num_nodes: u64, registry_version: u64) -> E
 
 pub(crate) fn crypto_without_keys() -> Arc<dyn ConsensusCrypto> {
     TempCryptoComponent::builder().build_arc()
+}
+
+pub(crate) fn add_available_quadruple_to_payload(
+    ecdsa_payload: &mut EcdsaPayload,
+    quadruple_id: QuadrupleId,
+    registry_version: RegistryVersion,
+) {
+    let sig_inputs = create_sig_inputs(quadruple_id.0 as u8);
+    let quadruple_ref = sig_inputs.sig_inputs_ref.presig_quadruple_ref.clone();
+    ecdsa_payload
+        .available_quadruples
+        .insert(quadruple_id, quadruple_ref.clone());
+    for (t_ref, mut transcript) in sig_inputs.idkg_transcripts {
+        transcript.registry_version = registry_version;
+        ecdsa_payload
+            .idkg_transcripts
+            .insert(t_ref.transcript_id, transcript);
+    }
 }
 
 pub(crate) fn set_up_ecdsa_payload(
@@ -1264,7 +1553,7 @@ pub(crate) fn set_up_ecdsa_payload(
 
 pub(crate) trait EcdsaPayloadTestHelper {
     fn peek_next_transcript_id(&self) -> IDkgTranscriptId;
-    fn peek_next_quadruple_id(&self) -> QuadrupleId;
+    fn peek_next_quadruple_id(&self, key_id: EcdsaKeyId) -> QuadrupleId;
 }
 
 impl EcdsaPayloadTestHelper for EcdsaPayload {
@@ -1272,7 +1561,7 @@ impl EcdsaPayloadTestHelper for EcdsaPayload {
         self.uid_generator.clone().next_transcript_id()
     }
 
-    fn peek_next_quadruple_id(&self) -> QuadrupleId {
-        self.uid_generator.clone().next_quadruple_id()
+    fn peek_next_quadruple_id(&self, key_id: EcdsaKeyId) -> QuadrupleId {
+        self.uid_generator.clone().next_quadruple_id(key_id)
     }
 }

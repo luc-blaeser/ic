@@ -1,16 +1,18 @@
 use candid::Encode;
+use ic_base_types::PrincipalId;
 use ic_config::{
     execution_environment::Config as HypervisorConfig,
     subnet_config::{CyclesAccountManagerConfig, SubnetConfig},
 };
-use ic_ic00_types::{
+use ic_management_canister_types::{
     CanisterIdRecord, CanisterSettingsArgs, CanisterSettingsArgsBuilder, CanisterStatusResultV2,
     CreateCanisterArgs, EmptyBlob, Method, Payload, UpdateSettingsArgs, IC_00,
 };
 use ic_registry_subnet_type::SubnetType;
 use ic_state_machine_tests::{
-    ErrorCode, StateMachine, StateMachineBuilder, StateMachineConfig, UserError,
+    ErrorCode, IngressStatus, StateMachine, StateMachineBuilder, StateMachineConfig, UserError,
 };
+use ic_test_utilities_metrics::fetch_int_counter;
 use ic_types::{ingress::WasmResult, CanisterId, Cycles, NumBytes};
 use ic_universal_canister::{call_args, wasm, UNIVERSAL_CANISTER_WASM};
 use std::{convert::TryInto, sync::Arc, time::Duration};
@@ -215,6 +217,18 @@ fn test_canister_uninstall_restart() {
     assert_eq!(
         env.query(canister_id, "read", vec![]).unwrap_err().code(),
         ErrorCode::CanisterWasmModuleNotFound
+    );
+}
+
+#[test]
+fn query_nonexisting_canister() {
+    let env = StateMachine::new();
+    env.tick(); // needed to create a certified state
+
+    let canister_id = CanisterId::from_u64(0);
+    assert_eq!(
+        env.query(canister_id, "read", vec![]).unwrap_err().code(),
+        ErrorCode::CanisterNotFound
     );
 }
 
@@ -868,7 +882,7 @@ fn subnet_memory_reservation_works() {
             "update",
             call_args()
                 .other_side(b)
-                .on_reject(wasm().reject_code().reject_message().reject())
+                .on_reject(wasm().reject_message().reject())
                 .on_reply(
                     wasm()
                         .stable_grow(800 / num_cores as u32)
@@ -926,7 +940,7 @@ fn subnet_memory_reservation_scales_with_number_of_cores() {
             "update",
             call_args()
                 .other_side(b)
-                .on_reject(wasm().reject_code().reject_message().reject())
+                .on_reject(wasm().reject_message().reject())
                 .on_reply(
                     wasm()
                         .stable_grow(800)
@@ -1420,4 +1434,79 @@ fn reserved_balance_limit_is_initialized_after_replica_upgrade() {
             .reserved_balance_limit(),
         Some(CyclesAccountManagerConfig::application_subnet().default_reserved_balance_limit),
     )
+}
+
+#[test]
+fn execution_observes_oversize_messages() {
+    let sm = StateMachine::new();
+
+    let a_id = sm
+        .install_canister_with_cycles(
+            UNIVERSAL_CANISTER_WASM.into(),
+            vec![],
+            None,
+            INITIAL_CYCLES_BALANCE,
+        )
+        .unwrap();
+
+    // Canister A calls itself with a large message
+    let a_calls_self_wasm = wasm()
+        .stable_grow(100)
+        .inter_update(
+            a_id,
+            call_args().eval_other_side(wasm().stable_read(0, 3 * 1024 * 1024).build()),
+        )
+        .build();
+    let ingress_id = sm.send_ingress(
+        PrincipalId::new_anonymous(),
+        a_id,
+        "update",
+        a_calls_self_wasm,
+    );
+
+    assert!(matches!(
+        sm.ingress_status(&ingress_id),
+        IngressStatus::Known { .. }
+    ));
+
+    assert_eq!(
+        1,
+        fetch_int_counter(
+            sm.metrics_registry(),
+            "execution_environment_oversize_intra_subnet_messages_total"
+        )
+        .unwrap()
+    );
+
+    // Canister A calls B with a large message
+    let b_id = sm
+        .install_canister_with_cycles(
+            UNIVERSAL_CANISTER_WASM.into(),
+            vec![],
+            None,
+            INITIAL_CYCLES_BALANCE,
+        )
+        .unwrap();
+
+    let a_calls_b_wasm = wasm()
+        .inter_update(
+            b_id,
+            call_args().eval_other_side(wasm().stable_read(0, 3 * 1024 * 1024)),
+        )
+        .build();
+    let ingress_id = sm.send_ingress(PrincipalId::new_anonymous(), a_id, "update", a_calls_b_wasm);
+
+    assert!(matches!(
+        sm.ingress_status(&ingress_id),
+        IngressStatus::Known { .. }
+    ));
+
+    assert_eq!(
+        2,
+        fetch_int_counter(
+            sm.metrics_registry(),
+            "execution_environment_oversize_intra_subnet_messages_total"
+        )
+        .unwrap()
+    );
 }

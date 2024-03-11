@@ -1,57 +1,68 @@
 use crate::common::local_replica;
 use crate::common::local_replica::test_identity;
-use axum::http::StatusCode;
-use candid::{Nat, Principal};
-use ic_agent::{identity::Secp256k1Identity, Identity};
+use crate::common::utils::{get_rosetta_blocks_from_icrc1_ledger, wait_for_rosetta_block};
+use candid::Nat;
+use candid::Principal;
+use common::local_replica::get_custom_agent;
+use ic_agent::identity::BasicIdentity;
+use ic_agent::Identity;
 use ic_base_types::CanisterId;
-use ic_icrc1_tokens_u64::U64;
-use ic_icrc_rosetta::{
-    common::{
-        storage::types::RosettaBlock,
-        types::{ApproveMetadata, OperationType},
-        utils::utils::icrc1_account_to_rosetta_accountidentifier,
-    },
-    Metadata,
+use ic_base_types::PrincipalId;
+pub use ic_canister_client_sender::Ed25519KeyPair as EdKeypair;
+use ic_icrc1_ledger::{InitArgs, InitArgsBuilder};
+use ic_icrc1_test_utils::{
+    minter_identity, valid_transactions_strategy, ArgWithCaller, LedgerEndpointArg,
+    DEFAULT_TRANSFER_FEE,
 };
+use ic_icrc_rosetta::common::constants::*;
+use ic_icrc_rosetta::common::types::FeeSetter;
+use ic_icrc_rosetta::common::types::{Error, FeeMetadata};
+use ic_icrc_rosetta::common::utils::utils::icrc1_rosetta_block_to_rosetta_core_block;
+use ic_icrc_rosetta::common::utils::utils::icrc1_rosetta_block_to_rosetta_core_transaction;
+use ic_icrc_rosetta::construction_api::types::ConstructionMetadataRequestOptions;
 use ic_icrc_rosetta_client::RosettaClient;
-use ic_icrc_rosetta_runner::{start_rosetta, RosettaOptions, DEFAULT_DECIMAL_PLACES};
-use ic_ledger_canister_core::ledger::LedgerTransaction;
-use ic_rosetta_api::DEFAULT_BLOCKCHAIN;
-use ic_starter_tests::{start_replica, ReplicaBins, ReplicaStarterConfig};
-use icrc_ledger_agent::Icrc1Agent;
-use icrc_ledger_types::{
-    icrc::generic_value::Value,
-    icrc1::{account::Account, transfer::TransferArg},
-    icrc2::approve::ApproveArgs,
-    icrc3::blocks::GetBlocksRequest,
+use ic_icrc_rosetta_runner::make_transaction_with_rosetta_client_binary;
+use ic_icrc_rosetta_runner::RosettaClientArgs;
+use ic_icrc_rosetta_runner::{
+    start_rosetta, RosettaContext, RosettaOptions, DEFAULT_DECIMAL_PLACES,
 };
+use ic_rosetta_api::DEFAULT_BLOCKCHAIN;
+use ic_starter_tests::ReplicaContext;
+use icrc_ledger_agent::CallMode;
+use icrc_ledger_agent::Icrc1Agent;
+use icrc_ledger_types::icrc1::account::Account;
+use icrc_ledger_types::icrc1::transfer::TransferArg;
+use icrc_ledger_types::icrc2::approve::ApproveArgs;
 use lazy_static::lazy_static;
+use num_traits::cast::ToPrimitive;
+use proptest::prelude::ProptestConfig;
+use proptest::proptest;
+use proptest::strategy::Strategy;
+use proptest::test_runner::Config as TestRunnerConfig;
+use proptest::test_runner::TestRunner;
 use rosetta_core::identifiers::*;
+use rosetta_core::models::RosettaSupportedKeyPair;
 use rosetta_core::objects::*;
 use rosetta_core::request_types::*;
-use rosetta_core::response_types::*;
-use serde_json::Number;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use rosetta_core::response_types::BlockResponse;
+use rosetta_core::response_types::ConstructionPreprocessResponse;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+use tokio::runtime::Runtime;
 
-mod common;
+pub mod common;
 
 lazy_static! {
     pub static ref TEST_ACCOUNT: Account = test_identity().sender().unwrap().into();
-    pub static ref TEST_ACCOUNT_2: Account = test_identity_2().sender().unwrap().into();
     pub static ref MAX_NUM_GENERATED_BLOCKS: usize = 20;
-    pub static ref NUM_TEST_CASES: u32 = 5;
-}
-
-pub fn test_identity_2() -> Secp256k1Identity {
-    Secp256k1Identity::from_pem(
-        &b"-----BEGIN EC PRIVATE KEY-----
-MHQCAQEEICJxApEbuZznKFpV+VKACRK30i6+7u5Z13/DOl18cIC+oAcGBSuBBAAK
-oUQDQgAEPas6Iag4TUx+Uop+3NhE6s3FlayFtbwdhRVjvOar0kPTfE/N8N6btRnd
-74ly5xXEBNSXiENyxhEuzOZrIWMCNQ==
------END EC PRIVATE KEY-----
-        "[..],
-    )
-    .expect("failed to parse identity from PEM")
+    pub static ref MAX_BLOCKS_PER_REQUEST: usize = 2000;
+    pub static ref NUM_TEST_CASES: u32 = 1;
+    pub static ref MINTING_IDENTITY: Arc<BasicIdentity> = Arc::new(minter_identity());
 }
 
 fn path_from_env(var: &str) -> PathBuf {
@@ -61,626 +72,419 @@ fn path_from_env(var: &str) -> PathBuf {
     .unwrap()
 }
 
-fn replica_bins() -> ReplicaBins {
-    let canister_launcher = path_from_env("CANISTER_LAUNCHER");
-    let replica_bin = path_from_env("REPLICA_BIN");
-    let sandbox_launcher = path_from_env("SANDBOX_LAUNCHER");
-    let starter_bin = path_from_env("STARTER_BIN");
-    ReplicaBins {
-        canister_launcher,
-        replica_bin,
-        sandbox_launcher,
-        starter_bin,
-    }
-}
-
 fn rosetta_bin() -> PathBuf {
     path_from_env("ROSETTA_BIN_PATH")
 }
 
+fn rosetta_client_bin() -> PathBuf {
+    path_from_env("ROSETTA_CLIENT_BIN_PATH")
+}
+
+pub struct RosettaTestingEnvironment {
+    // The '_' character is needed for the replica and rosetta context be allowed to never be used as the must not go out of scope and be killed.
+    _replica_context: ReplicaContext,
+    _rosetta_context: RosettaContext,
+    rosetta_client: RosettaClient,
+    icrc1_agent: Arc<Icrc1Agent>,
+    icrc1_ledger_id: Principal,
+    icrc1_ledger_init_args: InitArgs,
+    network_identifier: NetworkIdentifier,
+}
+
+#[derive(Default)]
+struct RosettaTestingEnvironmentBuilder {
+    icrc1_ledger_init_arg_builder: Option<InitArgsBuilder>,
+    transfer_args_for_block_generating: Option<Vec<ArgWithCaller>>,
+    offline: bool,
+}
+
+impl RosettaTestingEnvironmentBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_init_args_builder(mut self, builder: InitArgsBuilder) -> Self {
+        self.icrc1_ledger_init_arg_builder = Some(builder);
+        self
+    }
+
+    pub fn with_args_with_caller(mut self, transfer_args: Vec<ArgWithCaller>) -> Self {
+        self.transfer_args_for_block_generating = Some(transfer_args);
+        self
+    }
+
+    pub fn with_offline_rosetta(mut self, offline: bool) -> Self {
+        self.offline = offline;
+        self
+    }
+
+    pub async fn build(&self) -> RosettaTestingEnvironment {
+        let mut block_idxes = vec![];
+
+        let replica_context = local_replica::start_new_local_replica().await;
+        let replica_url = format!("http://localhost:{}", replica_context.port);
+
+        // Deploy an ICRC-1 ledger canister
+        let icrc1_ledger_init_args = match self.icrc1_ledger_init_arg_builder.clone() {
+            None => local_replica::icrc_ledger_default_args_builder().build(),
+            Some(builder) => builder.build(),
+        };
+        let icrc1_ledger_id = local_replica::deploy_icrc_ledger_with_custom_args(
+            &replica_context,
+            icrc1_ledger_init_args.clone(),
+        )
+        .await
+        .into();
+
+        if let Some(args) = &self.transfer_args_for_block_generating {
+            for ArgWithCaller {
+                caller,
+                arg,
+                principal_to_basic_identity: _,
+            } in args.clone().into_iter()
+            {
+                let caller_agent = Icrc1Agent {
+                    agent: get_custom_agent(caller.clone(), &replica_context).await,
+                    ledger_canister_id: icrc1_ledger_id,
+                };
+                block_idxes.push(match arg {
+                    LedgerEndpointArg::ApproveArg(approve_arg) => caller_agent
+                        .approve(approve_arg.clone())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .0
+                        .to_u64()
+                        .unwrap(),
+                    LedgerEndpointArg::TransferArg(transfer_arg) => caller_agent
+                        .transfer(transfer_arg.clone())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .0
+                        .to_u64()
+                        .unwrap(),
+                });
+            }
+        }
+        // Create a testing agent
+        let icrc1_agent = Arc::new(Icrc1Agent {
+            agent: local_replica::get_testing_agent(&replica_context).await,
+            ledger_canister_id: icrc1_ledger_id,
+        });
+        let rosetta_context = start_rosetta(
+            &rosetta_bin(),
+            RosettaOptions {
+                ledger_id: icrc1_ledger_id,
+                network_url: Some(replica_url),
+                offline: self.offline,
+                ..RosettaOptions::default()
+            },
+        )
+        .await;
+        let rosetta_client =
+            RosettaClient::from_str_url(&format!("http://0.0.0.0:{}", rosetta_context.port))
+                .expect("Unable to parse url");
+
+        let network_identifier = NetworkIdentifier::new(
+            DEFAULT_BLOCKCHAIN.to_owned(),
+            CanisterId::try_from(PrincipalId(icrc1_ledger_id))
+                .unwrap()
+                .to_string(),
+        );
+
+        // Wait for rosetta to catch up with the ledger
+        if let Some(last_block_idx) = block_idxes.last() {
+            let rosetta_last_block_idx = wait_for_rosetta_block(
+                &rosetta_client,
+                network_identifier.clone(),
+                *last_block_idx,
+            )
+            .await;
+            assert_eq!(
+                Some(*last_block_idx),
+                rosetta_last_block_idx,
+                "Wait for rosetta sync failed."
+            );
+        }
+
+        RosettaTestingEnvironment {
+            _replica_context: replica_context,
+            _rosetta_context: rosetta_context,
+            rosetta_client,
+            icrc1_agent,
+            icrc1_ledger_id,
+            icrc1_ledger_init_args,
+            network_identifier,
+        }
+    }
+}
+
+async fn assert_rosetta_balance(
+    account: Account,
+    block_index: u64,
+    balance: u64,
+    rosetta_client: &RosettaClient,
+    network_identifier: NetworkIdentifier,
+) {
+    println!(
+        "Checking balance for account: {:?} at block index {}",
+        account, block_index
+    );
+    let rosetta_balance = rosetta_client
+        .account_balance(block_index, account.into(), network_identifier.clone())
+        .await
+        .expect("Unable to call account_balance")
+        .balances
+        .first()
+        .unwrap()
+        .clone()
+        .value;
+    assert_eq!(rosetta_balance, Nat::from(balance).to_string());
+}
+
 #[tokio::test]
 async fn test_network_list() {
-    let context = start_replica(&replica_bins(), &ReplicaStarterConfig::default())
-        .await
-        .expect("Unable to start the replica");
-    let replica_url = format!("http://localhost:{}", context.port);
-
-    let context = start_rosetta(
-        &rosetta_bin(),
-        RosettaOptions {
-            network_url: Some(replica_url),
-            ..RosettaOptions::default()
-        },
-    )
-    .await;
-    let client = RosettaClient::from_str_url(&format!("http://0.0.0.0:{}", context.port))
-        .expect("Unable to parse url");
-    let network_list = client
+    let env = RosettaTestingEnvironmentBuilder::new()
+        .with_offline_rosetta(true)
+        .build()
+        .await;
+    let network_list = env
+        .rosetta_client
         .network_list()
         .await
         .expect("Unable to call network_list")
         .network_identifiers;
     let expected = NetworkIdentifier::new(
         DEFAULT_BLOCKCHAIN.to_owned(),
-        CanisterId::try_from(Principal::anonymous().as_slice())
-            .unwrap()
-            .to_string(),
+        env.icrc1_ledger_id.to_string(),
     );
     assert_eq!(network_list, vec![expected]);
 }
 
-#[tokio::test]
-async fn test_network_status() {
-    let replica_context = local_replica::start_new_local_replica().await;
-    let replica_url = format!("http://localhost:{}", replica_context.port);
-    // Deploy an ICRC-1 ledger canister
-    let icrc_ledger_canister_id =
-        local_replica::deploy_icrc_ledger_with_default_args(&replica_context).await;
-    let ledger_id = Principal::from(icrc_ledger_canister_id);
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(*NUM_TEST_CASES))]
+    #[test]
+fn test_network_status(args_with_caller in valid_transactions_strategy(
+        (*MINTING_IDENTITY).clone(),
+        DEFAULT_TRANSFER_FEE,
+        *MAX_NUM_GENERATED_BLOCKS,
+        SystemTime::now(),
+    )) {
+    // Create a tokio environment to conduct async calls
+    let rt = Runtime::new().unwrap();
 
-    // Create a testing agent
-    let agent = Arc::new(Icrc1Agent {
-        agent: local_replica::get_testing_agent(&replica_context).await,
-        ledger_canister_id: icrc_ledger_canister_id.into(),
+    // Wrap async calls in a blocking Block
+    rt.block_on(async {
+        let env = RosettaTestingEnvironmentBuilder::new()
+            .with_args_with_caller(args_with_caller.clone())
+            .with_init_args_builder(local_replica::icrc_ledger_default_args_builder().with_minting_account((*MINTING_IDENTITY).clone().sender().unwrap()))
+            .build()
+            .await;
+
+        // Get the blocks from the ledger to compare against rosetta
+        let rosetta_blocks = get_rosetta_blocks_from_icrc1_ledger(env.icrc1_agent,0,*MAX_BLOCKS_PER_REQUEST).await;
+
+        if !args_with_caller.is_empty(){
+        assert!(
+            !rosetta_blocks.is_empty(),
+            "there should be blocks in the ledger"
+        );
+
+        let rosetta_response = env.rosetta_client
+            .network_status(env.network_identifier.clone())
+            .await
+            .expect("Unable to call network_status");
+
+        assert_eq!(
+            rosetta_blocks.last().unwrap().index,
+            rosetta_response.current_block_identifier.index,
+            "Chain length does not match"
+        );
+        assert_eq!(
+            rosetta_response.current_block_identifier.index, args_with_caller.len() as u64,
+            "current_block_identifier index should be args_with_caller.len()"
+        );
+
+        assert_eq!(
+            hex::encode(rosetta_blocks.first().unwrap().clone().get_block_hash().clone()),
+            rosetta_response.genesis_block_identifier.hash,
+            "Genesis block hashes do not match"
+        );
+        assert_eq!(
+            hex::encode(rosetta_blocks.last().unwrap().clone().get_block_hash().clone()),
+            rosetta_response.current_block_identifier.hash,
+            "Current block hashes do not match"
+        );
+        assert_eq!(
+            hex::encode(rosetta_blocks.first().unwrap().clone().get_block_hash().clone()),
+            rosetta_response.oldest_block_identifier.unwrap().hash,
+            "Genesis block hashes do not match"
+        );
+        assert_eq!(
+            Duration::from_nanos(rosetta_blocks.last().unwrap().get_timestamp()).as_millis() as u64,
+            rosetta_response.current_block_timestamp
+        );
+    }
     });
 
-    // Transfer some tokens to generate a new block.
-    let _ = agent
-        .transfer(TransferArg {
-            from_subaccount: TEST_ACCOUNT.subaccount,
-            to: Account {
-                owner: icrc_ledger_canister_id.into(),
-                subaccount: None,
-            },
-            fee: None,
-            created_at_time: None,
-            memo: None,
-            amount: Nat::from(10_000_000),
-        })
-        .await
-        .expect("Failed to generate a new block");
-
-    let rosetta_context = start_rosetta(
-        &rosetta_bin(),
-        RosettaOptions {
-            ledger_id,
-            network_url: Some(replica_url),
-            offline: false,
-            ..RosettaOptions::default()
-        },
-    )
-    .await;
-
-    // Get the blocks from the ledger to compare against rosetta
-    let get_blocks_response = agent
-        .get_blocks(GetBlocksRequest {
-            start: Nat::from(0),
-            length: Nat::from(10),
-        })
-        .await
-        .expect("Failed to get blocks");
-    assert!(
-        !get_blocks_response.blocks.is_empty(),
-        "there should be blocks in the ledger"
-    );
-
-    let client = RosettaClient::from_str_url(&format!("http://0.0.0.0:{}", rosetta_context.port))
-        .expect("Unable to parse url");
-    let network_identifier = NetworkIdentifier::new(
-        DEFAULT_BLOCKCHAIN.to_owned(),
-        CanisterId::try_from(ledger_id.as_slice())
-            .unwrap()
-            .to_string(),
-    );
-
-    let rosetta_response = client
-        .network_status(network_identifier.clone())
-        .await
-        .expect("Unable to call network_status");
-
-    let expected_current_block =
-        RosettaBlock::from_generic_block(get_blocks_response.blocks[1].clone(), 1).unwrap();
-
-    assert_eq!(
-        get_blocks_response.chain_length,
-        rosetta_response.current_block_identifier.index + 1,
-        "Chain length does not match"
-    );
-    assert_eq!(
-        rosetta_response.current_block_identifier.index, 1,
-        "current_block_identifier index should be 1"
-    );
-    assert_eq!(
-        hex::encode(get_blocks_response.blocks[0].hash()),
-        rosetta_response.genesis_block_identifier.hash,
-        "Genesis block hashes do not match"
-    );
-    assert_eq!(
-        hex::encode(get_blocks_response.blocks[1].hash()),
-        rosetta_response.current_block_identifier.hash,
-        "Current block hashes do not match"
-    );
-    assert_eq!(
-        hex::encode(get_blocks_response.blocks[0].hash()),
-        rosetta_response.oldest_block_identifier.unwrap().hash,
-        "Genesis block hashes do not match"
-    );
-    assert_eq!(
-        Duration::from_nanos(expected_current_block.timestamp).as_millis() as u64,
-        rosetta_response.current_block_timestamp
-    );
 }
 
-// Creates a block for each type of transaction operation and returns
-// the blocks created.
-async fn create_blocks(
-    mut icrc_agent: Icrc1Agent,
-    icrc_ledger_canister_id: CanisterId,
-) -> Vec<Value> {
-    // Transfer some tokens to make a `Mint` operation.
-    icrc_agent
-        .transfer(TransferArg {
-            from_subaccount: TEST_ACCOUNT.subaccount,
-            to: *TEST_ACCOUNT_2,
-            fee: None,
-            created_at_time: None,
-            memo: None,
-            amount: Nat::from(100_000_000_000u64),
+}
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(*NUM_TEST_CASES))]
+    #[test]
+    fn test_blocks(args_with_caller in valid_transactions_strategy(
+        (*MINTING_IDENTITY).clone(),
+        DEFAULT_TRANSFER_FEE,
+        *MAX_NUM_GENERATED_BLOCKS,
+        SystemTime::now(),
+    )) {
+    // Create a tokio environment to conduct async calls
+    let rt = Runtime::new().unwrap();
+
+    // Wrap async calls in a blocking Block
+     rt.block_on(async {
+        let env = RosettaTestingEnvironmentBuilder::new()
+            .with_args_with_caller(args_with_caller.clone())
+            .with_init_args_builder(local_replica::icrc_ledger_default_args_builder().with_minting_account((*MINTING_IDENTITY).clone().sender().unwrap()))
+            .build()
+            .await;
+
+        if !args_with_caller.is_empty(){
+
+    for block in get_rosetta_blocks_from_icrc1_ledger(env.icrc1_agent,0,*MAX_BLOCKS_PER_REQUEST).await.into_iter(){
+        let expected_block_response = BlockResponse::new(
+            Some(
+                icrc1_rosetta_block_to_rosetta_core_block(block.clone(), Currency {
+                    symbol: env.icrc1_ledger_init_args.token_symbol.clone(),
+                    decimals: env.icrc1_ledger_init_args
+                    .decimals
+                    .unwrap_or(DEFAULT_DECIMAL_PLACES) as u32,
+                    ..Default::default()
+                }).unwrap(),
+            ));
+
+        assert_eq!(hex::encode(block.clone().get_block_hash().clone()),expected_block_response.clone().block.unwrap().block_identifier.hash);
+                // Rosetta should be able to handle blockidentifieres with both the hash and the block index set
+        let actual_block_response = env.rosetta_client.block(env.network_identifier.clone(), PartialBlockIdentifier{
+            hash:Some(hex::encode(block.clone().get_block_hash().clone())),
+            index:Some(block.index)
         })
         .await
-        .expect("Failed to generate a new transfer operation")
-        .expect("Failed to mint");
+        .expect("Failed to find block in Rosetta");
+        assert_eq!(expected_block_response,actual_block_response);
 
-    // Transfer some tokens to make a `Transfer` operation.
-    icrc_agent.agent.set_identity(test_identity_2());
-    icrc_agent
-        .transfer(TransferArg {
-            from_subaccount: TEST_ACCOUNT_2.subaccount,
-            to: Account {
-                owner: icrc_ledger_canister_id.into(),
-                subaccount: None,
-            },
-            fee: None,
-            created_at_time: None,
-            memo: None,
-            amount: Nat::from(100_000_000),
+        // Rosetta should be able to handle blockidentifieres with only the hash set
+        let actual_block_response = env.rosetta_client.block(env.network_identifier.clone(), PartialBlockIdentifier{
+            hash:Some(hex::encode(block.clone().get_block_hash())),
+            index:None
         })
         .await
-        .expect("Failed to generate a new transfer operation")
-        .expect("Failed to transfer");
+        .expect("Failed to find block in Rosetta");
+        assert_eq!(expected_block_response,actual_block_response);
 
-    // Transfer some tokens to make a `Burn` operation.
-    icrc_agent
-        .transfer(TransferArg {
-            from_subaccount: TEST_ACCOUNT_2.subaccount,
-            to: *TEST_ACCOUNT,
-            fee: None,
-            created_at_time: None,
-            memo: None,
-            amount: Nat::from(100_000_000),
+        // Rosetta should be able to handle blockidentifieres with only the index set
+        let actual_block_response = env.rosetta_client.block(env.network_identifier.clone(), PartialBlockIdentifier{
+            hash:None,
+            index:Some(block.index)
         })
         .await
-        .expect("Failed to generate a new burn operation")
-        .expect("Failed to burn");
+        .expect("Failed to find block in Rosetta");
+        assert_eq!(expected_block_response,actual_block_response);
 
-    // Approve some tokens to generate a block with an `Approve` operation.
-    icrc_agent
-        .approve(ApproveArgs {
-            from_subaccount: TEST_ACCOUNT_2.subaccount,
-            spender: Account {
-                owner: icrc_ledger_canister_id.into(),
-                subaccount: None,
-            },
-            amount: Nat::from(100_000_000),
-            expected_allowance: None,
-            expires_at: None,
-            fee: None,
-            memo: None,
-            created_at_time: None,
+        // If no hash was provided rosetta should return an error
+        assert!(env.rosetta_client.block(env.network_identifier.clone(), PartialBlockIdentifier{
+            hash:None,
+            index:None
         })
-        .await
-        .expect("Failed to generate a new approve operation")
-        .expect("Failed to approve");
-
-    // Get the blocks from the ledger to compare against rosetta
-    let get_blocks_response = icrc_agent
-        .get_blocks(GetBlocksRequest {
-            start: Nat::from(0),
-            length: Nat::from(10),
-        })
-        .await
-        .expect("Failed to get blocks");
-    assert!(
-        !get_blocks_response.blocks.is_empty(),
-        "there should be blocks in the ledger"
-    );
-
-    get_blocks_response.blocks
+        .await.is_err());
+    }}
+ });
+ }
 }
 
-fn expected_operations(
-    icrc_ledger_canister_id: CanisterId,
-    Metadata { decimals, symbol }: Metadata,
-) -> Vec<Vec<Operation>> {
-    let currency = Currency {
-        symbol: symbol.clone(),
-        decimals: decimals.into(),
-        metadata: None,
-    };
-    vec![
-        vec![Operation::new(
-            0,
-            OperationType::Mint.to_string(),
-            Some(icrc1_account_to_rosetta_accountidentifier(&TEST_ACCOUNT)),
-            Some(Amount::new("1000000000000".to_string(), currency.clone())),
-        )],
-        vec![Operation::new(
-            0,
-            OperationType::Mint.to_string(),
-            Some(icrc1_account_to_rosetta_accountidentifier(&TEST_ACCOUNT_2)),
-            Some(Amount::new("100000000000".to_string(), currency.clone())),
-        )],
-        vec![
-            Operation::new(
-                0,
-                OperationType::Transfer.to_string(),
-                Some(icrc1_account_to_rosetta_accountidentifier(&TEST_ACCOUNT_2)),
-                Some(Amount::new("-100000000".to_string(), currency.clone())),
-            ),
-            Operation::new(
-                1,
-                OperationType::Transfer.to_string(),
-                Some(icrc1_account_to_rosetta_accountidentifier(
-                    &icrc_ledger_canister_id.get().0.into(),
-                )),
-                Some(Amount::new("100000000".to_string(), currency.clone())),
-            ),
-            Operation::new(
-                2,
-                OperationType::Fee.to_string(),
-                Some(icrc1_account_to_rosetta_accountidentifier(&TEST_ACCOUNT_2)),
-                Some(Amount::new("-10000".to_string(), currency.clone())),
-            ),
-        ],
-        vec![Operation::new(
-            0,
-            OperationType::Burn.to_string(),
-            Some(icrc1_account_to_rosetta_accountidentifier(&TEST_ACCOUNT_2)),
-            Some(Amount::new("-100000000".to_string(), currency.clone())),
-        )],
-        vec![
-            Operation {
-                operation_identifier: OperationIdentifier::new(0),
-                account: Some(icrc1_account_to_rosetta_accountidentifier(&TEST_ACCOUNT_2)),
-                _type: OperationType::Approve.to_string(),
-                amount: None,
-                metadata: Some(
-                    ApproveMetadata {
-                        from: icrc1_account_to_rosetta_accountidentifier(&TEST_ACCOUNT_2),
-                        spender: icrc1_account_to_rosetta_accountidentifier(
-                            &icrc_ledger_canister_id.get().0.into(),
-                        ),
-                        allowance: U64::new(100_000_000),
-                        expected_allowance: None,
-                        expires_at: None,
-                    }
-                    .into(),
-                ),
-                related_operations: None,
-                status: None,
-                coin_change: None,
-            },
-            Operation::new(
-                1,
-                OperationType::Fee.to_string(),
-                Some(icrc1_account_to_rosetta_accountidentifier(&TEST_ACCOUNT_2)),
-                Some(Amount::new("-10000".to_string(), currency.clone())),
-            ),
-        ],
-    ]
-}
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(*NUM_TEST_CASES))]
+    #[test]
+    fn test_block_transaction(args_with_caller in valid_transactions_strategy(
+        (*MINTING_IDENTITY).clone(),
+        DEFAULT_TRANSFER_FEE,
+        *MAX_NUM_GENERATED_BLOCKS,
+        SystemTime::now(),
+    )) {
+    // Create a tokio environment to conduct async calls
+    let rt = Runtime::new().unwrap();
 
-fn create_expected_rosetta_responses(
-    blocks: Vec<Value>,
-    icrc_ledger_canister_id: CanisterId,
-    metadata: Metadata,
-) -> Vec<BlockResponse> {
-    // map the blocks to the expected operations to create the expected /block
-    // responses
-    let mut responses = vec![];
-    let expected_operations = expected_operations(icrc_ledger_canister_id, metadata);
+    // Wrap async calls in a blocking Block
+     rt.block_on(async {
+        let env = RosettaTestingEnvironmentBuilder::new()
+            .with_args_with_caller(args_with_caller.clone())
+            .with_init_args_builder(local_replica::icrc_ledger_default_args_builder().with_minting_account((*MINTING_IDENTITY).clone().sender().unwrap()))
+            .build()
+            .await;
 
-    for (index, (block, operations)) in blocks
-        .into_iter()
-        .zip(expected_operations.into_iter())
-        .enumerate()
-    {
-        let block = RosettaBlock::from_generic_block(block, index as u64).unwrap();
-        let block_hash = hex::encode(&block.block_hash);
-        let parent_hash = block
-            .parent_hash
-            .as_ref()
-            .map(hex::encode)
-            .unwrap_or_else(|| block_hash.clone());
-        let transaction_hash = block.get_transaction().unwrap().hash().to_string();
-        let mut transaction_metadata = ObjectMap::new();
-        if index == 0 {
-            transaction_metadata.insert(
-                "created_at_time".to_string(),
-                serde_json::Value::Number(Number::from(block.timestamp)),
-            );
-        }
+        if !args_with_caller.is_empty(){
 
-        responses.push(BlockResponse::new(Some(Block::new(
-            BlockIdentifier::new(index as u64, block_hash),
-            BlockIdentifier::new(index.saturating_sub(1) as u64, parent_hash),
-            Duration::from_nanos(block.timestamp).as_millis() as u64,
-            vec![Transaction {
-                transaction_identifier: TransactionIdentifier {
-                    hash: transaction_hash,
-                },
-                operations,
-                metadata: if !transaction_metadata.is_empty() {
-                    Some(transaction_metadata)
-                } else {
-                    None
-                },
-            }],
-        ))));
-    }
+    for block in get_rosetta_blocks_from_icrc1_ledger(env.icrc1_agent,0,*MAX_BLOCKS_PER_REQUEST).await.into_iter(){
+        let expected_block_transaction_response =   rosetta_core::response_types::BlockTransactionResponse {
+            transaction: icrc1_rosetta_block_to_rosetta_core_transaction(block.clone(), Currency {
+                symbol: env.icrc1_ledger_init_args.token_symbol.clone(),
+                decimals: env.icrc1_ledger_init_args
+                .decimals
+                .unwrap_or(DEFAULT_DECIMAL_PLACES) as u32,
+                ..Default::default()
+            }).unwrap()};
 
-    responses
-}
+        assert_eq!(hex::encode(block.clone().get_transaction_hash().clone()),expected_block_transaction_response.clone().transaction.transaction_identifier.hash);
 
-#[tokio::test]
-async fn test_block() {
-    let replica_context = local_replica::start_new_local_replica().await;
-    let replica_url = format!("http://localhost:{}", replica_context.port);
+                // Rosetta should be able to handle blockidentifieres with both the hash and the block index set
+        let actual_block_transaction_response = env.rosetta_client.block_transaction(env.network_identifier.clone(),
+            BlockIdentifier {
+                            index: block.index,
+                            hash: hex::encode(block.clone().get_block_hash().clone()),
 
-    // Deploy an ICRC-1 ledger canister
-    let init_args = local_replica::icrc_ledger_default_args_builder(&replica_context)
+        }, TransactionIdentifier{ hash: hex::encode(block.clone().get_transaction_hash().clone()) })
         .await
-        .with_feature_flags(ic_icrc1_ledger::FeatureFlags { icrc2: true })
-        .build();
-    let metadata = Metadata {
-        decimals: init_args.decimals.unwrap_or(DEFAULT_DECIMAL_PLACES),
-        symbol: init_args.token_symbol.clone(),
-    };
+        .expect("Failed to find block in Rosetta");
+        assert_eq!(expected_block_transaction_response,actual_block_transaction_response);
 
-    let icrc_ledger_canister_id =
-        local_replica::deploy_icrc_ledger_with_custom_args(&replica_context, init_args).await;
-    let ledger_id = Principal::from(icrc_ledger_canister_id);
+        assert!(env.rosetta_client.block_transaction(env.network_identifier.clone(),
+        BlockIdentifier {
+                        index: u64::MAX,
+                        hash: hex::encode(block.clone().get_block_hash().clone()),
 
-    let ic_agent = local_replica::get_testing_agent(&replica_context).await;
+    }, TransactionIdentifier{ hash: hex::encode(block.clone().get_transaction_hash().clone()) })
+    .await.is_err());
 
-    // Create a testing agent
-    let icrc_agent = Icrc1Agent {
-        agent: ic_agent,
-        ledger_canister_id: icrc_ledger_canister_id.into(),
-    };
+    assert!(env.rosetta_client.block_transaction(env.network_identifier.clone(),
+    BlockIdentifier {
+                    index: block.index,
+                    hash: hex::encode("wrong hash"),
 
-    // Create the blocks and expected rosetta responses.
-    let blocks = create_blocks(icrc_agent, icrc_ledger_canister_id).await;
-    let expected_responses =
-        create_expected_rosetta_responses(blocks, icrc_ledger_canister_id, metadata);
+    }, TransactionIdentifier{ hash: hex::encode(block.clone().get_transaction_hash()) })
+    .await.is_err());
 
-    let rosetta_context = start_rosetta(
-        &rosetta_bin(),
-        RosettaOptions {
-            ledger_id,
-            network_url: Some(replica_url),
-            offline: false,
-            ..RosettaOptions::default()
-        },
-    )
-    .await;
+    assert!(env.rosetta_client.block_transaction(env.network_identifier.clone(),
+        BlockIdentifier {
+                        index: block.index,
+                        hash: hex::encode(block.clone().get_block_hash()),
 
-    let client = RosettaClient::from_str_url(&format!("http://0.0.0.0:{}", rosetta_context.port))
-        .expect("Unable to parse url");
-    let network_identifier = NetworkIdentifier::new(
-        DEFAULT_BLOCKCHAIN.to_owned(),
-        CanisterId::try_from(ledger_id.as_slice())
-            .unwrap()
-            .to_string(),
-    );
-
-    for (index, expected_response) in expected_responses.into_iter().enumerate() {
-        let partial_block_identifier = match index % 3 {
-            1 => PartialBlockIdentifier {
-                index: Some(index as u64),
-                hash: None,
-            },
-            2 => PartialBlockIdentifier {
-                index: None,
-                hash: Some(
-                    expected_response
-                        .block
-                        .clone()
-                        .unwrap()
-                        .block_identifier
-                        .hash
-                        .clone(),
-                ),
-            },
-            _ => PartialBlockIdentifier {
-                index: Some(index as u64),
-                hash: Some(
-                    expected_response
-                        .block
-                        .clone()
-                        .unwrap()
-                        .block_identifier
-                        .hash
-                        .clone(),
-                ),
-            },
-        };
-
-        let received_block_response: BlockResponse = client
-            .block(network_identifier.clone(), partial_block_identifier)
-            .await
-            .expect("Failed to find block in Rosetta");
-
-        assert_eq!(received_block_response, expected_response);
+}, TransactionIdentifier{ hash: hex::encode("wrong tx hash") })
+.await.is_err());
     }
 }
-
-fn create_expected_block_hashes_and_block_transaction_responses(
-    blocks: Vec<Value>,
-    icrc_ledger_canister_id: CanisterId,
-    metadata: Metadata,
-) -> Vec<(String, BlockTransactionResponse)> {
-    // map the blocks to the expected operations to create the expected /block
-    // responses
-    let mut responses = vec![];
-    let expected_operations = expected_operations(icrc_ledger_canister_id, metadata);
-
-    for (index, (block, operations)) in blocks
-        .into_iter()
-        .zip(expected_operations.into_iter())
-        .enumerate()
-    {
-        let block = RosettaBlock::from_generic_block(block, index as u64).unwrap();
-        let block_hash = hex::encode(&block.block_hash);
-        let transaction_hash = block.get_transaction().unwrap().hash().to_string();
-        let mut metadata = ObjectMap::new();
-        if index == 0 {
-            metadata.insert(
-                "created_at_time".to_string(),
-                serde_json::Value::Number(Number::from(block.timestamp)),
-            );
-        }
-
-        responses.push((
-            block_hash,
-            BlockTransactionResponse {
-                transaction: Transaction {
-                    transaction_identifier: TransactionIdentifier {
-                        hash: transaction_hash,
-                    },
-                    operations,
-                    metadata: if !metadata.is_empty() {
-                        Some(metadata)
-                    } else {
-                        None
-                    },
-                },
-            },
-        ));
-    }
-
-    responses
-}
-
-#[tokio::test]
-async fn test_block_transaction() {
-    let replica_context = local_replica::start_new_local_replica().await;
-    let replica_url = format!("http://localhost:{}", replica_context.port);
-
-    // Deploy an ICRC-1 ledger canister
-    let init_args = local_replica::icrc_ledger_default_args_builder(&replica_context)
-        .await
-        .with_feature_flags(ic_icrc1_ledger::FeatureFlags { icrc2: true })
-        .build();
-    let metadata = Metadata {
-        decimals: init_args.decimals.unwrap_or(DEFAULT_DECIMAL_PLACES),
-        symbol: init_args.token_symbol.clone(),
-    };
-
-    let icrc_ledger_canister_id =
-        local_replica::deploy_icrc_ledger_with_custom_args(&replica_context, init_args).await;
-    let ledger_id = Principal::from(icrc_ledger_canister_id);
-
-    let ic_agent = local_replica::get_testing_agent(&replica_context).await;
-
-    // Create a testing agent
-    let icrc_agent = Icrc1Agent {
-        agent: ic_agent,
-        ledger_canister_id: icrc_ledger_canister_id.into(),
-    };
-
-    // Create the blocks and expected rosetta responses.
-    let blocks = create_blocks(icrc_agent, icrc_ledger_canister_id).await;
-    let expected_responses = create_expected_block_hashes_and_block_transaction_responses(
-        blocks,
-        icrc_ledger_canister_id,
-        metadata,
-    );
-
-    let rosetta_context = start_rosetta(
-        &rosetta_bin(),
-        RosettaOptions {
-            ledger_id,
-            network_url: Some(replica_url),
-            offline: false,
-            ..RosettaOptions::default()
-        },
-    )
-    .await;
-
-    let client = RosettaClient::from_str_url(&format!("http://0.0.0.0:{}", rosetta_context.port))
-        .expect("Unable to parse url");
-    let network_identifier = NetworkIdentifier::new(
-        DEFAULT_BLOCKCHAIN.to_owned(),
-        CanisterId::try_from(ledger_id.as_slice())
-            .unwrap()
-            .to_string()
-            .to_string(),
-    );
-
-    for (index, (expected_block_hash, expected_response)) in
-        expected_responses.into_iter().enumerate()
-    {
-        let block_identifier = BlockIdentifier {
-            index: index as u64,
-            hash: expected_block_hash,
-        };
-
-        let transaction_identifier = expected_response.transaction.transaction_identifier.clone();
-
-        let received_block_response: BlockTransactionResponse = client
-            .block_transaction(
-                network_identifier.clone(),
-                block_identifier,
-                transaction_identifier,
-            )
-            .await
-            .expect("Failed to find block transaction in Rosetta");
-        assert_eq!(received_block_response, expected_response);
-    }
+ });
+ }
 }
 
 #[tokio::test]
 async fn test_mempool() {
-    let replica_context = local_replica::start_new_local_replica().await;
-    let replica_url = format!("http://localhost:{}", replica_context.port);
-    // Deploy an ICRC-1 ledger canister
-    let icrc_ledger_canister_id =
-        local_replica::deploy_icrc_ledger_with_default_args(&replica_context).await;
-    let ledger_id = Principal::from(icrc_ledger_canister_id);
+    let env = RosettaTestingEnvironmentBuilder::new().build().await;
 
-    let rosetta_context = start_rosetta(
-        &rosetta_bin(),
-        RosettaOptions {
-            ledger_id,
-            network_url: Some(replica_url),
-            offline: false,
-            ..RosettaOptions::default()
-        },
-    )
-    .await;
-
-    let client = RosettaClient::from_str_url(&format!("http://0.0.0.0:{}", rosetta_context.port))
-        .expect("Unable to parse url");
-    let network_identifier = NetworkIdentifier::new(
-        DEFAULT_BLOCKCHAIN.to_owned(),
-        CanisterId::try_from(ledger_id.as_slice())
-            .unwrap()
-            .to_string(),
-    );
-
-    let transaction_identifiers = client
-        .mempool(network_identifier.clone())
+    let transaction_identifiers = env
+        .rosetta_client
+        .mempool(env.network_identifier.clone())
         .await
         .expect("Unable to call mempool")
         .transaction_identifiers;
@@ -690,12 +494,746 @@ async fn test_mempool() {
         hash: "1234".to_string(),
     };
     let mempool_transaction_request =
-        MempoolTransactionRequest::new(network_identifier, transaction_id);
-    let response = client
+        MempoolTransactionRequest::new(env.network_identifier, transaction_id);
+    let response = env
+        .rosetta_client
         .mempool_transaction(mempool_transaction_request)
         .await;
+    let err = response.expect_err("expected an error");
+    assert_eq!(err, Error::mempool_transaction_missing());
+}
+
+#[tokio::test]
+async fn test_construction_preprocess() {
+    let env = RosettaTestingEnvironmentBuilder::new().build().await;
+
+    let construction_preprocess_response = env
+        .rosetta_client
+        .construction_preprocess(vec![], env.network_identifier)
+        .await
+        .expect("Unable to call Construction Preprocess");
+    let expected = ConstructionPreprocessResponse {
+        options: Some(
+            ConstructionMetadataRequestOptions {
+                suggested_fee: true,
+            }
+            .try_into()
+            .unwrap(),
+        ),
+        required_public_keys: None,
+    };
+    assert_eq!(construction_preprocess_response, expected);
+}
+
+#[tokio::test]
+async fn test_construction_derive() {
+    let env = RosettaTestingEnvironmentBuilder::new().build().await;
+
+    let key_pair = EdKeypair::generate_from_u64(10);
+    let principal_id = key_pair.generate_principal_id().unwrap();
+    let public_key = ic_rosetta_test_utils::to_public_key(&key_pair);
+    let account = Account {
+        owner: principal_id.into(),
+        subaccount: None,
+    };
+
+    let request = ConstructionDeriveRequest {
+        network_identifier: env.network_identifier.clone(),
+        public_key: public_key.clone(),
+        metadata: None,
+    };
+    let account_identifier = env
+        .rosetta_client
+        .construction_derive(request.clone())
+        .await
+        .expect("Unable to call /construction/derive")
+        .account_identifier
+        .expect("/construction/derive did not return an account identifier");
+    assert_eq!(account_identifier, account.into());
+}
+
+#[test]
+fn test_account_balance() {
+    let mut runner = TestRunner::new(TestRunnerConfig {
+        max_shrink_iters: 0,
+        cases: *NUM_TEST_CASES,
+        ..Default::default()
+    });
+
+    runner
+        .run(
+            &(valid_transactions_strategy(
+                (*MINTING_IDENTITY).clone(),
+                DEFAULT_TRANSFER_FEE,
+                50,
+                SystemTime::now(),
+            )
+            .no_shrink()),
+            |args_with_caller| {
+                let rt = Runtime::new().unwrap();
+                let minting_account = MINTING_IDENTITY.sender().unwrap().into();
+
+                rt.block_on(async {
+                    let env = RosettaTestingEnvironmentBuilder::new()
+                        .with_args_with_caller(args_with_caller.clone())
+                        .with_init_args_builder(
+                            local_replica::icrc_ledger_default_args_builder()
+                                .with_minting_account(minting_account),
+                        )
+                        .build()
+                        .await;
+
+                    // Keep track of the account balances
+                    let mut accounts_balances: HashMap<Account, u64> = HashMap::new();
+
+                    let current_index = env
+                        .rosetta_client
+                        .network_status(env.network_identifier.clone())
+                        .await
+                        .expect("Unable to call network_status")
+                        .current_block_identifier
+                        .index;
+
+                    // We start at the block index before any transactions were created by the strategy
+                    let mut block_start_index = current_index - args_with_caller.len() as u64 + 1;
+
+                    let mut all_involved_accounts = HashSet::new();
+
+                    for ArgWithCaller {
+                        caller,
+                        arg,
+                        principal_to_basic_identity: _,
+                    } in args_with_caller.iter()
+                    {
+                        let sender_principal = caller.sender().unwrap();
+                        let mut involved_accounts = vec![];
+                        match arg {
+                            LedgerEndpointArg::ApproveArg(ApproveArgs {
+                                from_subaccount,
+                                spender,
+                                ..
+                            }) => {
+                                let from = Account {
+                                    owner: sender_principal,
+                                    subaccount: *from_subaccount,
+                                };
+
+                                // We are not interested in collisions with the minting account
+                                if from != minting_account {
+                                    accounts_balances.entry(from).and_modify(|balance| {
+                                        *balance -= DEFAULT_TRANSFER_FEE;
+                                    });
+                                    involved_accounts.push(from);
+                                }
+                                if *spender != minting_account {
+                                    accounts_balances.entry(*spender).or_insert(0);
+                                    involved_accounts.push(*spender);
+                                }
+                            }
+                            LedgerEndpointArg::TransferArg(TransferArg {
+                                from_subaccount,
+                                to,
+                                amount,
+                                ..
+                            }) => {
+                                let from = Account {
+                                    owner: sender_principal,
+                                    subaccount: *from_subaccount,
+                                };
+
+                                // For Mint transactions we do not keep track of the balance of the minter
+                                if from != minting_account {
+                                    accounts_balances.entry(from).and_modify(|balance| {
+                                        *balance -= amount.0.to_u64().unwrap();
+                                        // If the transfer is a burn no transfer fee should be deducted
+                                        if *to != minting_account {
+                                            *balance -= DEFAULT_TRANSFER_FEE;
+                                        }
+                                    });
+                                    involved_accounts.push(from);
+                                }
+                                if *to != minting_account {
+                                    accounts_balances
+                                        .entry(*to)
+                                        .and_modify(|balance| {
+                                            *balance += amount.0.to_u64().unwrap();
+                                        })
+                                        .or_insert(amount.0.to_u64().unwrap());
+                                    involved_accounts.push(*to);
+                                }
+                            }
+                        };
+
+                        for account in involved_accounts {
+                            all_involved_accounts.insert(account);
+                            assert_rosetta_balance(
+                                account,
+                                block_start_index,
+                                *accounts_balances.get(&account).unwrap(),
+                                &env.rosetta_client,
+                                env.network_identifier.clone(),
+                            )
+                            .await;
+                        }
+
+                        block_start_index += 1;
+                    }
+
+                    // Assert that the current balance on the ledger is the same as that of icrc rosetta
+                    for account in all_involved_accounts.into_iter() {
+                        let ledger_balance = env
+                            .icrc1_agent
+                            .balance_of(account, icrc_ledger_agent::CallMode::Query)
+                            .await
+                            .unwrap()
+                            .0
+                            .to_u64()
+                            .unwrap();
+                        let current_block_index = env
+                            .rosetta_client
+                            .network_status(env.network_identifier.clone())
+                            .await
+                            .expect("Unable to call network_status")
+                            .current_block_identifier
+                            .index;
+                        assert_rosetta_balance(
+                            account,
+                            current_block_index,
+                            ledger_balance,
+                            &env.rosetta_client,
+                            env.network_identifier.clone(),
+                        )
+                        .await;
+                    }
+                });
+                Ok(())
+            },
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_continuous_block_sync() {
+    let env = RosettaTestingEnvironmentBuilder::new().build().await;
+
+    // The empty test ledger has 1 block at index 0 - mint to the test identity.
+    let mut last_block_idx_start = 0;
+
+    let args = TransferArg {
+        from_subaccount: None,
+        to: *TEST_ACCOUNT,
+        fee: Some(DEFAULT_TRANSFER_FEE.into()),
+        amount: 1u64.into(),
+        memo: None,
+        created_at_time: None,
+    };
+
+    for blocks in 1..6 {
+        for i in 0..blocks {
+            let block_index = env
+                .icrc1_agent
+                .transfer(args.clone())
+                .await
+                .expect("sending transfer failed")
+                .expect("transfer resulted in an error");
+            assert_eq!(block_index, last_block_idx_start + i + 1);
+        }
+
+        let last_block_idx = wait_for_rosetta_block(
+            &env.rosetta_client,
+            env.network_identifier.clone(),
+            last_block_idx_start + blocks,
+        )
+        .await;
+
+        assert_eq!(
+            last_block_idx,
+            Some(last_block_idx_start + blocks),
+            "Rosetta did not sync the last block!"
+        );
+
+        last_block_idx_start = last_block_idx.expect("Last block not found");
+    }
+}
+
+#[tokio::test]
+async fn test_construction_submit() {
+    let sender_keypair = EdKeypair::generate_from_u64(0);
+    let receiver_keypair = EdKeypair::generate_from_u64(1);
+
+    let env = RosettaTestingEnvironmentBuilder::new()
+        .with_init_args_builder(
+            local_replica::icrc_ledger_default_args_builder()
+                .with_minting_account((*MINTING_IDENTITY).clone().sender().unwrap())
+                .with_initial_balance(
+                    sender_keypair.generate_principal_id().unwrap().0,
+                    1_000_000_000_000u64,
+                ),
+        )
+        .build()
+        .await;
+
+    let to_operation = rosetta_core::objects::Operation {
+        operation_identifier: OperationIdentifier {
+            index: TRANSFER_TO_OPERATION_IDENTIFIER,
+            network_index: None,
+        },
+        related_operations: Some(vec![
+            OperationIdentifier::new(TRANSFER_FROM_OPERATION_IDENTIFIER),
+            OperationIdentifier::new(FEE_OPERATION_IDENTIFIER),
+        ]),
+        type_: "TRANSFER".to_owned(),
+        status: None,
+        account: Some(AccountIdentifier {
+            address: receiver_keypair
+                .generate_principal_id()
+                .unwrap()
+                .0
+                .to_string(),
+            sub_account: None,
+            metadata: None,
+        }),
+        amount: Some(rosetta_core::objects::Amount {
+            value: "0".to_owned(),
+            currency: Currency {
+                symbol: env.icrc1_ledger_init_args.token_symbol.clone(),
+                decimals: env
+                    .icrc1_ledger_init_args
+                    .decimals
+                    .unwrap_or(DEFAULT_DECIMAL_PLACES) as u32,
+                metadata: None,
+            },
+            metadata: None,
+        }),
+        coin_change: None,
+        metadata: None,
+    };
+
+    let from_operation = rosetta_core::objects::Operation {
+        operation_identifier: OperationIdentifier {
+            index: TRANSFER_FROM_OPERATION_IDENTIFIER,
+            network_index: None,
+        },
+        related_operations: Some(vec![
+            OperationIdentifier::new(TRANSFER_TO_OPERATION_IDENTIFIER),
+            OperationIdentifier::new(FEE_OPERATION_IDENTIFIER),
+        ]),
+        type_: "TRANSFER".to_owned(),
+        status: None,
+        account: Some(AccountIdentifier {
+            address: sender_keypair
+                .generate_principal_id()
+                .unwrap()
+                .0
+                .to_string(),
+            sub_account: None,
+            metadata: None,
+        }),
+        amount: Some(rosetta_core::objects::Amount {
+            value: "-0".to_owned(),
+            currency: Currency {
+                symbol: env.icrc1_ledger_init_args.token_symbol.clone(),
+                decimals: env
+                    .icrc1_ledger_init_args
+                    .decimals
+                    .unwrap_or(DEFAULT_DECIMAL_PLACES) as u32,
+                metadata: None,
+            },
+            metadata: None,
+        }),
+        coin_change: None,
+        metadata: None,
+    };
+
+    let fee_operation = rosetta_core::objects::Operation {
+        operation_identifier: OperationIdentifier {
+            index: FEE_OPERATION_IDENTIFIER,
+            network_index: None,
+        },
+        related_operations: Some(vec![
+            OperationIdentifier::new(TRANSFER_FROM_OPERATION_IDENTIFIER),
+            OperationIdentifier::new(TRANSFER_TO_OPERATION_IDENTIFIER),
+        ]),
+        type_: "FEE".to_owned(),
+        status: None,
+        account: Some(AccountIdentifier {
+            address: sender_keypair
+                .generate_principal_id()
+                .unwrap()
+                .0
+                .to_string(),
+            sub_account: None,
+            metadata: None,
+        }),
+        amount: Some(rosetta_core::objects::Amount {
+            value: format!("-{}", Nat::from(DEFAULT_TRANSFER_FEE)),
+            currency: Currency {
+                symbol: env.icrc1_ledger_init_args.token_symbol.clone(),
+                decimals: env
+                    .icrc1_ledger_init_args
+                    .decimals
+                    .unwrap_or(DEFAULT_DECIMAL_PLACES) as u32,
+                metadata: None,
+            },
+            metadata: None,
+        }),
+        coin_change: None,
+        metadata: Some(
+            FeeMetadata {
+                fee_set_by: FeeSetter::User,
+            }
+            .try_into()
+            .unwrap(),
+        ),
+    };
+
+    let mut operations = vec![to_operation, from_operation, fee_operation];
+
+    let construction_preprocess_response = env
+        .rosetta_client
+        .construction_preprocess(operations.clone(), env.network_identifier.clone())
+        .await
+        .expect("Unable to call /construction/preprocess");
+
+    let public_keys = vec![(&sender_keypair).into()];
     assert_eq!(
-        response.expect_err("expected an error").status().unwrap(),
-        StatusCode::INTERNAL_SERVER_ERROR
+        construction_preprocess_response.required_public_keys,
+        Some(vec![Account::from(
+            sender_keypair.generate_principal_id().unwrap().0
+        )
+        .into()])
+    );
+
+    let construction_payloads_response = env
+        .rosetta_client
+        .construction_payloads(
+            env.network_identifier.clone(),
+            operations.clone(),
+            Some(public_keys),
+            None,
+        )
+        .await
+        .expect("Unable to call /construction/payloads");
+
+    let mut construction_parse_response = env
+        .rosetta_client
+        .construction_parse(
+            env.network_identifier.clone(),
+            construction_payloads_response.unsigned_transaction.clone(),
+            false,
+        )
+        .await
+        .expect("Unable to call /construction/parse");
+
+    construction_parse_response
+        .operations
+        .iter_mut()
+        .for_each(|op| {
+            op.related_operations = op.related_operations.clone().map(|mut x| {
+                x.sort_by(|a, b| a.index.cmp(&b.index));
+                x
+            })
+        });
+    operations.iter_mut().for_each(|op| {
+        op.related_operations = op.related_operations.clone().map(|mut x| {
+            x.sort_by(|a, b| a.index.cmp(&b.index));
+            x
+        })
+    });
+
+    assert_eq!(construction_parse_response.operations, operations.clone());
+
+    let signatures =
+        RosettaClient::sign_transaction(&sender_keypair, construction_payloads_response.clone())
+            .unwrap();
+
+    let construction_combine_response = env
+        .rosetta_client
+        .construction_combine(
+            env.network_identifier.clone(),
+            construction_payloads_response.unsigned_transaction,
+            signatures,
+        )
+        .await
+        .expect("Unable to call /construction/combine");
+
+    let signed_transaction = construction_combine_response.signed_transaction;
+
+    let construction_parse_response = env
+        .rosetta_client
+        .construction_parse(
+            env.network_identifier.clone(),
+            signed_transaction.clone(),
+            true,
+        )
+        .await
+        .expect("Unable to call /construction/parse");
+
+    assert_eq!(construction_parse_response.operations, operations.clone());
+
+    let balance_before_transfer = env
+        .icrc1_agent
+        .balance_of(
+            sender_keypair.generate_principal_id().unwrap().0.into(),
+            CallMode::Query,
+        )
+        .await
+        .unwrap();
+
+    let construction_submit_response = env
+        .rosetta_client
+        .construction_submit(
+            env.network_identifier.clone(),
+            signed_transaction.to_string(),
+        )
+        .await
+        .expect("Unable to call /construction/submit");
+
+    let construction_hash_response = env
+        .rosetta_client
+        .construction_hash(env.network_identifier, signed_transaction.to_string())
+        .await
+        .expect("Unable to call /construction/hash");
+
+    assert_eq!(
+        construction_submit_response.transaction_identifier.hash,
+        construction_hash_response.transaction_identifier.hash
+    );
+
+    let current_balance = env
+        .icrc1_agent
+        .balance_of(
+            sender_keypair.generate_principal_id().unwrap().0.into(),
+            CallMode::Query,
+        )
+        .await
+        .unwrap();
+
+    // Since we do not yet get the actual response back from the submit endpoint, we need to check that the transaction was successful by confirming the balance change
+    assert_eq!(
+        current_balance,
+        balance_before_transfer - Nat::from(DEFAULT_TRANSFER_FEE)
+    );
+}
+
+#[tokio::test]
+async fn test_rosetta_client_construction_api_flow() {
+    let sender_keypair = EdKeypair::generate_from_u64(0);
+    let receiver_keypair = EdKeypair::generate_from_u64(1);
+
+    let env = RosettaTestingEnvironmentBuilder::new()
+        .with_init_args_builder(
+            local_replica::icrc_ledger_default_args_builder()
+                .with_minting_account((*MINTING_IDENTITY).clone().sender().unwrap())
+                .with_initial_balance(
+                    sender_keypair.generate_principal_id().unwrap().0,
+                    1_000_000_000_000u64,
+                ),
+        )
+        .build()
+        .await;
+
+    // Test the transfer functionality of the rosetta client
+    let transfer_amount: Nat = 1_000_000_000u64.into();
+
+    let operations = env
+        .rosetta_client
+        .build_transfer_operations(
+            &sender_keypair,
+            None,
+            receiver_keypair.generate_principal_id().unwrap().0.into(),
+            transfer_amount.clone(),
+            env.network_identifier.clone(),
+        )
+        .await
+        .unwrap();
+
+    let balance_before_transfer = env
+        .icrc1_agent
+        .balance_of(
+            sender_keypair.generate_principal_id().unwrap().0.into(),
+            CallMode::Query,
+        )
+        .await
+        .unwrap();
+
+    env.rosetta_client
+        .make_and_submit_transaction(
+            &sender_keypair,
+            env.network_identifier.clone(),
+            operations,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let current_balance = env
+        .icrc1_agent
+        .balance_of(
+            sender_keypair.generate_principal_id().unwrap().0.into(),
+            CallMode::Query,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        current_balance,
+        balance_before_transfer - Nat::from(DEFAULT_TRANSFER_FEE) - transfer_amount
+    );
+
+    // Test the approve functionality of the rosetta client
+    let approve_amount: Nat = 1_000_000_000u64.into();
+
+    let operations = env
+        .rosetta_client
+        .build_approve_operations(
+            &sender_keypair,
+            None,
+            receiver_keypair.generate_principal_id().unwrap().0.into(),
+            approve_amount.clone(),
+            None,
+            env.network_identifier.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let balance_before_approve = env
+        .icrc1_agent
+        .balance_of(
+            sender_keypair.generate_principal_id().unwrap().0.into(),
+            CallMode::Query,
+        )
+        .await
+        .unwrap();
+
+    env.rosetta_client
+        .make_and_submit_transaction(
+            &sender_keypair,
+            env.network_identifier.clone(),
+            operations,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let current_balance = env
+        .icrc1_agent
+        .balance_of(
+            sender_keypair.generate_principal_id().unwrap().0.into(),
+            CallMode::Query,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        current_balance,
+        balance_before_approve - Nat::from(DEFAULT_TRANSFER_FEE)
+    );
+}
+
+#[tokio::test]
+async fn test_rosetta_client_binary() {
+    let sender_keypair = EdKeypair::generate_from_u64(0);
+    let receiver_keypair = EdKeypair::generate_from_u64(1);
+
+    let sender_account = Account {
+        owner: sender_keypair.generate_principal_id().unwrap().0,
+        subaccount: Some([1; 32]),
+    };
+
+    let env = RosettaTestingEnvironmentBuilder::new()
+        .with_init_args_builder(
+            local_replica::icrc_ledger_default_args_builder()
+                .with_minting_account((*MINTING_IDENTITY).clone().sender().unwrap())
+                .with_initial_balance(sender_account, 1_000_000_000_000u64),
+        )
+        .build()
+        .await;
+
+    // Test the transfer functionality of the rosetta client binary
+    let transfer_amount: Nat = 1_000_000_000u64.into();
+
+    let balance_before_transfer = env
+        .icrc1_agent
+        .balance_of(sender_account, CallMode::Query)
+        .await
+        .unwrap();
+
+    let rosetta_client_args = RosettaClientArgs {
+        operation_type: "transfer".to_owned(),
+        to: Some(receiver_keypair.generate_principal_id().unwrap().0.into()),
+        spender: None,
+        from_subaccount: sender_account.subaccount.map(|s| s.to_vec()),
+        amount: Some(transfer_amount.clone()),
+        allowance: None,
+        rosetta_url: env.rosetta_client.url.clone().to_string(),
+        expires_at: None,
+        expected_allowance: None,
+        memo: None,
+        created_at_time: None,
+    };
+
+    make_transaction_with_rosetta_client_binary(
+        &rosetta_client_bin(),
+        rosetta_client_args,
+        sender_keypair.to_pem(),
+    )
+    .await
+    .unwrap();
+
+    let current_balance = env
+        .icrc1_agent
+        .balance_of(sender_account, CallMode::Query)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        current_balance,
+        balance_before_transfer - Nat::from(DEFAULT_TRANSFER_FEE) - transfer_amount
+    );
+
+    // Test the approve functionality of the rosetta client binary
+    let approve_amount: Nat = 1_000_000_000u64.into();
+
+    let balance_before_approve = env
+        .icrc1_agent
+        .balance_of(sender_account, CallMode::Query)
+        .await
+        .unwrap();
+
+    let rosetta_client_args = RosettaClientArgs {
+        operation_type: "approve".to_owned(),
+        to: None,
+        spender: Some(receiver_keypair.generate_principal_id().unwrap().0.into()),
+        from_subaccount: sender_account.subaccount.map(|s| s.to_vec()),
+        amount: None,
+        allowance: Some(approve_amount),
+        rosetta_url: env.rosetta_client.url.clone().to_string(),
+        expires_at: None,
+        expected_allowance: None,
+        memo: Some(b"test_bytes".to_vec()),
+        created_at_time: None,
+    };
+
+    make_transaction_with_rosetta_client_binary(
+        &rosetta_client_bin(),
+        rosetta_client_args,
+        sender_keypair.to_pem(),
+    )
+    .await
+    .unwrap();
+
+    let current_balance = env
+        .icrc1_agent
+        .balance_of(sender_account, CallMode::Query)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        current_balance,
+        balance_before_approve - Nat::from(DEFAULT_TRANSFER_FEE)
     );
 }

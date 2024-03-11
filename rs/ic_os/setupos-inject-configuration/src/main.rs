@@ -1,13 +1,14 @@
 use std::os::unix::fs::PermissionsExt;
 use std::{
+    assert,
     fs::{self, File, Permissions},
     io::Write,
+    net::{Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Error};
 use clap::{Args, Parser};
-use ipnet::Ipv6Net;
 use tempfile::NamedTempFile;
 use url::Url;
 
@@ -38,10 +39,22 @@ struct Cli {
 #[derive(Args)]
 struct NetworkConfig {
     #[arg(long)]
-    ipv6_prefix: Option<Ipv6Net>,
+    ipv6_prefix: Option<String>,
 
     #[arg(long)]
-    ipv6_gateway: Option<Ipv6Net>,
+    ipv6_gateway: Option<Ipv6Addr>,
+
+    #[arg(long)]
+    ipv4_address: Option<Ipv4Addr>,
+
+    #[arg(long)]
+    ipv4_gateway: Option<Ipv4Addr>,
+
+    #[arg(long)]
+    ipv4_prefix_length: Option<u8>,
+
+    #[arg(long)]
+    domain: Option<String>,
 
     #[arg(long)]
     mgmt_mac: Option<String>,
@@ -168,19 +181,26 @@ async fn write_config(path: &Path, cfg: &NetworkConfig) -> Result<(), Error> {
         ipv6_prefix,
         ipv6_gateway,
         mgmt_mac,
+        ipv4_address,
+        ipv4_gateway,
+        ipv4_prefix_length,
+        domain,
     } = cfg;
 
     if let (Some(ipv6_prefix), Some(ipv6_gateway)) = (ipv6_prefix, ipv6_gateway) {
         // Always write 4 segments, even if our prefix is less.
-        let segments = ipv6_prefix.trunc().addr().segments();
-        writeln!(
-            &mut f,
-            "ipv6_prefix={:04x}:{:04x}:{:04x}:{:04x}",
-            segments[0], segments[1], segments[2], segments[3],
-        )?;
+        assert!(format!("{ipv6_prefix}::").parse::<Ipv6Addr>().is_ok());
+        writeln!(&mut f, "ipv6_prefix={}", ipv6_prefix)?;
+        writeln!(&mut f, "ipv6_gateway={}", ipv6_gateway)?;
+    }
 
-        writeln!(&mut f, "ipv6_subnet=/{}", ipv6_prefix.prefix_len())?;
-        writeln!(&mut f, "ipv6_gateway={}", ipv6_gateway.addr())?;
+    if let (Some(ipv4_address), Some(ipv4_gateway), Some(ipv4_prefix_length), Some(domain)) =
+        (ipv4_address, ipv4_gateway, ipv4_prefix_length, domain)
+    {
+        writeln!(&mut f, "ipv4_address={}", ipv4_address)?;
+        writeln!(&mut f, "ipv4_gateway={}", ipv4_gateway)?;
+        writeln!(&mut f, "ipv4_prefix_length={}", ipv4_prefix_length)?;
+        writeln!(&mut f, "domain={}", domain)?;
     }
 
     if let Some(mgmt_mac) = mgmt_mac {

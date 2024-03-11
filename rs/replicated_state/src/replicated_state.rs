@@ -3,9 +3,10 @@ use super::{
     metadata_state::{IngressHistoryState, Stream, Streams, SystemMetadata},
 };
 use crate::{
+    canister_snapshots::CanisterSnapshots,
     canister_state::queues::CanisterQueuesLoopDetector,
     canister_state::system_state::{push_input, CanisterOutputQueuesIterator},
-    metadata_state::StreamMap,
+    metadata_state::{subnet_call_context_manager::SignWithEcdsaContext, StreamMap},
     CanisterQueues,
 };
 use ic_base_types::PrincipalId;
@@ -131,8 +132,8 @@ impl<'a> OutputIterator<'a> {
     ) -> Self {
         let mut canister_iterators: VecDeque<_> = canisters
             .iter_mut()
+            .filter(|(_, canister)| canister.has_output())
             .map(|(owner, canister)| canister.system_state.output_into_iter(*owner))
-            .filter(|handle| !handle.is_empty())
             .collect();
 
         let mut rng = ChaChaRng::seed_from_u64(seed);
@@ -406,6 +407,9 @@ pub struct ReplicatedState {
     /// Temporary query stats received during the current epoch.
     /// Reset during the start of each epoch.
     pub epoch_query_stats: RawQueryStats,
+
+    /// Manages the canister snapshots.
+    pub canister_snapshots: CanisterSnapshots,
 }
 
 impl ReplicatedState {
@@ -417,6 +421,7 @@ impl ReplicatedState {
             subnet_queues: CanisterQueues::default(),
             consensus_queue: Vec::new(),
             epoch_query_stats: RawQueryStats::default(),
+            canister_snapshots: CanisterSnapshots::default(),
         }
     }
 
@@ -426,6 +431,7 @@ impl ReplicatedState {
         metadata: SystemMetadata,
         subnet_queues: CanisterQueues,
         epoch_query_stats: RawQueryStats,
+        canister_snapshots: CanisterSnapshots,
     ) -> Self {
         let mut res = Self {
             canister_states,
@@ -433,6 +439,7 @@ impl ReplicatedState {
             subnet_queues,
             consensus_queue: Vec::new(),
             epoch_query_stats,
+            canister_snapshots,
         };
         res.update_stream_responses_size_bytes();
         res
@@ -566,6 +573,14 @@ impl ReplicatedState {
         self.metadata.streams.keys().cloned().collect()
     }
 
+    /// Returns all sign with ECDSA contexts
+    pub fn sign_with_ecdsa_contexts(&self) -> &BTreeMap<CallbackId, SignWithEcdsaContext> {
+        &self
+            .metadata
+            .subnet_call_context_manager
+            .sign_with_ecdsa_contexts
+    }
+
     /// Retrieves a reference to the stream from this subnet to the destination
     /// subnet, if such a stream exists.
     pub fn get_stream(&self, destination_subnet_id: &SubnetId) -> Option<&Stream> {
@@ -580,13 +595,14 @@ impl ReplicatedState {
             .sum()
     }
 
-    /// Returns the memory taken by different types of memory resources.
+    /// Computes the memory taken by different types of memory resources.
     pub fn memory_taken(&self) -> MemoryTaken {
         let (
             raw_memory_taken,
             mut message_memory_taken,
             wasm_custom_sections_memory_taken,
             canister_history_memory_taken,
+            wasm_chunk_store_memory_usage,
         ) = self
             .canisters_iter()
             .map(|canister| {
@@ -598,6 +614,7 @@ impl ReplicatedState {
                     canister.system_state.message_memory_usage(),
                     canister.wasm_custom_sections_memory_usage(),
                     canister.canister_history_memory_usage(),
+                    canister.wasm_chunk_store_memory_usage(),
                 )
             })
             .reduce(|accum, val| {
@@ -606,6 +623,7 @@ impl ReplicatedState {
                     accum.1 + val.1,
                     accum.2 + val.2,
                     accum.3 + val.3,
+                    accum.4 + val.4,
                 )
             })
             .unwrap_or_default();
@@ -613,11 +631,27 @@ impl ReplicatedState {
         message_memory_taken += (self.subnet_queues.memory_usage() as u64).into();
 
         MemoryTaken {
-            execution: raw_memory_taken + canister_history_memory_taken,
+            execution: raw_memory_taken
+                + canister_history_memory_taken
+                + wasm_chunk_store_memory_usage,
             messages: message_memory_taken,
             wasm_custom_sections: wasm_custom_sections_memory_taken,
             canister_history: canister_history_memory_taken,
         }
+    }
+
+    /// Computes the memory taken by messages.
+    ///
+    /// This is a more efficient alternative to `memory_taken()` for cases when only
+    /// the message memory usage is necessary.
+    pub fn message_memory_taken(&self) -> NumBytes {
+        let canisters_memory_usage: NumBytes = self
+            .canisters_iter()
+            .map(|canister| canister.system_state.message_memory_usage())
+            .sum();
+        let subnet_memory_usage = (self.subnet_queues.memory_usage() as u64).into();
+
+        canisters_memory_usage + subnet_memory_usage
     }
 
     /// Returns the total memory taken by the ingress history in bytes.
@@ -761,9 +795,7 @@ impl ReplicatedState {
             &mut self.subnet_queues,
             own_subnet_id,
             // We seed the output iterator with the time. We can do this because
-            // we don't need unpredictability of the rotation, and we accept that
-            // in case the same time is passed in two consecutive batches we
-            // rotate by the same amount for now.
+            // we don't need unpredictability of the rotation.
             time.as_nanos_since_unix_epoch(),
         )
     }
@@ -775,6 +807,14 @@ impl ReplicatedState {
     /// Returns an immutable reference to `self.subnet_queues`.
     pub fn subnet_queues(&self) -> &CanisterQueues {
         &self.subnet_queues
+    }
+
+    /// See `IngressQueue::filter_messages()` for documentation.
+    pub fn filter_subnet_queues_ingress_messages<F>(&mut self, filter: F) -> Vec<Arc<Ingress>>
+    where
+        F: FnMut(&Arc<Ingress>) -> bool,
+    {
+        self.subnet_queues.filter_ingress_messages(filter)
     }
 
     /// Returns an immutable reference to `self.epoch_query_stats`.
@@ -888,6 +928,7 @@ impl ReplicatedState {
             mut subnet_queues,
             consensus_queue,
             epoch_query_stats: _,
+            canister_snapshots,
         } = self;
 
         // Consensus queue is always empty at the end of the round.
@@ -923,6 +964,7 @@ impl ReplicatedState {
             subnet_queues,
             consensus_queue,
             epoch_query_stats: RawQueryStats::default(), // Don't preserve query stats during subnet splitting.
+            canister_snapshots,
         })
     }
 
@@ -945,6 +987,7 @@ impl ReplicatedState {
             ref mut subnet_queues,
             consensus_queue: _,
             epoch_query_stats: _,
+            canister_snapshots: _,
         } = self;
 
         // Reset query stats after subnet split
@@ -1105,6 +1148,8 @@ pub mod testing {
             subnet_queues: Default::default(),
             consensus_queue: Default::default(),
             epoch_query_stats: Default::default(),
+            // TODO(EXC-1527): Handle canister snapshots during a subnet split.
+            canister_snapshots: CanisterSnapshots::default(),
         };
     }
 }

@@ -1,7 +1,7 @@
 use super::*;
 
+use ic_ledger_canister_blocks_synchronizer_test_utils::create_tmp_dir;
 use ic_ledger_canister_blocks_synchronizer_test_utils::sample_data::Scribe;
-use ic_ledger_canister_blocks_synchronizer_test_utils::{create_tmp_dir, init_test_logger};
 use ic_ledger_core::block::BlockType;
 use ic_ledger_core::tokens::CheckedAdd;
 use ic_rosetta_api::convert::{block_id, from_hash, to_hash};
@@ -24,8 +24,6 @@ use std::sync::Arc;
 
 #[actix_rt::test]
 async fn smoke_test() {
-    init_test_logger();
-
     let mut scribe = Scribe::new();
     let num_transactions: usize = 1000;
     let num_accounts = 100;
@@ -64,7 +62,7 @@ async fn smoke_test() {
         );
     }
 
-    let msg = NetworkRequest::new(req_handler.network_id().into());
+    let msg = NetworkRequest::new(req_handler.network_id());
     let res = req_handler.network_status(msg).await;
     assert_eq!(
         res,
@@ -118,7 +116,7 @@ async fn smoke_test() {
         .index;
     assert_eq!(b - a, 10);
 
-    let msg = NetworkRequest::new(req_handler.network_id().into());
+    let msg = NetworkRequest::new(req_handler.network_id());
     let res = req_handler.network_status(msg).await;
     assert_eq!(
         res.unwrap().oldest_block_identifier,
@@ -129,10 +127,10 @@ async fn smoke_test() {
     let res = req_handler.network_list(msg).await;
     assert_eq!(
         res,
-        Ok(NetworkListResponse::new(vec![req_handler.network_id().0]))
+        Ok(NetworkListResponse::new(vec![req_handler.network_id()]))
     );
 
-    let msg = NetworkRequest::new(req_handler.network_id().into());
+    let msg = NetworkRequest::new(req_handler.network_id());
     let network_options = req_handler
         .network_options(msg)
         .await
@@ -152,7 +150,7 @@ async fn smoke_test() {
     assert!(!network_options.allow.errors.is_empty());
     assert!(network_options.allow.historical_balance_lookup);
 
-    let msg = NetworkRequest::new(req_handler.network_id().into());
+    let msg = NetworkRequest::new(req_handler.network_id());
     let res = req_handler.mempool(msg).await;
     assert_eq!(res, Ok(MempoolResponse::new(vec![])));
 
@@ -169,25 +167,29 @@ async fn smoke_test() {
         ))
     );
 
-    let msg = AccountBalanceRequest::new(
-        req_handler.network_id(),
-        ic_rosetta_api::convert::to_model_account_identifier(&acc_id(0)),
-    );
+    let msg = AccountBalanceRequest {
+        network_identifier: req_handler.network_id(),
+        account_identifier: ic_rosetta_api::convert::to_model_account_identifier(&acc_id(0)),
+        block_identifier: None,
+        metadata: None,
+    };
+
     let res = req_handler.account_balance(msg).await;
     assert_eq!(
         res,
-        Ok(AccountBalanceResponse::new(
-            block_id(scribe.blockchain.back().unwrap()).unwrap(),
-            vec![tokens_to_amount(
+        Ok(AccountBalanceResponse {
+            block_identifier: block_id(scribe.blockchain.back().unwrap()).unwrap(),
+            balances: vec![tokens_to_amount(
                 *scribe.balance_book.get(&acc_id(0)).unwrap(),
                 DEFAULT_TOKEN_SYMBOL
             )
-            .unwrap()]
-        ))
+            .unwrap()],
+            metadata: None
+        })
     );
 
     let (acc_id, _ed_kp, pk, _pid) = ic_rosetta_test_utils::make_user_ed25519(4);
-    let msg = ConstructionDeriveRequest::new(req_handler.network_id().into(), pk);
+    let msg = ConstructionDeriveRequest::new(req_handler.network_id(), pk);
     let res = req_handler.construction_derive(msg);
     assert_eq!(
         res,
@@ -200,11 +202,15 @@ async fn smoke_test() {
 
     let (_acc_id, _ed_kp, mut pk, _pid) = ic_rosetta_test_utils::make_user_ed25519(4);
     pk.curve_type = CurveType::Secp256K1;
-    let msg = ConstructionDeriveRequest::new(req_handler.network_id().into(), pk);
+    let msg = ConstructionDeriveRequest::new(req_handler.network_id(), pk);
     let res = req_handler.construction_derive(msg);
     assert!(res.is_err(), "This pk should not have been accepted");
 
-    let msg = ConstructionMetadataRequest::new(req_handler.network_id());
+    let msg = ConstructionMetadataRequest {
+        network_identifier: req_handler.network_id(),
+        options: None,
+        public_keys: None,
+    };
     let res = req_handler.construction_metadata(msg).await;
     assert_eq!(
         res,
@@ -225,8 +231,6 @@ async fn smoke_test() {
 
 #[actix_rt::test]
 async fn blocks_test() {
-    init_test_logger();
-
     let ledger = Arc::new(TestLedger::new());
     let req_handler = RosettaRequestHandler::new_with_default_blockchain(ledger.clone());
     let mut scribe = Scribe::new();
@@ -256,7 +260,7 @@ async fn blocks_test() {
         index: Some(h.try_into().unwrap()),
         hash: None,
     };
-    let msg = BlockRequest::new(req_handler.network_id().into(), block_id);
+    let msg = BlockRequest::new(req_handler.network_id(), block_id);
     let resp = req_handler.block(msg).await.unwrap();
 
     let block = resp.block.unwrap();
@@ -270,7 +274,7 @@ async fn blocks_test() {
         index: None,
         hash: Some(from_hash(&scribe.blockchain[h].hash)),
     };
-    let msg = BlockRequest::new(req_handler.network_id().into(), block_id);
+    let msg = BlockRequest::new(req_handler.network_id(), block_id);
     let resp = req_handler.block(msg).await.unwrap();
     let block = resp.block.unwrap();
 
@@ -289,7 +293,7 @@ async fn blocks_test() {
         hash: from_hash(&scribe.blockchain[h].hash),
     };
     let msg = BlockTransactionRequest::new(
-        req_handler.network_id().into(),
+        req_handler.network_id(),
         block_id.clone(),
         trans.transaction_identifier.clone(),
     );
@@ -310,7 +314,10 @@ async fn blocks_test() {
         .unwrap();
     assert_eq!(
         resp.transactions,
-        vec![BlockTransaction::new(block_id, trans)]
+        vec![BlockTransaction {
+            block_identifier: block_id,
+            transaction: trans
+        }]
     );
     assert_eq!(resp.total_count, 1);
 
@@ -361,7 +368,7 @@ async fn blocks_test() {
             index: Some(block.index),
             hash: None,
         };
-        let msg = BlockRequest::new(req_handler.network_id().into(), partial_block_id);
+        let msg = BlockRequest::new(req_handler.network_id(), partial_block_id);
         let resp = req_handler.block(msg).await.unwrap();
         let transactions = vec![ic_rosetta_api::convert::block_to_transaction(
             &block,
@@ -375,7 +382,7 @@ async fn blocks_test() {
             hash: from_hash(&block.hash),
         };
         let msg = BlockTransactionRequest::new(
-            req_handler.network_id().into(),
+            req_handler.network_id(),
             block_id.clone(),
             transaction.transaction_identifier.clone(),
         );
@@ -401,15 +408,13 @@ async fn blocks_test() {
 
 #[actix_rt::test]
 async fn balances_test() {
-    init_test_logger();
-
     let ledger = Arc::new(TestLedger::new());
     let req_handler = RosettaRequestHandler::new_with_default_blockchain(ledger.clone());
     let mut scribe = Scribe::new();
 
     scribe.gen_accounts(2, 1_000_000);
     for b in &scribe.blockchain {
-        ledger.add_block(b.clone()).await.ok();
+        ledger.add_block(b.clone()).await.unwrap();
     }
 
     let acc0 = acc_id(0);
@@ -428,7 +433,7 @@ async fn balances_test() {
     ledger
         .add_block(scribe.blockchain.back().unwrap().clone())
         .await
-        .ok();
+        .unwrap();
     assert_eq!(
         get_balance(&req_handler, None, acc0).await.unwrap(),
         *scribe.balance_book.get(&acc0).unwrap()
@@ -444,7 +449,7 @@ async fn balances_test() {
     ledger
         .add_block(scribe.blockchain.back().unwrap().clone())
         .await
-        .ok();
+        .unwrap();
     assert_eq!(
         get_balance(&req_handler, None, acc0).await.unwrap(),
         *scribe.balance_book.get(&acc0).unwrap()
@@ -458,7 +463,7 @@ async fn balances_test() {
     ledger
         .add_block(scribe.blockchain.back().unwrap().clone())
         .await
-        .ok();
+        .unwrap();
     assert_eq!(
         get_balance(&req_handler, None, acc0).await.unwrap(),
         *scribe.balance_book.get(&acc0).unwrap()
@@ -477,14 +482,7 @@ async fn balances_test() {
 
 fn verify_balances(scribe: &Scribe, blocks: &Blocks, start_idx: usize) {
     for hb in scribe.blockchain.iter().skip(start_idx) {
-        assert_eq!(
-            *hb,
-            blocks
-                .get_hashed_block(&hb.index)
-                .ok()
-                .ok_or(false)
-                .unwrap()
-        );
+        assert_eq!(*hb, blocks.get_hashed_block(&hb.index).unwrap());
         assert!(blocks.is_verified_by_hash(&hb.hash).unwrap());
         for (account, amount) in scribe.balance_history.get(hb.index as usize).unwrap() {
             assert_eq!(
@@ -663,7 +661,6 @@ async fn verify_account_search(
 
 #[actix_rt::test]
 async fn load_from_store_test() {
-    init_test_logger();
     let tmpdir = create_tmp_dir();
     let location = tmpdir.path();
     let scribe = Scribe::new_with_sample_data(10, 150);
@@ -751,7 +748,6 @@ async fn load_from_store_test() {
 // remove this test if it's in the way of a new spec
 #[actix_rt::test]
 async fn load_unverified_test() {
-    init_test_logger();
     let tmpdir = create_tmp_dir();
     let location = tmpdir.path();
     let scribe = Scribe::new_with_sample_data(10, 150);
@@ -789,7 +785,6 @@ async fn load_unverified_test() {
 
 #[actix_rt::test]
 async fn store_batch_test() {
-    init_test_logger();
     let tmpdir = create_tmp_dir();
     let location = tmpdir.path();
     let scribe = Scribe::new_with_sample_data(10, 150);
@@ -805,7 +800,7 @@ async fn store_batch_test() {
         blocks.get_hashed_block(&20).unwrap(),
         *scribe.blockchain.get(20).unwrap()
     );
-    assert!(blocks.get_hashed_block(&21).ok().is_none());
+    assert!(blocks.get_hashed_block(&21).is_err());
 
     let mut part2: Vec<HashedBlock> = scribe.blockchain.iter().skip(21).cloned().collect();
 
@@ -818,14 +813,14 @@ async fn store_batch_test() {
         blocks.get_hashed_block(&30).unwrap(),
         *scribe.blockchain.get(30).unwrap()
     );
-    assert!(blocks.get_hashed_block(&31).ok().is_none());
+    assert!(blocks.get_hashed_block(&31).is_err());
 
     assert!(blocks.push_batch(part3.clone()).is_err());
     assert_eq!(
         blocks.get_hashed_block(&30).unwrap(),
         *scribe.blockchain.get(30).unwrap()
     );
-    assert!(blocks.get_hashed_block(&31).ok().is_none());
+    assert!(blocks.get_hashed_block(&31).is_err());
 
     part3.pop();
 
@@ -835,7 +830,7 @@ async fn store_batch_test() {
         blocks.get_hashed_block(&last_idx).unwrap(),
         *scribe.blockchain.back().unwrap()
     );
-    assert!(blocks.get_hashed_block(&(last_idx + 1)).ok().is_none());
+    assert!(blocks.get_hashed_block(&(last_idx + 1)).is_err());
 
     blocks.set_hashed_block_to_verified(&last_idx).unwrap();
     verify_balances(&scribe, &blocks, 0);

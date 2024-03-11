@@ -1,5 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test", "rust_test_suite")
-load("//bazel:defs.bzl", "rust_bench")
+load("//bazel:defs.bzl", "rust_ic_bench")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -13,22 +13,18 @@ DEPENDENCIES = [
     "//rs/crypto",
     "//rs/crypto/sha2",
     "//rs/crypto/tls_interfaces",
-    "//rs/crypto/utils/threshold_sig",
     "//rs/cycles_account_manager",
     "//rs/execution_environment",
     "//rs/http_endpoints/metrics",
     "//rs/http_endpoints/public",
     "//rs/https_outcalls/client",
     "//rs/interfaces",
-    "//rs/interfaces/adapter_client",
     "//rs/interfaces/certified_stream_store",
     "//rs/interfaces/registry",
     "//rs/messaging",
     "//rs/monitoring/logger",
     "//rs/monitoring/metrics",
     "//rs/monitoring/pprof",
-    "//rs/nns/constants",
-    "//rs/p2p",
     "//rs/protobuf",
     "//rs/registry/client",
     "//rs/registry/helpers",
@@ -38,14 +34,10 @@ DEPENDENCIES = [
     "//rs/replicated_state",
     "//rs/state_manager",
     "//rs/sys",
-    "//rs/types/error_types",
     "//rs/types/types",
-    "//rs/utils",
     "//rs/xnet/endpoint",
     "//rs/xnet/payload_builder",
-    "@crate_index//:base64",
     "@crate_index//:clap",
-    "@crate_index//:crossbeam-channel",
     "@crate_index//:hex",
     "@crate_index//:jemalloc-ctl",
     "@crate_index//:jemallocator",
@@ -54,20 +46,11 @@ DEPENDENCIES = [
     "@crate_index//:num_cpus",
     "@crate_index//:pprof",
     "@crate_index//:prometheus",
-    "@crate_index//:prost",
     "@crate_index//:rand",
     "@crate_index//:regex",
-    "@crate_index//:serde",
-    "@crate_index//:serde_bytes",
-    "@crate_index//:serde_cbor",
     "@crate_index//:slog",
-    "@crate_index//:slog-async",
-    "@crate_index//:static_assertions",
     "@crate_index//:tempfile",
-    "@crate_index//:thread_profiler",
     "@crate_index//:tokio",
-    "@crate_index//:tower",
-    "@crate_index//:tracing",
 ] + select({
     "@rules_rust//rust/platform:linux": [
         "//rs/monitoring/backtrace",
@@ -81,7 +64,7 @@ DEV_DEPENDENCIES = [
     "//rs/interfaces/registry/mocks",
     "//rs/rust_canisters/canister_test",
     "//rs/test_utilities",
-    "//rs/types/ic00_types",
+    "//rs/types/management_canister_types",
     "@crate_index//:assert_cmd",
     "@crate_index//:criterion",
     "@crate_index//:predicates",
@@ -93,14 +76,10 @@ MACRO_DEV_DEPENDENCIES = []
 ALIASES = {}
 
 DATA = [
-    "//rs/canister_sandbox",
-    "//rs/canister_sandbox/sandbox_launcher",
     "//rs/rust_canisters/stable_structures:stable_structures_canister",
 ]
 
 ENV = {
-    "LAUNCHER_BINARY": "$(rootpath //rs/canister_sandbox/sandbox_launcher)",
-    "SANDBOX_BINARY": "$(rootpath //rs/canister_sandbox)",
     "STABLE_STRUCTURES_CANISTER_WASM_PATH": "$(rootpath //rs/rust_canisters/stable_structures:stable_structures_canister)",
 }
 
@@ -152,7 +131,7 @@ rust_test_suite(
     deps = [":replica_lib"] + DEPENDENCIES + DEV_DEPENDENCIES,
 )
 
-rust_bench(
+rust_ic_bench(
     name = "calls_bench",
     testonly = True,
     srcs = ["benches/calls.rs"],

@@ -7,7 +7,7 @@ use crate::{
     storage::{
         neuron_indexes::{CorruptedNeuronIndexes, NeuronIndex},
         with_stable_neuron_indexes, with_stable_neuron_indexes_mut, with_stable_neuron_store,
-        with_stable_neuron_store_mut, NeuronIdU64, TopicSigned32,
+        with_stable_neuron_store_mut,
     },
     Clock, IcClock,
 };
@@ -20,13 +20,12 @@ use ic_nervous_system_governance::index::{
     neuron_principal::NeuronPrincipalIndex,
 };
 use ic_nns_common::pb::v1::NeuronId;
-use icp_ledger::Subaccount;
+use icp_ledger::{AccountIdentifier, Subaccount};
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashSet},
     fmt::{Debug, Display, Formatter},
-    ops::Deref,
-    ops::RangeBounds,
+    ops::{Deref, RangeBounds},
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -172,6 +171,11 @@ enum StorageLocation {
     Stable,
 }
 
+pub type NeuronStoreState = (
+    BTreeMap<u64, Neuron>,
+    HeapNeuronFollowingIndex<NeuronId, Topic>,
+);
+
 /// This struct stores and provides access to all neurons within NNS Governance, which can live
 /// in either heap memory or stable memory.
 #[cfg_attr(test, derive(Clone, Debug))]
@@ -192,13 +196,12 @@ pub struct NeuronStore {
     /// evaluated this way):
     /// - computing cached entries: when it involves neurons, it mostly cares about stake, maturity
     ///   and NF fund.
-    /// - validating indexes by checking whether each neuron in the heap has corresponding entires
+    /// - validating indexes by checking whether each neuron in the heap has corresponding entries
     ///   in the indexes.
     /// - `Governance::validate`: soon to be deprecated since we have subaccount index.
     /// - `voting_eligible_neurons()`: inactive neurons have been dissolved for 14 days, so it
     ///   cannot be voting eligible.
-    /// - `list_community_fund_neuron_ids` and `list_active_neurons_fund_neurons`: inactive neurons
-    ///   must not be NF.
+    /// - `list_active_neurons_fund_neurons`: inactive neurons must not be NF.
     /// - `list_neurons_ready_to_unstake_maturity`: inactive neurons have 0 stake (which also means
     ///   0 staked maturity), so no inactive neurons need to unstake maturity.
     /// - `list_ready_to_spawn_neuron_ids`: inactive neurons must have 0 maturity, and spawning
@@ -212,7 +215,7 @@ pub struct NeuronStore {
     /// is saved and restored.
     ///
     /// (Topic, Followee) -> set of followers.
-    topic_followee_index: HeapNeuronFollowingIndex<NeuronIdU64, TopicSigned32>,
+    topic_followee_index: HeapNeuronFollowingIndex<NeuronId, Topic>,
 
     // In non-test builds, Box would suffice. However, in test, the containing struct (to wit,
     // NeuronStore) implements additional traits. Therefore, more elaborate wrapping is needed.
@@ -232,6 +235,16 @@ impl PartialEq for NeuronStore {
         } = self;
 
         *heap_neurons == other.heap_neurons && *topic_followee_index == other.topic_followee_index
+    }
+}
+
+impl Default for NeuronStore {
+    fn default() -> Self {
+        Self {
+            heap_neurons: BTreeMap::new(),
+            topic_followee_index: HeapNeuronFollowingIndex::new(BTreeMap::new()),
+            clock: Box::new(IcClock::new()),
+        }
     }
 }
 
@@ -261,15 +274,12 @@ impl NeuronStore {
         neuron_store
     }
 
-    // Restores NeuronStore after an upgrade, assuming data  are already in the stable storage (e.g.
+    // Restores NeuronStore after an upgrade, assuming data are already in the stable storage (e.g.
     // neuron indexes and inactive neurons) and persisted data are already calculated (e.g.
     // topic_followee_index).
-    pub fn new_restored(
-        heap_neurons: BTreeMap<u64, Neuron>,
-        topic_followee_index: HeapNeuronFollowingIndex<NeuronIdU64, TopicSigned32>,
-    ) -> Self {
+    pub fn new_restored(state: NeuronStoreState) -> Self {
         let clock = Box::new(IcClock::new());
-
+        let (heap_neurons, topic_followee_index) = state;
         Self {
             heap_neurons,
             topic_followee_index,
@@ -277,18 +287,9 @@ impl NeuronStore {
         }
     }
 
-    /// Takes the heap neurons for serialization. The `self.heap_neurons` will become empty, so
-    /// it should only be called once at pre_upgrade.
-    pub fn take_heap_neurons(&mut self) -> BTreeMap<u64, Neuron> {
-        std::mem::take(&mut self.heap_neurons)
-    }
-
-    /// Takes the HeapNeuronFollowingIndex.  The `self.topic_followee_index` will become empty, so
-    /// it should only be called once at pre_upgrade.
-    pub fn take_heap_topic_followee_index(
-        &mut self,
-    ) -> HeapNeuronFollowingIndex<NeuronIdU64, TopicSigned32> {
-        std::mem::take(&mut self.topic_followee_index)
+    /// Takes the neuron store state which should be persisted through upgrades.
+    pub fn take(self) -> NeuronStoreState {
+        (self.heap_neurons, self.topic_followee_index)
     }
 
     /// If there is a bug (related to lock acquisition), this could return u64::MAX.
@@ -331,9 +332,7 @@ impl NeuronStore {
         self.heap_neurons.clone()
     }
 
-    pub fn clone_topic_followee_index(
-        &self,
-    ) -> HeapNeuronFollowingIndex<NeuronIdU64, TopicSigned32> {
+    pub fn clone_topic_followee_index(&self) -> HeapNeuronFollowingIndex<NeuronId, Topic> {
         self.topic_followee_index.clone()
     }
 
@@ -392,7 +391,7 @@ impl NeuronStore {
                  neuron indexes are out-of-sync with neurons: {}",
                 LOG_PREFIX,
                 NeuronStoreError::CorruptedNeuronIndexes(CorruptedNeuronIndexes {
-                    neuron_id: neuron.id.unwrap().id,
+                    neuron_id: neuron.id.unwrap(),
                     indexes: vec![defects],
                 })
             );
@@ -447,7 +446,7 @@ impl NeuronStore {
                  neuron indexes are out-of-sync with neurons: {}",
                 LOG_PREFIX,
                 NeuronStoreError::CorruptedNeuronIndexes(CorruptedNeuronIndexes {
-                    neuron_id: neuron_id.id,
+                    neuron_id,
                     indexes: vec![defects],
                 })
             );
@@ -460,10 +459,7 @@ impl NeuronStore {
         &self,
         neuron_id: NeuronId,
     ) -> Result<(Cow<Neuron>, StorageLocation), NeuronStoreError> {
-        let heap_neuron = self
-            .heap_neurons
-            .get(&neuron_id.id)
-            .map(|neuron| Cow::Borrowed(neuron));
+        let heap_neuron = self.heap_neurons.get(&neuron_id.id).map(Cow::Borrowed);
 
         if let Some(heap_neuron) = heap_neuron.clone() {
             // If the neuron is active on heap, return early to avoid any operation on stable
@@ -475,10 +471,7 @@ impl NeuronStore {
         }
 
         let stable_neuron = with_stable_neuron_store(|stable_neuron_store| {
-            stable_neuron_store
-                .read(neuron_id)
-                .ok()
-                .map(|neuron| Cow::Owned(neuron))
+            stable_neuron_store.read(neuron_id).ok().map(Cow::Owned)
         });
         match (stable_neuron, heap_neuron) {
             (Some(stable), Some(_)) => {
@@ -498,17 +491,18 @@ impl NeuronStore {
     fn update_neuron(
         &mut self,
         neuron_id: NeuronId,
-        neuron: Neuron,
+        old_neuron: &Neuron,
+        new_neuron: Neuron,
         previous_location: StorageLocation,
-        is_neuron_changed: bool,
     ) -> Result<(), NeuronStoreError> {
-        let target_location = if neuron.is_inactive(self.now()) {
+        let target_location = if new_neuron.is_inactive(self.now()) {
             StorageLocation::Stable
         } else {
             StorageLocation::Heap
         };
+        let is_neuron_changed = *old_neuron != new_neuron;
 
-        // Perform transition betweene 2 storage if necessary.
+        // Perform transition between 2 storage if necessary.
         //
         // Note:
         // - the location here is the primary location. Currently, StorageLocation::Stable means the
@@ -521,7 +515,7 @@ impl NeuronStore {
             (StorageLocation::Heap, StorageLocation::Heap) => {
                 // We might be able to improve the performance by comparing and changing each field of neuron separately.
                 if is_neuron_changed {
-                    self.heap_neurons.insert(neuron_id.id, neuron);
+                    self.heap_neurons.insert(neuron_id.id, new_neuron);
                 }
             }
             (StorageLocation::Heap, StorageLocation::Stable) => {
@@ -529,14 +523,14 @@ impl NeuronStore {
                 // stable neuron store. Therefore we want to exist when there is an error in create,
                 // since there is probably a real issue.
                 with_stable_neuron_store_mut(|stable_neuron_store| {
-                    stable_neuron_store.create(neuron.clone())
+                    stable_neuron_store.create(new_neuron.clone())
                 })?;
                 self.heap_neurons.remove(&neuron_id.id);
             }
             (StorageLocation::Stable, StorageLocation::Heap) => {
                 // Now the neuron in heap becomes its primary copy and the one in stable memory is
                 // the secondary copy.
-                self.heap_neurons.insert(neuron_id.id, neuron);
+                self.heap_neurons.insert(neuron_id.id, new_neuron);
                 with_stable_neuron_store_mut(|stable_neuron_store| {
                     stable_neuron_store.delete(neuron_id)
                 })?;
@@ -546,7 +540,7 @@ impl NeuronStore {
                 // error since it signals a real issue.
                 if is_neuron_changed {
                     with_stable_neuron_store_mut(|stable_neuron_store| {
-                        stable_neuron_store.update(neuron.clone())
+                        stable_neuron_store.update(old_neuron, new_neuron)
                     })?;
                 }
             }
@@ -565,6 +559,16 @@ impl NeuronStore {
 
     pub fn has_neuron_with_subaccount(&self, subaccount: Subaccount) -> bool {
         self.get_neuron_id_for_subaccount(subaccount).is_some()
+    }
+
+    pub fn get_neuron_id_for_account_id(&self, account_id: &AccountIdentifier) -> Option<NeuronId> {
+        with_stable_neuron_indexes(|indexes| {
+            indexes.account_id().get_neuron_id_by_account_id(account_id)
+        })
+    }
+
+    pub fn has_neuron_with_account_id(&self, account_id: &AccountIdentifier) -> bool {
+        self.get_neuron_id_for_account_id(account_id).is_some()
     }
 
     /// Get a reference to heap neurons.  Temporary method to allow
@@ -604,20 +608,7 @@ impl NeuronStore {
             .collect()
     }
 
-    /// List all neuron ids that are in the community fund.
-    pub fn list_community_fund_neuron_ids(&self) -> Vec<NeuronId> {
-        let filter = |n: &Neuron| {
-            n.joined_community_fund_timestamp_seconds
-                .unwrap_or_default()
-                > 0
-        };
-        self.map_heap_neurons_filtered(filter, |n| n.id)
-            .into_iter()
-            .flatten()
-            .collect()
-    }
-
-    /// List all neuron ids that are in the community fund.
+    /// List all neuron ids that are in the Neurons' Fund.
     pub fn list_active_neurons_fund_neurons(&self) -> Vec<NeuronsFundNeuron> {
         let now = self.now();
         let filter = |n: &Neuron| {
@@ -656,7 +647,7 @@ impl NeuronStore {
             if !spawning_state {
                 return false;
             }
-            // spawning_state is calculated based on presence of spawn_at_atimestamp_seconds
+            // spawning_state is calculated based on presence of spawn_at_timestamp_seconds
             // so it would be quite surprising if it is missing here (impossible in fact)
             now_seconds >= n.spawn_at_timestamp_seconds.unwrap_or(u64::MAX)
         };
@@ -687,12 +678,7 @@ impl NeuronStore {
         let old_neuron = neuron.deref().clone();
         let mut new_neuron = old_neuron.clone();
         let result = f(&mut new_neuron);
-        self.update_neuron(
-            *neuron_id,
-            new_neuron.clone(),
-            location,
-            new_neuron != old_neuron,
-        )?;
+        self.update_neuron(*neuron_id, &old_neuron, new_neuron.clone(), location)?;
         // Updating indexes needs to happen after successfully storing primary data.
         self.update_neuron_indexes(&old_neuron, &new_neuron);
         Ok(result)
@@ -722,7 +708,7 @@ impl NeuronStore {
                  neuron indexes are out-of-sync with neurons: {}",
                 LOG_PREFIX,
                 NeuronStoreError::CorruptedNeuronIndexes(CorruptedNeuronIndexes {
-                    neuron_id: old_neuron.id.unwrap().id,
+                    neuron_id: old_neuron.id.unwrap(),
                     indexes: defects,
                 })
             );
@@ -751,12 +737,8 @@ impl NeuronStore {
         topic: Topic,
     ) -> Vec<NeuronId> {
         self.topic_followee_index
-            .get_followers_by_followee_and_category(
-                &NeuronIdU64::from(followee),
-                TopicSigned32::from(topic),
-            )
+            .get_followers_by_followee_and_category(&followee, topic)
             .into_iter()
-            .map(|id| NeuronId { id })
             .collect()
     }
 
@@ -770,7 +752,6 @@ impl NeuronStore {
                 .principal()
                 .get_neuron_ids(principal_id)
                 .into_iter()
-                .map(|id| NeuronId { id })
                 .collect()
         })
     }
@@ -832,6 +813,7 @@ impl NeuronStore {
             principal: indexes.principal().num_entries(),
             following: indexes.following().num_entries(),
             known_neuron: indexes.known_neuron().num_entries(),
+            account_id: indexes.account_id().num_entries(),
         })
     }
 }
@@ -842,6 +824,7 @@ pub struct NeuronIndexesLens {
     pub principal: usize,
     pub following: usize,
     pub known_neuron: usize,
+    pub account_id: usize,
 }
 
 #[cfg(test)]

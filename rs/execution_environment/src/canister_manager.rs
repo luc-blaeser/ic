@@ -15,15 +15,15 @@ use ic_base_types::NumSeconds;
 use ic_config::flag_status::FlagStatus;
 use ic_cycles_account_manager::{CyclesAccountManager, ResourceSaturation};
 use ic_error_types::{ErrorCode, RejectCode, UserError};
-use ic_ic00_types::{
-    CanisterChangeDetails, CanisterChangeOrigin, CanisterInstallModeV2, CanisterStatusResultV2,
-    CanisterStatusType, InstallChunkedCodeArgs, InstallCodeArgsV2, Method as Ic00Method,
-    StoredChunksReply, UploadChunkReply,
-};
 use ic_interfaces::execution_environment::{
     CanisterOutOfCyclesError, HypervisorError, IngressHistoryWriter, SubnetAvailableMemory,
 };
 use ic_logger::{error, fatal, info, ReplicaLogger};
+use ic_management_canister_types::{
+    CanisterChangeDetails, CanisterChangeOrigin, CanisterInstallModeV2, CanisterStatusResultV2,
+    CanisterStatusType, ChunkHash, InstallChunkedCodeArgs, InstallCodeArgsV2, Method as Ic00Method,
+    StoredChunksReply, UploadChunkReply,
+};
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::canister_state::system_state::ReservationError;
@@ -49,7 +49,7 @@ use ic_types::{
     InvalidMemoryAllocationError, MemoryAllocation, NumBytes, NumInstructions, PrincipalId,
     SubnetId, Time,
 };
-use ic_wasm_types::CanisterModule;
+use ic_wasm_types::{CanisterModule, WasmHash};
 use num_traits::cast::ToPrimitive;
 use prometheus::IntCounter;
 use serde::{Deserialize, Serialize};
@@ -154,11 +154,108 @@ impl CanisterMgrConfig {
 }
 
 #[derive(Clone, Debug)]
+pub enum WasmSource {
+    CanisterModule(CanisterModule),
+    ChunkStore {
+        wasm_chunk_store: WasmChunkStore,
+        chunk_hashes_list: Vec<Vec<u8>>,
+        wasm_module_hash: WasmHash,
+    },
+}
+
+impl From<&WasmSource> for WasmHash {
+    fn from(item: &WasmSource) -> Self {
+        match item {
+            WasmSource::CanisterModule(canister_module) => {
+                Self::from(canister_module.module_hash())
+            }
+            WasmSource::ChunkStore {
+                wasm_module_hash, ..
+            } => wasm_module_hash.clone(),
+        }
+    }
+}
+
+impl WasmSource {
+    pub fn module_hash(&self) -> [u8; 32] {
+        WasmHash::from(self).to_slice()
+    }
+
+    /// The number of instructions to be charged each time we try to convert to
+    /// a canister module.
+    pub fn instructions_to_assemble(&self) -> NumInstructions {
+        match self {
+            Self::CanisterModule(_module) => NumInstructions::from(0),
+            // Charge one instruction per byte, assuming each chunk is the
+            // maximum size.
+            Self::ChunkStore {
+                chunk_hashes_list, ..
+            } => NumInstructions::from(
+                (wasm_chunk_store::chunk_size() * chunk_hashes_list.len() as u64).get(),
+            ),
+        }
+    }
+
+    /// Convert the source to a canister module (assembling chunks if required).
+    pub(crate) fn into_canister_module(self) -> Result<CanisterModule, CanisterManagerError> {
+        match self {
+            Self::CanisterModule(module) => Ok(module),
+            Self::ChunkStore {
+                wasm_chunk_store,
+                chunk_hashes_list,
+                wasm_module_hash,
+            } => {
+                // Assume each chunk uses the full chunk size even though the actual
+                // size might be smaller.
+                let mut wasm_module = Vec::with_capacity(
+                    chunk_hashes_list.len() * wasm_chunk_store::chunk_size().get() as usize,
+                );
+                for hash in chunk_hashes_list {
+                    let hash = hash.as_slice().try_into().map_err(|_| {
+                        CanisterManagerError::WasmChunkStoreError {
+                            message: "Chunk hash is invalid. The length is not 32".to_string(),
+                        }
+                    })?;
+                    for page in wasm_chunk_store.get_chunk_data(&hash).ok_or_else(|| {
+                        CanisterManagerError::WasmChunkStoreError {
+                            message: format!("Chunk hash {:?} was not found", &hash[..32]),
+                        }
+                    })? {
+                        wasm_module.extend_from_slice(page)
+                    }
+                }
+                let canister_module = CanisterModule::new(wasm_module);
+
+                if canister_module.module_hash()[..] != wasm_module_hash.to_slice() {
+                    return Err(CanisterManagerError::WasmChunkStoreError {
+                        message: format!(
+                            "Wasm module hash {:?} does not match given hash {:?}",
+                            canister_module.module_hash(),
+                            wasm_module_hash
+                        ),
+                    });
+                }
+                Ok(canister_module)
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    /// Only used for tests.
+    fn unwrap_as_slice_for_testing(&self) -> &[u8] {
+        match self {
+            Self::CanisterModule(module) => module.as_slice(),
+            Self::ChunkStore { .. } => panic!("Can't convert WasmSource::ChunkStore to slice"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct InstallCodeContext {
     pub origin: CanisterChangeOrigin,
     pub mode: CanisterInstallModeV2,
     pub canister_id: CanisterId,
-    pub wasm_module: CanisterModule,
+    pub wasm_source: WasmSource,
     pub arg: Vec<u8>,
     pub compute_allocation: Option<ComputeAllocation>,
     pub memory_allocation: Option<MemoryAllocation>,
@@ -176,7 +273,6 @@ impl InstallCodeContext {
 pub enum InstallCodeContextError {
     ComputeAllocation(InvalidComputeAllocationError),
     MemoryAllocation(InvalidMemoryAllocationError),
-    InvalidCanisterId(String),
     InvalidHash(String),
 }
 
@@ -197,13 +293,6 @@ impl From<InstallCodeContextError> for UserError {
                 format!(
                     "MemoryAllocation expected to be in the range [{}..{}], got {}",
                     err.min, err.max, err.given
-                ),
-            ),
-            InstallCodeContextError::InvalidCanisterId(bytes) => UserError::new(
-                ErrorCode::CanisterContractViolation,
-                format!(
-                    "Specified canister id is not a valid principal id {}",
-                    hex::encode(&bytes[..])
                 ),
             ),
             InstallCodeContextError::InvalidHash(err) => {
@@ -232,38 +321,22 @@ impl InstallCodeContext {
         store: &WasmChunkStore,
     ) -> Result<Self, InstallCodeContextError> {
         let canister_id = args.target_canister_id();
-        // Assume each chunk uses the full chunk size even though the actual
-        // size might be smaller.
-        let mut wasm_module = Vec::with_capacity(
-            args.chunk_hashes_list.len() * wasm_chunk_store::chunk_size().get() as usize,
-        );
-        for hash in args.chunk_hashes_list {
-            let hash = hash.as_slice().try_into().map_err(|_| {
-                InstallCodeContextError::InvalidHash(
-                    "Chunk hash is invalid. The length is not 32".to_string(),
-                )
-            })?;
-            for page in store.get_chunk_data(&hash).ok_or_else(|| {
-                InstallCodeContextError::InvalidHash(format!(
-                    "Chunk hash {:?} was not found",
-                    &hash[..32]
-                ))
-            })? {
-                wasm_module.extend_from_slice(page)
-            }
-        }
-        let hash = ic_crypto_sha2::Sha256::hash(&wasm_module);
-        if hash[..] != args.wasm_module_hash {
-            return Err(InstallCodeContextError::InvalidHash(format!(
-                "Wasm module hash {:?} does not match given hash {:?}",
-                hash, args.wasm_module_hash
-            )));
-        }
+        let wasm_module_hash = args.wasm_module_hash.try_into().map_err(|hash| {
+            InstallCodeContextError::InvalidHash(format!("Invalid wasm hash {:?}", hash))
+        })?;
         Ok(InstallCodeContext {
             origin,
             mode: args.mode,
             canister_id,
-            wasm_module: CanisterModule::new(wasm_module),
+            wasm_source: WasmSource::ChunkStore {
+                wasm_chunk_store: store.clone(),
+                chunk_hashes_list: args
+                    .chunk_hashes_list
+                    .into_iter()
+                    .map(|h| h.to_vec())
+                    .collect(),
+                wasm_module_hash,
+            },
             arg: args.arg,
             compute_allocation: None,
             memory_allocation: None,
@@ -300,7 +373,7 @@ impl TryFrom<(CanisterChangeOrigin, InstallCodeArgsV2)> for InstallCodeContext {
             origin,
             mode: args.mode,
             canister_id,
-            wasm_module: CanisterModule::new(args.wasm_module),
+            wasm_source: WasmSource::CanisterModule(CanisterModule::new(args.wasm_module)),
             arg: args.arg,
             compute_allocation,
             memory_allocation,
@@ -390,7 +463,6 @@ impl CanisterManager {
                 format!("Only canisters can call ic00 method {}", method_name),
             )),
 
-
             // These methods are only valid if they are sent by the controller
             // of the canister. We assume that the canister always wants to
             // accept messages from its controller.
@@ -405,7 +477,11 @@ impl CanisterManager {
             | Ok(Ic00Method::UploadChunk)
             | Ok(Ic00Method::StoredChunks)
             | Ok(Ic00Method::DeleteChunks)
-            | Ok(Ic00Method::ClearChunkStore) => {
+            | Ok(Ic00Method::ClearChunkStore)
+            | Ok(Ic00Method::TakeCanisterSnapshot)
+            | Ok(Ic00Method::LoadCanisterSnapshot)
+            | Ok(Ic00Method::ListCanisterSnapshots)
+            | Ok(Ic00Method::DeleteCanisterSnapshot) => {
                 // Reject large install methods if the flag is not enabled, or
                 // they are not implemented.
                 match method {
@@ -440,12 +516,20 @@ impl CanisterManager {
                             )),
                         }
                     },
-                    None =>  Err(UserError::new(
+                    None => Err(UserError::new(
                         ErrorCode::InvalidManagementPayload,
                         format!("Failed to decode payload for ic00 method: {}", method_name),
                     )),
                 }
             },
+
+            Ok(Ic00Method::FetchCanisterLogs) => Err(UserError::new(
+                ErrorCode::CanisterRejectedMessage,
+                format!(
+                    "{} API is only accessible in non-replicated mode",
+                    Ic00Method::FetchCanisterLogs
+                ),
+            )),
 
             Ok(Ic00Method::ProvisionalCreateCanisterWithCycles)
             | Ok(Ic00Method::BitcoinGetSuccessors)
@@ -543,6 +627,9 @@ impl CanisterManager {
             );
         if let Some(freezing_threshold) = settings.freezing_threshold() {
             canister.system_state.freeze_threshold = freezing_threshold;
+        }
+        if let Some(log_visibility) = settings.log_visibility() {
+            canister.system_state.log_visibility = log_visibility;
         }
     }
 
@@ -722,6 +809,7 @@ impl CanisterManager {
         round_limits: &mut RoundLimits,
         round_counters: RoundCounters,
         subnet_size: usize,
+        log_dirty_pages: FlagStatus,
     ) -> (
         Result<InstallCodeResult, CanisterManagerError>,
         NumInstructions,
@@ -760,6 +848,7 @@ impl CanisterManager {
             CompilationCostHandling::CountFullAmount,
             round_counters,
             subnet_size,
+            log_dirty_pages,
         );
         match dts_result {
             DtsInstallCodeResult::Finished {
@@ -818,6 +907,7 @@ impl CanisterManager {
         compilation_cost_handling: CompilationCostHandling,
         round_counters: RoundCounters,
         subnet_size: usize,
+        log_dirty_pages: FlagStatus,
     ) -> DtsInstallCodeResult {
         if let Err(err) = validate_controller(&canister, &context.sender()) {
             return DtsInstallCodeResult::Finished {
@@ -834,6 +924,7 @@ impl CanisterManager {
             None => {
                 let memory_usage = canister.memory_usage();
                 let message_memory_usage = canister.message_memory_usage();
+                let reveal_top_up = canister.controllers().contains(message.sender());
                 match self.cycles_account_manager.prepay_execution_cycles(
                     &mut canister.system_state,
                     memory_usage,
@@ -841,6 +932,7 @@ impl CanisterManager {
                     execution_parameters.compute_allocation,
                     execution_parameters.instruction_limits.message(),
                     subnet_size,
+                    reveal_top_up,
                 ) {
                     Ok(cycles) => cycles,
                     Err(err) => {
@@ -871,6 +963,7 @@ impl CanisterManager {
             requested_memory_allocation: context.memory_allocation,
             sender: context.sender(),
             canister_id: canister.canister_id(),
+            log_dirty_pages,
         };
 
         let round = RoundContext {
@@ -1007,6 +1100,7 @@ impl CanisterManager {
                 }
             }
         };
+        canister.system_state.canister_version += 1;
         state.put_canister_state(canister);
         result
     }
@@ -1050,6 +1144,7 @@ impl CanisterManager {
             CanisterStatus::Stopped => CanisterStatus::new_running(),
         };
         canister.system_state.status = status;
+        canister.system_state.canister_version += 1;
 
         Ok(stop_contexts)
     }
@@ -1080,6 +1175,7 @@ impl CanisterManager {
         let memory_allocation = canister.memory_allocation();
         let freeze_threshold = canister.system_state.freeze_threshold;
         let reserved_cycles_limit = canister.system_state.reserved_balance_limit();
+        let log_visibility = canister.system_state.log_visibility;
 
         Ok(CanisterStatusResultV2::new(
             canister.status(),
@@ -1095,6 +1191,7 @@ impl CanisterManager {
             Some(memory_allocation.bytes().get()),
             freeze_threshold.get(),
             reserved_cycles_limit.map(|x| x.get()),
+            log_visibility,
             self.cycles_account_manager
                 .idle_cycles_burned_rate(
                     memory_allocation,
@@ -1504,6 +1601,7 @@ impl CanisterManager {
         let current_memory_usage = canister.memory_usage();
         let message_memory = canister.message_memory_usage();
         let compute_allocation = canister.compute_allocation();
+        let reveal_top_up = canister.controllers().contains(&sender);
         // Charge for the upload.
         let prepaid_cycles = self
             .cycles_account_manager
@@ -1514,6 +1612,7 @@ impl CanisterManager {
                 compute_allocation,
                 instructions,
                 subnet_size,
+                reveal_top_up,
             )
             .map_err(|err| CanisterManagerError::WasmChunkStoreError {
                 message: format!("Error charging for 'upload_chunk': {}", err),
@@ -1681,7 +1780,7 @@ impl CanisterManager {
             .system_state
             .wasm_chunk_store
             .keys()
-            .map(|k| serde_bytes::ByteBuf::from(*k))
+            .map(|k| ChunkHash { hash: k.to_vec() })
             .collect();
         Ok(StoredChunksReply(keys))
     }
@@ -2098,7 +2197,7 @@ pub fn uninstall_canister(
                         },
                     }));
                 }
-                CallOrigin::CanisterUpdate(caller_canister_id, callback_id) => {
+                CallOrigin::CanisterUpdate(caller_canister_id, callback_id, deadline) => {
                     rejects.push(Response::Canister(CanisterResponse {
                         originator: *caller_canister_id,
                         respondent: canister_id,
@@ -2108,6 +2207,7 @@ pub fn uninstall_canister(
                             RejectCode::CanisterReject,
                             "Canister has been uninstalled.",
                         )),
+                        deadline: *deadline,
                     }));
                 }
                 CallOrigin::CanisterQuery(_, _) | CallOrigin::Query(_) => fatal!(

@@ -2,7 +2,7 @@ use crate::driver::{
     config::NODES_INFO,
     driver_setup::SSH_AUTHORIZED_PUB_KEYS_DIR,
     farm::{Farm, FarmResult, FileId},
-    ic::{InternetComputer, Ipv4Config, Node},
+    ic::{InternetComputer, Node},
     nested::{NestedNode, NestedVms, NESTED_CONFIGURED_IMAGE_PATH},
     node_software_version::NodeSoftwareVersion,
     port_allocator::AddrType,
@@ -12,7 +12,11 @@ use crate::driver::{
         HasDependencies, HasIcDependencies, HasTopologySnapshot, IcNodeContainer,
         InitialReplicaVersion, NodesInfo,
     },
+    test_setup::InfraProvider,
 };
+use crate::k8s::images::*;
+use crate::k8s::tnet::{TNet, TNode};
+use crate::util::block_on;
 use anyhow::{bail, Result};
 use flate2::{write::GzEncoder, Compression};
 use ic_base_types::NodeId;
@@ -25,6 +29,7 @@ use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_registry_subnet_type::SubnetType;
 use ic_types::malicious_behaviour::MaliciousBehaviour;
 use ic_types::ReplicaVersion;
+use registry_canister::mutations::node_management::do_update_node_ipv4_config_directly::IPv4Config;
 use slog::{info, warn, Logger};
 use std::{
     collections::BTreeMap,
@@ -79,6 +84,7 @@ pub fn init_ic(
     } else {
         test_env.read_dependency_from_env_to_string("ENV_DEPS__IC_VERSION_FILE")?
     };
+
     let replica_version = ReplicaVersion::try_from(replica_version.clone())?;
     let initial_replica_version = InitialReplicaVersion {
         version: replica_version.clone(),
@@ -201,6 +207,13 @@ pub fn init_ic(
 
     ic_config.set_use_specified_ids_allocation_range(specific_ids);
 
+    if InfraProvider::read_attribute(test_env) == InfraProvider::K8s {
+        ic_config.set_whitelisted_prefixes(Some("::/0".to_string()));
+        ic_config.set_whitelisted_ports(Some(
+            "22,2497,4100,7070,8080,9090,9091,9100,19100,19531".to_string(),
+        ));
+    }
+
     info!(test_env.logger(), "Initializing via {:?}", &ic_config);
 
     Ok(ic_config.initialize()?)
@@ -223,6 +236,11 @@ pub fn setup_and_start_vms(
         nodes.push(node.clone());
     }
 
+    let tnet = match InfraProvider::read_attribute(env) {
+        InfraProvider::K8s => TNet::read_attribute(env),
+        InfraProvider::Farm => TNet::new("dummy")?,
+    };
+
     let mut join_handles: Vec<JoinHandle<anyhow::Result<()>>> = vec![];
     let mut nodes_info = NodesInfo::new();
     for node in nodes {
@@ -232,23 +250,63 @@ pub fn setup_and_start_vms(
         let t_env = env.clone();
         let ic_name = ic.name();
         let malicious_behaviour = ic.get_malicious_behavior_of_node(node.node_id);
+        let query_stats_epoch_length = ic.get_query_stats_epoch_length_of_node(node.node_id);
         let ipv4_config = ic.get_ipv4_config_of_node(node.node_id);
+        let domain = ic.get_domain_of_node(node.node_id);
         nodes_info.insert(node.node_id, malicious_behaviour.clone());
+        let tnet_node = match InfraProvider::read_attribute(env) {
+            InfraProvider::K8s => tnet
+                .nodes
+                .iter()
+                .find(|n| n.node_id.clone().expect("node_id missing") == vm_name.clone())
+                .expect("tnet doesn't have this node")
+                .clone(),
+            InfraProvider::Farm => TNode::default(),
+        };
         join_handles.push(thread::spawn(move || {
             create_config_disk_image(
                 &ic_name,
                 &node,
                 malicious_behaviour,
+                query_stats_epoch_length,
                 ipv4_config,
+                domain,
                 &t_env,
                 &group_name,
             )?;
-            let image_id = upload_config_disk_image(&group_name, &node, &t_farm)?;
-            // delete uncompressed file
+
             let conf_img_path = PathBuf::from(&node.node_path).join(CONF_IMG_FNAME);
+            match InfraProvider::read_attribute(&t_env) {
+                InfraProvider::K8s => {
+                    let url = format!(
+                        "{}/{}",
+                        tnet_node.config_url.clone().expect("missing config_url"),
+                        CONF_IMG_FNAME
+                    );
+                    info!(
+                        t_env.logger(),
+                        "Uploading image {} to {}",
+                        conf_img_path.clone().display().to_string(),
+                        url.clone()
+                    );
+                    block_on(upload_image(conf_img_path.as_path(), &url))
+                        .expect("Failed to upload config image");
+                    block_on(tnet_node.deploy_config_image(CONF_IMG_FNAME))
+                        .expect("deploying config image failed");
+                    block_on(tnet_node.start()).expect("starting vm failed");
+                }
+                InfraProvider::Farm => {
+                    let image_id = upload_config_disk_image(&group_name, &node, &t_farm)?;
+                    t_farm.attach_disk_images(
+                        &group_name,
+                        &vm_name,
+                        "usb-storage",
+                        vec![image_id],
+                    )?;
+                    t_farm.start_vm(&group_name, &vm_name)?;
+                }
+            }
             std::fs::remove_file(conf_img_path)?;
-            t_farm.attach_disk_images(&group_name, &vm_name, "usb-storage", vec![image_id])?;
-            t_farm.start_vm(&group_name, &vm_name)?;
             Ok(())
         }));
     }
@@ -335,11 +393,13 @@ pub fn upload_config_disk_image(
 
 /// side-effectful function that creates the config disk images in the node
 /// directories.
-pub fn create_config_disk_image(
+fn create_config_disk_image(
     ic_name: &str,
     node: &InitializedNode,
     malicious_behavior: Option<MaliciousBehaviour>,
-    ipv4_config: Option<Ipv4Config>,
+    query_stats_epoch_length: Option<u64>,
+    ipv4_config: Option<IPv4Config>,
+    domain: Option<String>,
     test_env: &TestEnv,
     group_name: &str,
 ) -> anyhow::Result<()> {
@@ -359,6 +419,15 @@ pub fn create_config_disk_image(
         .arg(node.crypto_path())
         .arg("--elasticsearch_tags")
         .arg(format!("system_test {}", group_name));
+
+    // We've seen k8s nodes fail to pick up RA correctly, so we specify their
+    // addresses directly. Ideally, all nodes should do this, to match mainnet.
+    if InfraProvider::read_attribute(test_env) == InfraProvider::K8s {
+        cmd.arg("--ipv6_address")
+            .arg(format!("{}/64", node.node_config.public_api.ip()))
+            .arg("--ipv6_gateway")
+            .arg("fe80::ecee:eeff:feee:eeee");
+    }
 
     // If we have a root subnet, specify the correct NNS url.
     if let Some(node) = test_env
@@ -380,21 +449,35 @@ pub fn create_config_disk_image(
             .arg(serde_json::to_string(&malicious_behavior)?);
     }
 
+    if let Some(query_stats_epoch_length) = query_stats_epoch_length {
+        info!(
+            test_env.logger(),
+            "Node with id={} has query_stats_epoch_length={:?}",
+            node.node_id,
+            query_stats_epoch_length
+        );
+        cmd.arg("--query_stats_epoch_length")
+            .arg(format!("{}", query_stats_epoch_length));
+    }
+
     if let Some(ipv4_config) = ipv4_config {
         info!(
             test_env.logger(),
-            "Node with id={} is IPv4-enabled: IP address {:?}/{:?}, IP gateway {:?}",
-            node.node_id,
-            ipv4_config.ip_addr,
-            ipv4_config.prefix_length,
-            ipv4_config.gateway_ip_addr
+            "Node with id={} is IPv4-enabled: {:?}", node.node_id, ipv4_config
         );
         cmd.arg("--ipv4_address").arg(format!(
-            "{:?}/{:?}",
+            "{}/{:?}",
             ipv4_config.ip_addr, ipv4_config.prefix_length
         ));
-        cmd.arg("--ipv4_gateway")
-            .arg(ipv4_config.gateway_ip_addr.to_string());
+        cmd.arg("--ipv4_gateway").arg(&ipv4_config.gateway_ip_addr);
+    }
+
+    if let Some(domain) = domain {
+        info!(
+            test_env.logger(),
+            "Node with id={} has domain_name {}", node.node_id, domain,
+        );
+        cmd.arg("--domain").arg(domain);
     }
 
     let ssh_authorized_pub_keys_dir: PathBuf = test_env.get_path(SSH_AUTHORIZED_PUB_KEYS_DIR);
@@ -518,11 +601,11 @@ fn configure_setupos_image(
     let old_ip = nested_vm.get_vm()?.ipv6;
     let segments = old_ip.segments();
     let prefix = format!(
-        "{:04x}:{:04x}:{:04x}:{:04x}::/64",
+        "{:04x}:{:04x}:{:04x}:{:04x}",
         segments[0], segments[1], segments[2], segments[3]
     );
     let gateway = format!(
-        "{:04x}:{:04x}:{:04x}:{:04x}::1/64",
+        "{:04x}:{:04x}:{:04x}:{:04x}::1",
         segments[0], segments[1], segments[2], segments[3]
     );
 

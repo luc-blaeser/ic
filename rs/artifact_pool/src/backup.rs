@@ -574,7 +574,7 @@ impl BackupArtifact {
         // If the file exists, it will be overwritten (this is required on
         // initializations).
         let serialized = self.serialize()?;
-        ic_utils::fs::write_using_tmp_file(full_path, |writer| writer.write_all(&serialized))
+        ic_sys::fs::write_using_tmp_file(full_path, |writer| writer.write_all(&serialized))
     }
 
     /// Serializes the artifact to protobuf.
@@ -627,7 +627,7 @@ impl BackupArtifact {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ic_test_utilities::{consensus::fake::*, mock_time, types::ids::node_test_id};
+    use ic_test_utilities::{consensus::fake::*, types::ids::node_test_id};
     use ic_types::{
         batch::*,
         consensus::*,
@@ -682,14 +682,14 @@ mod tests {
                 CryptoHashOf::from(CryptoHash(Vec::new())),
                 Payload::new(
                     ic_types::crypto::crypto_hash,
-                    (ic_types::consensus::dkg::Summary::fake(), None).into(),
+                    BlockPayload::Summary(SummaryPayload::fake()),
                 ),
                 Height::from(123),
                 Rank(456),
                 ValidationContext {
                     registry_version: RegistryVersion::from(99),
                     certified_height: Height::from(42),
-                    time: mock_time(),
+                    time: UNIX_EPOCH,
                 },
             ),
             node_test_id(333),

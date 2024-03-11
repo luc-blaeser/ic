@@ -7,10 +7,12 @@ pub struct CallContext {
     pub available_funds: ::core::option::Option<super::super::queues::v1::Funds>,
     #[prost(bool, tag = "8")]
     pub deleted: bool,
-    #[prost(uint64, optional, tag = "9")]
-    pub time_nanos: ::core::option::Option<u64>,
+    #[prost(uint64, tag = "9")]
+    pub time_nanos: u64,
     #[prost(uint64, tag = "10")]
     pub instructions_executed: u64,
+    #[prost(message, optional, tag = "11")]
+    pub metadata: ::core::option::Option<super::super::queues::v1::RequestMetadata>,
     #[prost(oneof = "call_context::CallOrigin", tags = "1, 2, 3, 4, 7")]
     pub call_origin: ::core::option::Option<call_context::CallOrigin>,
 }
@@ -31,6 +33,9 @@ pub mod call_context {
         pub canister_id: ::core::option::Option<super::super::super::super::types::v1::CanisterId>,
         #[prost(uint64, tag = "2")]
         pub callback_id: u64,
+        /// If non-zero, this originates from a best-effort canister update call.
+        #[prost(uint32, tag = "3")]
+        pub deadline_seconds: u32,
     }
     /// System task is either a Heartbeat or a GlobalTimer.
     #[allow(clippy::derive_partial_eq_without_eq)]
@@ -89,6 +94,9 @@ pub struct Callback {
     #[prost(message, optional, tag = "9")]
     pub prepayment_for_response_transmission:
         ::core::option::Option<super::super::queues::v1::Cycles>,
+    /// If non-zero, this is a best-effort call.
+    #[prost(uint32, tag = "10")]
+    pub deadline_seconds: u32,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -156,7 +164,6 @@ pub mod wasm_method {
         CanisterPostUpgrade = 4,
         CanisterInspectMessage = 5,
         CanisterHeartbeat = 6,
-        Empty = 7,
         CanisterGlobalTimer = 8,
     }
     impl SystemMethod {
@@ -173,7 +180,6 @@ pub mod wasm_method {
                 SystemMethod::CanisterPostUpgrade => "SYSTEM_METHOD_CANISTER_POST_UPGRADE",
                 SystemMethod::CanisterInspectMessage => "SYSTEM_METHOD_CANISTER_INSPECT_MESSAGE",
                 SystemMethod::CanisterHeartbeat => "SYSTEM_METHOD_CANISTER_HEARTBEAT",
-                SystemMethod::Empty => "SYSTEM_METHOD_EMPTY",
                 SystemMethod::CanisterGlobalTimer => "SYSTEM_METHOD_CANISTER_GLOBAL_TIMER",
             }
         }
@@ -187,7 +193,6 @@ pub mod wasm_method {
                 "SYSTEM_METHOD_CANISTER_POST_UPGRADE" => Some(Self::CanisterPostUpgrade),
                 "SYSTEM_METHOD_CANISTER_INSPECT_MESSAGE" => Some(Self::CanisterInspectMessage),
                 "SYSTEM_METHOD_CANISTER_HEARTBEAT" => Some(Self::CanisterHeartbeat),
-                "SYSTEM_METHOD_EMPTY" => Some(Self::Empty),
                 "SYSTEM_METHOD_CANISTER_GLOBAL_TIMER" => Some(Self::CanisterGlobalTimer),
                 _ => None,
             }
@@ -272,6 +277,9 @@ pub mod stop_canister_context {
         pub cycles: ::core::option::Option<super::super::super::queues::v1::Cycles>,
         #[prost(uint64, optional, tag = "5")]
         pub call_id: ::core::option::Option<u64>,
+        /// If non-zero, this is a best-effort canister update call.
+        #[prost(uint32, tag = "6")]
+        pub deadline_seconds: u32,
     }
     #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
@@ -524,6 +532,16 @@ pub struct WasmChunkStoreMetadata {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CanisterLogRecord {
+    #[prost(uint64, tag = "1")]
+    pub idx: u64,
+    #[prost(uint64, tag = "2")]
+    pub timestamp_nanos: u64,
+    #[prost(bytes = "vec", tag = "3")]
+    pub content: ::prost::alloc::vec::Vec<u8>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CanisterStateBits {
     #[prost(uint64, tag = "2")]
     pub last_full_execution_round: u64,
@@ -601,6 +619,15 @@ pub struct CanisterStateBits {
     /// Statistics on query execution for entire lifetime of canister.
     #[prost(message, optional, tag = "41")]
     pub total_query_stats: ::core::option::Option<TotalQueryStats>,
+    /// Log visibility for the canister.
+    #[prost(enumeration = "LogVisibility", tag = "42")]
+    pub log_visibility: i32,
+    /// Log records of the canister.
+    #[prost(message, repeated, tag = "43")]
+    pub canister_log_records: ::prost::alloc::vec::Vec<CanisterLogRecord>,
+    /// The index of the next log record to be created.
+    #[prost(uint64, tag = "44")]
+    pub next_canister_log_record_idx: u64,
     #[prost(oneof = "canister_state_bits::CanisterStatus", tags = "11, 12, 13")]
     pub canister_status: ::core::option::Option<canister_state_bits::CanisterStatus>,
 }
@@ -737,6 +764,35 @@ impl CyclesUseCase {
             "CYCLES_USE_CASE_DELETED_CANISTERS" => Some(Self::DeletedCanisters),
             "CYCLES_USE_CASE_NON_CONSUMED" => Some(Self::NonConsumed),
             "CYCLES_USE_CASE_BURNED_CYCLES" => Some(Self::BurnedCycles),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum LogVisibility {
+    Unspecified = 0,
+    Controllers = 1,
+    Public = 2,
+}
+impl LogVisibility {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            LogVisibility::Unspecified => "LOG_VISIBILITY_UNSPECIFIED",
+            LogVisibility::Controllers => "LOG_VISIBILITY_CONTROLLERS",
+            LogVisibility::Public => "LOG_VISIBILITY_PUBLIC",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "LOG_VISIBILITY_UNSPECIFIED" => Some(Self::Unspecified),
+            "LOG_VISIBILITY_CONTROLLERS" => Some(Self::Controllers),
+            "LOG_VISIBILITY_PUBLIC" => Some(Self::Public),
             _ => None,
         }
     }

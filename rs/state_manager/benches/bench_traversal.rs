@@ -16,7 +16,6 @@ use ic_replicated_state::{
 use ic_state_manager::labeled_tree_visitor::LabeledTreeVisitor;
 use ic_state_manager::{stream_encoding::encode_stream_slice, tree_hash::hash_state};
 use ic_test_utilities::{
-    mock_time,
     state::{get_initial_state, get_running_canister},
     types::{
         ids::{canister_test_id, message_test_id, subnet_test_id, user_test_id},
@@ -25,6 +24,7 @@ use ic_test_utilities::{
 };
 use ic_types::{
     messages::{CallbackId, Payload},
+    time::UNIX_EPOCH,
     xnet::StreamIndex,
     Cycles,
 };
@@ -79,7 +79,7 @@ fn bench_traversal(c: &mut Criterion<ProcessTime>) {
     }
 
     let user_id = user_test_id(1);
-    let time = mock_time();
+    let time = UNIX_EPOCH;
 
     for i in 1..NUM_STATUSES {
         use ic_error_types::{ErrorCode, UserError};

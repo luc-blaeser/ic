@@ -16,6 +16,7 @@ use ic_interfaces::execution_environment::{
     TrapCode::{self, CyclesAmountTooBigFor64Bit},
 };
 use ic_logger::{error, ReplicaLogger};
+use ic_management_canister_types::CanisterLog;
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::{
     canister_state::WASM_PAGE_SIZE_IN_BYTES, memory_required_to_push_request, Memory, NumWasmPages,
@@ -150,6 +151,11 @@ impl InstructionLimits {
     /// Note that with DTS, the slice size is constant for a fixed message type.
     pub fn update(&mut self, left: NumInstructions) {
         self.message = left;
+    }
+
+    /// Checks if DTS is enabled.
+    pub fn slicing_enabled(self) -> bool {
+        self.max_slice < self.message
     }
 }
 
@@ -570,6 +576,38 @@ impl ApiType {
             ApiType::PreUpgrade { .. } => "pre upgrade",
             ApiType::InspectMessage { .. } => "inspect message",
             ApiType::Cleanup { .. } => "cleanup",
+        }
+    }
+
+    pub fn caller(&self) -> Option<PrincipalId> {
+        match self {
+            ApiType::Start { .. } => None,
+            ApiType::Init { caller, .. } => Some(*caller),
+            ApiType::SystemTask { .. } => None,
+            ApiType::Update { caller, .. } => Some(*caller),
+            ApiType::ReplicatedQuery { caller, .. } => Some(*caller),
+            ApiType::NonReplicatedQuery { caller, .. } => Some(*caller),
+            ApiType::ReplyCallback { caller, .. } => Some(*caller),
+            ApiType::RejectCallback { caller, .. } => Some(*caller),
+            ApiType::PreUpgrade { caller, .. } => Some(*caller),
+            ApiType::InspectMessage { caller, .. } => Some(*caller),
+            ApiType::Cleanup { caller, .. } => Some(*caller),
+        }
+    }
+
+    pub fn time(&self) -> &Time {
+        match self {
+            ApiType::Start { time }
+            | ApiType::Init { time, .. }
+            | ApiType::SystemTask { time, .. }
+            | ApiType::Update { time, .. }
+            | ApiType::Cleanup { time, .. }
+            | ApiType::NonReplicatedQuery { time, .. }
+            | ApiType::ReplicatedQuery { time, .. }
+            | ApiType::PreUpgrade { time, .. }
+            | ApiType::ReplyCallback { time, .. }
+            | ApiType::RejectCallback { time, .. }
+            | ApiType::InspectMessage { time, .. } => time,
         }
     }
 }
@@ -1115,6 +1153,7 @@ impl SystemApiImpl {
                                 self.memory_usage.current_usage,
                                 self.memory_usage.current_message_usage,
                                 amount,
+                                false, // synchronous error => no need to reveal top up balance
                             )?;
                         request.add_cycles(amount);
                         Ok(())
@@ -1284,20 +1323,15 @@ impl SystemApiImpl {
         } else {
             (memory_required_to_push_request(&req) as u64).into()
         };
-        if let Err(err) = self.memory_usage.allocate_message_memory(
+        if let Err(_err) = self.memory_usage.allocate_message_memory(
             reservation_bytes,
             &self.api_type,
             &self.sandbox_safe_system_state,
         ) {
             abort(req, &mut self.sandbox_safe_system_state);
-            match err {
-                err @ HypervisorError::InsufficientCyclesInMessageMemoryGrow { .. } => {
-                    // Return an the out-of-cycles error in this case for a better
-                    // error message to be relayed to the caller.
-                    return Err(err);
-                }
-                _ => return Ok(RejectCode::SysTransient as i32),
-            }
+            // Return an error code instead of trapping here in order to allow
+            // the user code to handle the error gracefully.
+            return Ok(RejectCode::SysTransient as i32);
         }
 
         match self.sandbox_safe_system_state.push_output_request(
@@ -1333,29 +1367,31 @@ impl SystemApiImpl {
         }
     }
 
-    /// Increase `ic0.call_perform()` system API call counter.
-    fn inc_call_perform_counter(&mut self) {
-        self.call_counters.call_perform += 1;
-    }
-
-    /// Increase `ic0.canister_cycle_balance()` system API call counter.
-    fn inc_canister_cycle_balance_counter(&mut self) {
-        self.call_counters.canister_cycle_balance += 1;
-    }
-
-    /// Increase `ic0.canister_cycle_balance128()` system API call counter.
-    fn inc_canister_cycle_balance128_counter(&mut self) {
-        self.call_counters.canister_cycle_balance128 += 1;
-    }
-
-    /// Increase `ic0.time()` system API call counter.
-    fn inc_time_counter(&mut self) {
-        self.call_counters.time += 1;
-    }
-
     /// Return tracked System API call counters.
     pub fn call_counters(&self) -> SystemApiCallCounters {
         self.call_counters.clone()
+    }
+
+    /// Appends the specified bytes on the heap as a string to the canister's logs.
+    pub fn save_log_message(&mut self, src: usize, size: usize, heap: &[u8]) {
+        self.sandbox_safe_system_state.append_canister_log(
+            self.api_type.time(),
+            valid_subslice("save_log_message", src, size, heap).unwrap_or(
+                // Do not trap here!
+                // If the specified memory range is invalid, ignore it and log the error message.
+                b"(debug_print message out of memory bounds)",
+            ),
+        );
+    }
+
+    /// Takes collected canister log records.
+    pub fn take_canister_log(&mut self) -> CanisterLog {
+        self.sandbox_safe_system_state.take_canister_log()
+    }
+
+    /// Returns collected canister log records.
+    pub fn canister_log(&self) -> &CanisterLog {
+        self.sandbox_safe_system_state.canister_log()
     }
 }
 
@@ -2201,7 +2237,6 @@ impl SystemApi for SystemApiImpl {
     // or the output queues are full. In this case, we need to perform the
     // necessary cleanups.
     fn ic0_call_perform(&mut self) -> HypervisorResult<i32> {
-        self.inc_call_perform_counter();
         let result = match &mut self.api_type {
             ApiType::Start { .. }
             | ApiType::Init { .. }
@@ -2439,7 +2474,7 @@ impl SystemApi for SystemApiImpl {
     }
 
     fn ic0_time(&mut self) -> HypervisorResult<Time> {
-        self.inc_time_counter();
+        self.call_counters.time += 1;
         let result = match &self.api_type {
             ApiType::Start { .. } => Err(self.error_for("ic0_time")),
             ApiType::Init { time, .. }
@@ -2543,6 +2578,33 @@ impl SystemApi for SystemApiImpl {
         result
     }
 
+    /// Performance improvement:
+    /// This function is called after a message execution succeeded but the number of
+    /// dirty pages is large enough to warrant an extra round of execution.
+    /// Therefore, we yield control back to the replica and we wait for the
+    /// next round to start copying dirty pages.
+    fn yield_for_dirty_memory_copy(&mut self, instruction_counter: i64) -> HypervisorResult<i64> {
+        let result = self
+            .out_of_instructions_handler
+            .yield_for_dirty_memory_copy(instruction_counter);
+        if let Ok(new_slice_instruction_limit) = result {
+            // A new slice has started, update the instruction sum and limit.
+            let slice_instructions = self
+                .current_slice_instruction_limit
+                .saturating_sub(instruction_counter)
+                .max(0);
+            self.instructions_executed_before_current_slice += slice_instructions;
+            self.current_slice_instruction_limit = new_slice_instruction_limit;
+        }
+        trace_syscall!(
+            self,
+            yield_for_dirty_memory_copy,
+            result,
+            instruction_counter
+        );
+        result
+    }
+
     fn update_available_memory(
         &mut self,
         native_memory_grow_res: i64,
@@ -2634,7 +2696,7 @@ impl SystemApi for SystemApiImpl {
     }
 
     fn ic0_canister_cycle_balance(&mut self) -> HypervisorResult<u64> {
-        self.inc_canister_cycle_balance_counter();
+        self.call_counters.canister_cycle_balance += 1;
         let result = {
             let (high_amount, low_amount) = self
                 .ic0_canister_cycle_balance_helper("ic0_canister_cycle_balance")?
@@ -2657,7 +2719,7 @@ impl SystemApi for SystemApiImpl {
         dst: u64,
         heap: &mut [u8],
     ) -> HypervisorResult<()> {
-        self.inc_canister_cycle_balance128_counter();
+        self.call_counters.canister_cycle_balance128 += 1;
         let result = {
             let method_name = "ic0_canister_cycle_balance128";
             let cycles = self.ic0_canister_cycle_balance_helper(method_name)?;
@@ -2832,7 +2894,7 @@ impl SystemApi for SystemApiImpl {
     }
 
     fn ic0_data_certificate_copy(
-        &self,
+        &mut self,
         dst: u32,
         offset: u32,
         size: u32,
@@ -2842,12 +2904,13 @@ impl SystemApi for SystemApiImpl {
     }
 
     fn ic0_data_certificate_copy_64(
-        &self,
+        &mut self,
         dst: u64,
         offset: u64,
         size: u64,
         heap: &mut [u8],
     ) -> HypervisorResult<()> {
+        self.call_counters.data_certificate_copy += 1;
         let result = match &self.api_type {
             ApiType::Start { .. }
             | ApiType::Init { .. }
@@ -3032,12 +3095,9 @@ impl SystemApi for SystemApiImpl {
         let size = size.min(MAX_DEBUG_MESSAGE_SIZE);
         let msg = match valid_subslice("ic0.debug_print", src as usize, size as usize, heap) {
             Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
-            Err(_) => {
-                // Do not trap here!
-                // debug.print should never fail, so if the specified memory range
-                // is invalid, we ignore it and print the error message
-                "(debug message out of memory bounds)".to_string()
-            }
+            // Do not trap here! `ic0_debug_print` should never fail!
+            // If the specified memory range is invalid, ignore it and print the error message.
+            Err(_) => "(debug message out of memory bounds)".to_string(),
         };
         match &self.api_type {
             ApiType::Start { time }
@@ -3204,6 +3264,12 @@ pub struct DefaultOutOfInstructionsHandler {}
 impl OutOfInstructionsHandler for DefaultOutOfInstructionsHandler {
     fn out_of_instructions(&self, _instruction_counter: i64) -> HypervisorResult<i64> {
         Err(HypervisorError::InstructionLimitExceeded)
+    }
+
+    fn yield_for_dirty_memory_copy(&self, _instruction_counter: i64) -> HypervisorResult<i64> {
+        // This is a no-op, should only happen if it is called on a subnet where DTS is completely disabled.
+        // 0 instructions were executed as a result.
+        Ok(0)
     }
 }
 

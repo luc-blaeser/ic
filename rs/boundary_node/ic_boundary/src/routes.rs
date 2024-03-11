@@ -17,19 +17,20 @@ use axum::{
     BoxError, Extension,
 };
 use bytes::Bytes;
-use candid::Principal;
+use candid::{CandidType, Decode, Principal};
 use http::{
-    header::{HeaderName, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE},
+    header::{HeaderName, HeaderValue, CONTENT_TYPE},
     Method,
 };
-use http_body::Body as HttpBody;
 use ic_types::{
     messages::{Blob, HttpStatusResponse, ReplicaHealthStatus},
     CanisterId,
 };
+
 use lazy_static::lazy_static;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use strum::{Display, IntoStaticStr};
 use tower_governor::errors::GovernorError;
 use url::Url;
 
@@ -45,6 +46,7 @@ use crate::{
 // TODO which one to use?
 const IC_API_VERSION: &str = "0.18.0";
 pub const ANONYMOUS_PRINCIPAL: Principal = Principal::anonymous();
+const METHOD_HTTP: &str = "http_request";
 
 // Clippy complains that these are interior-mutable.
 // We don't mutate them, so silence it.
@@ -65,6 +67,8 @@ const HEADER_IC_NODE_ID: HeaderName = HeaderName::from_static("x-ic-node-id");
 #[allow(clippy::declare_interior_mutable_const)]
 const HEADER_IC_CANISTER_ID: HeaderName = HeaderName::from_static("x-ic-canister-id");
 #[allow(clippy::declare_interior_mutable_const)]
+const HEADER_IC_CANISTER_ID_CBOR: HeaderName = HeaderName::from_static("x-ic-canister-id-cbor");
+#[allow(clippy::declare_interior_mutable_const)]
 const HEADER_IC_METHOD_NAME: HeaderName = HeaderName::from_static("x-ic-method-name");
 #[allow(clippy::declare_interior_mutable_const)]
 const HEADER_IC_SENDER: HeaderName = HeaderName::from_static("x-ic-sender");
@@ -73,7 +77,17 @@ const HEADER_IC_REQUEST_TYPE: HeaderName = HeaderName::from_static("x-ic-request
 #[allow(clippy::declare_interior_mutable_const)]
 const HEADER_IC_RETRIES: HeaderName = HeaderName::from_static("x-ic-retries");
 #[allow(clippy::declare_interior_mutable_const)]
+const HEADER_IC_ERROR_CAUSE: HeaderName = HeaderName::from_static("x-ic-error-cause");
+#[allow(clippy::declare_interior_mutable_const)]
 const HEADER_X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
+#[allow(clippy::declare_interior_mutable_const)]
+pub const HEADER_X_REAL_IP: http::HeaderName = http::HeaderName::from_static("x-real-ip");
+#[allow(clippy::declare_interior_mutable_const)]
+pub const HEADER_X_IC_COUNTRY_CODE: http::HeaderName =
+    http::HeaderName::from_static("x-ic-country-code");
+
+const HEADERS_HIDE_HTTP_REQUEST: [&str; 4] =
+    ["x-real-ip", "x-forwarded-for", "x-request-id", "user-agent"];
 
 // Rust const/static concat is non-existent, so we have to repeat
 pub const PATH_STATUS: &str = "/api/v2/status";
@@ -88,24 +102,22 @@ lazy_static! {
 }
 
 // Type of IC request
-#[derive(Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Hash, Display, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum RequestType {
     #[default]
+    Unknown,
     Status,
     Query,
     Call,
     ReadState,
 }
 
-impl fmt::Display for RequestType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::Status => write!(f, "status"),
-            Self::Query => write!(f, "query"),
-            Self::Call => write!(f, "call"),
-            Self::ReadState => write!(f, "read_state"),
-        }
-    }
+#[derive(Debug, Clone, Display)]
+#[strum(serialize_all = "snake_case")]
+pub enum RateLimitCause {
+    Normal,
+    LedgerTransfer,
 }
 
 // Categorized possible causes for request processing failures
@@ -114,7 +126,9 @@ impl fmt::Display for RequestType {
 pub enum ErrorCause {
     UnableToReadBody(String),
     PayloadTooLarge(usize),
-    UnableToParseCBOR(String), // TODO just use MalformedRequest?
+    UnableToParseCBOR(String),
+    UnableToParseHTTPArg(String),
+    LoadShed,
     MalformedRequest(String),
     MalformedResponse(String),
     NoRoutingTable,
@@ -126,7 +140,7 @@ pub enum ErrorCause {
     ReplicaTLSErrorOther(String),
     ReplicaTLSErrorCert(String),
     ReplicaErrorOther(String),
-    TooManyRequests,
+    RateLimited(RateLimitCause),
     Other(String),
 }
 
@@ -137,6 +151,8 @@ impl ErrorCause {
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::UnableToReadBody(_) => StatusCode::REQUEST_TIMEOUT,
             Self::UnableToParseCBOR(_) => StatusCode::BAD_REQUEST,
+            Self::UnableToParseHTTPArg(_) => StatusCode::BAD_REQUEST,
+            Self::LoadShed => StatusCode::TOO_MANY_REQUESTS,
             Self::MalformedRequest(_) => StatusCode::BAD_REQUEST,
             Self::MalformedResponse(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::NoRoutingTable => StatusCode::SERVICE_UNAVAILABLE,
@@ -148,7 +164,7 @@ impl ErrorCause {
             Self::ReplicaTLSErrorOther(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::ReplicaTLSErrorCert(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::ReplicaErrorOther(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
+            Self::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
@@ -158,6 +174,8 @@ impl ErrorCause {
             Self::PayloadTooLarge(x) => Some(format!("maximum body size is {x} bytes")),
             Self::UnableToReadBody(x) => Some(x.clone()),
             Self::UnableToParseCBOR(x) => Some(x.clone()),
+            Self::UnableToParseHTTPArg(x) => Some(x.clone()),
+            Self::LoadShed => Some("Overloaded".into()),
             Self::MalformedRequest(x) => Some(x.clone()),
             Self::MalformedResponse(x) => Some(x.clone()),
             Self::ReplicaErrorDNS(x) => Some(x.clone()),
@@ -186,6 +204,8 @@ impl fmt::Display for ErrorCause {
             Self::UnableToReadBody(_) => write!(f, "unable_to_read_body"),
             Self::PayloadTooLarge(_) => write!(f, "payload_too_large"),
             Self::UnableToParseCBOR(_) => write!(f, "unable_to_parse_cbor"),
+            Self::UnableToParseHTTPArg(_) => write!(f, "unable_to_parse_http_arg"),
+            Self::LoadShed => write!(f, "load_shed"),
             Self::MalformedRequest(_) => write!(f, "malformed_request"),
             Self::MalformedResponse(_) => write!(f, "malformed_response"),
             Self::NoRoutingTable => write!(f, "no_routing_table"),
@@ -197,7 +217,7 @@ impl fmt::Display for ErrorCause {
             Self::ReplicaTLSErrorOther(_) => write!(f, "replica_tls_error"),
             Self::ReplicaTLSErrorCert(_) => write!(f, "replica_tls_error_cert"),
             Self::ReplicaErrorOther(_) => write!(f, "replica_error_other"),
-            Self::TooManyRequests => write!(f, "rate_limited"),
+            Self::RateLimited(x) => write!(f, "rate_limited_{x}"),
         }
     }
 }
@@ -217,6 +237,15 @@ impl IntoResponse for ErrorCause {
     }
 }
 
+#[derive(Clone, CandidType, Deserialize, Hash, PartialEq)]
+pub struct HttpRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    #[serde(with = "serde_bytes")]
+    pub body: Vec<u8>,
+}
+
 // Object that holds per-request information
 #[derive(Default, Clone)]
 pub struct RequestContext {
@@ -230,6 +259,9 @@ pub struct RequestContext {
     pub nonce: Option<Vec<u8>>,
     pub ingress_expiry: Option<u64>,
     pub arg: Option<Vec<u8>>,
+
+    // Filled in when the request is HTTP
+    pub http_request: Option<HttpRequest>,
 }
 
 impl RequestContext {
@@ -247,17 +279,30 @@ impl Hash for RequestContext {
         self.sender.hash(state);
         self.method_name.hash(state);
         self.ingress_expiry.hash(state);
-        self.arg.hash(state);
+
+        // Hash http_request if it's present, arg otherwise
+        // They're mutually exclusive
+        if self.http_request.is_some() {
+            self.http_request.hash(state);
+        } else {
+            self.arg.hash(state);
+        }
     }
 }
 
 impl PartialEq for RequestContext {
     fn eq(&self, other: &Self) -> bool {
-        self.canister_id == other.canister_id
+        let r = self.canister_id == other.canister_id
             && self.sender == other.sender
             && self.method_name == other.method_name
-            && self.ingress_expiry == other.ingress_expiry
-            && self.arg == other.arg
+            && self.ingress_expiry == other.ingress_expiry;
+
+        // Same as in hash()
+        if self.http_request.is_some() {
+            r && self.http_request == other.http_request
+        } else {
+            r && self.arg == other.arg
+        }
     }
 }
 impl Eq for RequestContext {}
@@ -284,7 +329,7 @@ pub trait Proxy: Sync + Send {
         &self,
         request_type: RequestType,
         request: Request<Body>,
-        node: Node,
+        node: Arc<Node>,
         canister_id: CanisterId,
     ) -> Result<Response, ErrorCause>;
 }
@@ -333,7 +378,7 @@ impl Proxy for ProxyRouter {
         &self,
         request_type: RequestType,
         request: Request<Body>,
-        node: Node,
+        node: Arc<Node>,
         canister_id: CanisterId,
     ) -> Result<Response, ErrorCause> {
         // Prepare the request
@@ -455,24 +500,48 @@ impl From<BoxError> for ApiError {
         // it's a GovernorError
         let error = item.downcast_ref::<GovernorError>().unwrap().to_owned();
         match error {
-            GovernorError::TooManyRequests { .. } => ApiError::from(ErrorCause::TooManyRequests),
-            GovernorError::UnableToExtractKey => {
-                ApiError::Unspecified(anyhow!("unable to extract rate-limiting key"))
+            GovernorError::TooManyRequests { .. } => {
+                ApiError::from(ErrorCause::RateLimited(RateLimitCause::Normal))
             }
-            GovernorError::Other { .. } => ApiError::Unspecified(anyhow!("GovernorError")),
+            GovernorError::UnableToExtractKey => ApiError::from(ErrorCause::Other(
+                "unable to extract rate-limiting key".into(),
+            )),
+            GovernorError::Other { msg, .. } => ApiError::from(ErrorCause::Other(format!(
+                "governor_error: {}",
+                msg.unwrap_or_default()
+            ))),
         }
     }
 }
 
 pub async fn validate_request(
-    request: Request<Body>,
+    matched_path: MatchedPath,
+    canister_id: Path<String>,
+    mut request: Request<Body>,
     next: Next<Body>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let request_type = match matched_path.as_str() {
+        PATH_QUERY => RequestType::Query,
+        PATH_CALL => RequestType::Call,
+        PATH_READ_STATE => RequestType::ReadState,
+        _ => panic!("unknown path, should never happen"),
+    };
+
+    request.extensions_mut().insert(request_type);
+
+    // Decode canister_id from URL
+    let canister_id = CanisterId::from_str(&canister_id).map_err(|err| {
+        ErrorCause::MalformedRequest(format!("Unable to decode canister_id from URL: {err}"))
+    })?;
+
+    request.extensions_mut().insert(canister_id);
+
     if let Some(id_header) = request.headers().get(HEADER_X_REQUEST_ID) {
         let is_valid_id = id_header
             .to_str()
             .map(|id| UUID_REGEX.is_match(id))
             .unwrap_or(false);
+
         if !is_valid_id {
             #[allow(clippy::borrow_interior_mutable_const)]
             return Err(ErrorCause::MalformedRequest(format!(
@@ -482,48 +551,21 @@ pub async fn validate_request(
         }
     }
 
-    Ok(next.run(request).await)
-}
+    let mut resp = next.run(request).await;
+    resp.headers_mut().insert(
+        HEADER_IC_CANISTER_ID,
+        HeaderValue::from_maybe_shared(Bytes::from(canister_id.to_string())).unwrap(),
+    );
 
-/// Middlware runs before response compression phase and adds a content-length header
-/// if one is missing and exact body size is known.
-///
-/// TODO this is a temporary workaround until CompressionLayer and/or Axum is fixed:
-/// 1) Axum adds Content-Length only to the responses generated by handler, not middleware
-/// 2) CompressionLayer does not pass-through the size_hint() to the inner body even if no compression is requested
-///
-/// Without Content-Length header or exact size_hint the response is always chunked
-pub async fn pre_compression(request: Request<Body>, next: Next<Body>) -> Response {
-    let mut response = next.run(request).await;
-    if response.headers().get(CONTENT_LENGTH).is_none() {
-        if let Some(v) = response.body().size_hint().exact() {
-            response.headers_mut().insert(CONTENT_LENGTH, v.into());
-        }
-    }
-
-    response
+    Ok(resp)
 }
 
 // Middleware: preprocess the request before handing it over to handlers
 pub async fn preprocess_request(
-    canister_id: Path<String>,
-    matched_path: MatchedPath,
+    Extension(request_type): Extension<RequestType>,
     request: Request<Body>,
     next: Next<Body>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // Derive request type, status call never ends up here
-    let request_type = match matched_path.as_str() {
-        PATH_QUERY => RequestType::Query,
-        PATH_CALL => RequestType::Call,
-        PATH_READ_STATE => RequestType::ReadState,
-        _ => panic!("unknown path, should never happen"),
-    };
-
-    // Decode canister_id from URL
-    let canister_id = CanisterId::from_str(&canister_id).map_err(|err| {
-        ErrorCause::MalformedRequest(format!("Unable to decode canister_id from URL: {err}"))
-    })?;
-
     // Consume body
     let (parts, body) = request.into_parts();
     let body = read_streaming_body(body, MAX_REQUEST_BODY_SIZE).await?;
@@ -533,6 +575,30 @@ pub async fn preprocess_request(
         .map_err(|err| ErrorCause::UnableToParseCBOR(err.to_string()))?;
     let content = envelope.content;
 
+    // Check if the request is HTTP and try to parse the arg
+    let (arg, http_request) = match (&content.method_name, content.arg) {
+        (Some(method), Some(arg)) => {
+            if request_type == RequestType::Query && method == METHOD_HTTP {
+                let mut req: HttpRequest = Decode!(&arg.0, HttpRequest).map_err(|err| {
+                    ErrorCause::UnableToParseHTTPArg(format!(
+                        "unable to decode arg as HttpRequest: {err}"
+                    ))
+                })?;
+
+                // Remove specific headers
+                req.headers
+                    .retain(|x| !HEADERS_HIDE_HTTP_REQUEST.contains(&(x.0.as_str())));
+
+                // Drop the arg as it's now redundant
+                (None, Some(req))
+            } else {
+                (Some(arg), None)
+            }
+        }
+
+        (_, arg) => (arg, None),
+    };
+
     // Construct the context
     let ctx = RequestContext {
         request_type,
@@ -541,27 +607,24 @@ pub async fn preprocess_request(
         canister_id: content.canister_id,
         method_name: content.method_name,
         ingress_expiry: content.ingress_expiry,
-        arg: content.arg.map(|x| x.0),
+        arg: arg.map(|x| x.0),
         nonce: content.nonce.map(|x| x.0),
+        http_request,
     };
+
+    let ctx = Arc::new(ctx);
 
     // Reconstruct request back from parts
     let mut request = Request::from_parts(parts, Body::from(body));
 
     // Inject variables into the request
     request.extensions_mut().insert(ctx.clone());
-    request.extensions_mut().insert(canister_id);
 
     // Pass request to the next processor
     let mut response = next.run(request).await;
 
     // Inject context into the response for access by other middleware
     response.extensions_mut().insert(ctx);
-
-    // Inject canister_id if it's not there already (could be overriden by other middleware)
-    if response.extensions().get::<CanisterId>().is_none() {
-        response.extensions_mut().insert(canister_id);
-    }
 
     Ok(response)
 }
@@ -592,13 +655,23 @@ pub async fn lookup_subnet(
 pub async fn postprocess_response(request: Request<Body>, next: Next<Body>) -> impl IntoResponse {
     let mut response = next.run(request).await;
 
+    let error_cause = response
+        .extensions()
+        .get::<ErrorCause>()
+        .map(|x| x.to_string())
+        .unwrap_or("none".into());
+
     // Set the correct content-type for all replies if it's not an error
-    let error_cause = response.extensions().get::<ErrorCause>();
-    if error_cause.is_none() {
+    if error_cause == "none" && response.status().is_success() {
         response
             .headers_mut()
             .insert(CONTENT_TYPE, CONTENT_TYPE_CBOR);
     }
+
+    response.headers_mut().insert(
+        HEADER_IC_ERROR_CAUSE,
+        HeaderValue::from_maybe_shared(Bytes::from(error_cause)).unwrap(),
+    );
 
     // Add cache status if there's one
     let cache_status = response.extensions().get::<CacheStatus>().cloned();
@@ -616,7 +689,7 @@ pub async fn postprocess_response(request: Request<Body>, next: Next<Body>) -> i
         }
     }
 
-    let node = response.extensions().get::<Node>().cloned();
+    let node = response.extensions().get::<Arc<Node>>().cloned();
     if let Some(v) = node {
         // Principals and subnet type are always ASCII printable, so unwrap is safe
         response.headers_mut().insert(
@@ -635,25 +708,18 @@ pub async fn postprocess_response(request: Request<Body>, next: Next<Body>) -> i
         );
     }
 
-    if let Some(ctx) = response.extensions().get::<RequestContext>().cloned() {
+    if let Some(ctx) = response.extensions().get::<Arc<RequestContext>>().cloned() {
         response.headers_mut().insert(
             HEADER_IC_REQUEST_TYPE,
             HeaderValue::from_maybe_shared(Bytes::from(ctx.request_type.to_string())).unwrap(),
         );
 
-        // Try to get canister_id from CBOR first, then from the URL
-        ctx.canister_id
-            .or(response
-                .extensions()
-                .get::<CanisterId>()
-                .map(|x| x.get_ref().0))
-            .map(|x| x.to_string())
-            .and_then(|v| {
-                response.headers_mut().insert(
-                    HEADER_IC_CANISTER_ID,
-                    HeaderValue::from_maybe_shared(Bytes::from(v)).unwrap(),
-                )
-            });
+        ctx.canister_id.and_then(|v| {
+            response.headers_mut().insert(
+                HEADER_IC_CANISTER_ID_CBOR,
+                HeaderValue::from_maybe_shared(Bytes::from(v.to_string())).unwrap(),
+            )
+        });
 
         ctx.sender.and_then(|v| {
             response.headers_mut().insert(
@@ -662,10 +728,10 @@ pub async fn postprocess_response(request: Request<Body>, next: Next<Body>) -> i
             )
         });
 
-        ctx.method_name.and_then(|v| {
+        ctx.method_name.as_ref().and_then(|v| {
             response.headers_mut().insert(
                 HEADER_IC_METHOD_NAME,
-                HeaderValue::from_maybe_shared(Bytes::from(v)).unwrap(),
+                HeaderValue::from_maybe_shared(Bytes::from(v.clone())).unwrap(),
             )
         });
     }
@@ -725,9 +791,9 @@ pub async fn status(
 // Handler: Unified handler for query/call/read_state calls
 pub async fn handle_call(
     State(p): State<Arc<dyn Proxy>>,
-    Extension(ctx): Extension<RequestContext>,
+    Extension(ctx): Extension<Arc<RequestContext>>,
     Extension(canister_id): Extension<CanisterId>,
-    Extension(node): Extension<Node>,
+    Extension(node): Extension<Arc<Node>>,
     request: Request<Body>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Proxy the request

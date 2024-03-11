@@ -12,13 +12,15 @@ def image_deps(mode, malicious = False):
     Define all GuestOS inputs.
 
     Args:
-      mode: Variant to be built, dev, dev-sev or prod.
+      mode: Variant to be built, dev or prod.
       malicious: if True, bundle the `malicious_replica`
     Returns:
       A dict containing inputs to build this image.
     """
 
     deps = {
+        "base_dockerfile": "//ic-os/guestos:rootfs/Dockerfile.base",
+
         # Define rootfs and bootfs
         "bootfs": {
             # base layer
@@ -30,6 +32,7 @@ def image_deps(mode, malicious = False):
 
             # additional files to install
             "//publish/binaries:canister_sandbox": "/opt/ic/bin/canister_sandbox:0755",
+            "//publish/binaries:compiler_sandbox": "/opt/ic/bin/compiler_sandbox:0755",
             "//publish/binaries:guestos_tool": "/opt/ic/bin/guestos_tool:0755",
             "//publish/binaries:ic-btc-adapter": "/opt/ic/bin/ic-btc-adapter:0755",
             "//publish/binaries:ic-consensus-pool-util": "/opt/ic/bin/ic-consensus-pool-util:0755",
@@ -38,12 +41,17 @@ def image_deps(mode, malicious = False):
             "//publish/binaries:ic-regedit": "/opt/ic/bin/ic-regedit:0755",
             "//publish/binaries:ic-recovery": "/opt/ic/bin/ic-recovery:0755",
             "//publish/binaries:orchestrator": "/opt/ic/bin/orchestrator:0755",
+            "//publish/binaries:ic-boundary-tls": "/opt/ic/bin/ic-boundary:0755",
             ("//publish/malicious:replica" if malicious else "//publish/binaries:replica"): "/opt/ic/bin/replica:0755",  # Install the malicious replica if set
+            "//publish/binaries:metrics-proxy": "/opt/ic/bin/metrics-proxy:0755",
             "//publish/binaries:sandbox_launcher": "/opt/ic/bin/sandbox_launcher:0755",
             "//publish/binaries:state-tool": "/opt/ic/bin/state-tool:0755",
             "//publish/binaries:vsock_guest": "/opt/ic/bin/vsock_guest:0755",
             "//ic-os/utils:infogetty": "/opt/ic/bin/infogetty:0755",
             "//ic-os/utils:prestorecon": "/opt/ic/bin/prestorecon:0755",
+
+            # additional libraries to install
+            "//publish/binaries:nss_icos": "/usr/lib/x86_64-linux-gnu/libnss_icos.so.2:0644",
         },
 
         # Set various configuration values
@@ -69,11 +77,16 @@ def image_deps(mode, malicious = False):
         "dev": {
             "build_container_filesystem_config_file": "//ic-os/guestos/envs/dev:build_container_filesystem_config.txt",
         },
+        "local-base-dev": {
+            # Use the non-local-base file
+            "build_container_filesystem_config_file": "//ic-os/guestos/envs/dev:build_container_filesystem_config.txt",
+        },
         "dev-malicious": {
             "build_container_filesystem_config_file": "//ic-os/guestos/envs/dev-malicious:build_container_filesystem_config.txt",
         },
-        "dev-sev": {
-            "build_container_filesystem_config_file": "//ic-os/guestos/envs/dev-sev:build_container_filesystem_config.txt",
+        "local-base-prod": {
+            # Use the non-local-base file
+            "build_container_filesystem_config_file": "//ic-os/guestos/envs/prod:build_container_filesystem_config.txt",
         },
         "prod": {
             "build_container_filesystem_config_file": "//ic-os/guestos/envs/prod:build_container_filesystem_config.txt",
@@ -87,7 +100,7 @@ def image_deps(mode, malicious = False):
         "dev": {
             "//ic-os/guestos:rootfs/allow_console_root": "/etc/allow_console_root:0644",
         },
-        "dev-sev": {
+        "local-base-dev": {
             "//ic-os/guestos:rootfs/allow_console_root": "/etc/allow_console_root:0644",
         },
     }

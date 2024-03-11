@@ -1,42 +1,4 @@
 ---
-".after-script-test":
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
-  needs: []
-  rules:
-    - changes:
-        - gitlab-ci/src/after_script/**/*
-        - gitlab-ci/config/**/*
-      if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\bhotfix\b/i
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
-    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
-  script:
-    - |
-      set -eExuo pipefail
-
-      cd "${CI_PROJECT_DIR}"
-
-      shellcheck -x gitlab-ci/src/after_script/*.sh
-
-      buildevents cmd "$CI_PIPELINE_ID" "$CI_JOB_ID" "$CI_JOB_NAME" -- "${CI_PROJECT_DIR}"/gitlab-ci/src/after_script/after_script.sh
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
 ".bazel-test-all":
   after_script:
     - |
@@ -71,17 +33,12 @@
         # Finish and collapse the after_script section
         echo -e "\e[0Ksection_end:$(date +%s):after_script\r\e[0K"
   artifacts:
-    expire_in: 3 days
     paths:
       - bazel-build-log*.json*
       - bazel-bep.pb
     reports:
       junit: bazel-testlogs-gitlab/**/test.xml
     when: always
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"
@@ -104,22 +61,13 @@
     BAZEL_COMMAND: test
     BAZEL_STARTUP_ARGS: "--output_base=/var/tmp/bazel-output/"
     BAZEL_TARGETS: "//..."
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     RUSTFLAGS: "--remap-path-prefix=${CI_PROJECT_DIR}=/ic"
 ".benchmark-spot-test":
   artifacts:
-    expire_in: 3 days
     paths:
       - "$CI_JOB_STAGE/$CI_JOB_NAME"
     when: always
   dependencies: []
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -127,17 +75,11 @@
       when: manual
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "BENCHMARK_NIGHTLY"
       when: always
-  tags:
-    - dfinity-ic
   timeout: 1 hour
   variables:
     CD_ENV: BENCHMARK_NIGHTLY
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdrc02
@@ -145,15 +87,10 @@
     cd_target_env: BENCHMARK_NIGHTLY
 ".benchmark-test":
   artifacts:
-    expire_in: 3 days
     paths:
       - "$CI_JOB_STAGE/$CI_JOB_NAME"
     when: always
   dependencies: []
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -161,16 +98,10 @@
       when: manual
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "BENCHMARK_SUITE"
       when: always
-  tags:
-    - dfinity-ic
   timeout: 3 hours
   variables:
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdslo
@@ -193,15 +124,10 @@
   fi
 ".build-base-image-job":
   artifacts:
-    expire_in: 3 days
     paths:
       - digestfile*
-    when: always
   extends:
-    - ".build-k8s"
     - ".rules-build-base-images"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "build-push-base-images"
@@ -211,7 +137,6 @@
     - changes:
         - gitlab-ci/config/base-images-build.yml
         - ic-os/boundary-guestos/rootfs/Dockerfile.base
-        - ic-os/boundary-api-guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/packages.common
         - ic-os/guestos/rootfs/packages.dev
@@ -240,24 +165,12 @@
           echo "$REF_FILE" >> "digestfile-${IMAGE}"
           rm -f digestfile
       fi
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
 ".build-ic":
   artifacts:
-    expire_in: 3 days
     paths:
       - bazel-build-log*.json*
     reports:
       dotenv: nns.release.env
-  extends:
-    - ".ic-build-image"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   script:
     - |
@@ -280,29 +193,56 @@
 
       if [ "$CI_COMMIT_REF_PROTECTED" == "true" ]; then
           gitlab-ci/container/build-ic.sh -i -c -b
+      elif [ "${RUN_ON_DIFF_ONLY:-}" == "true" ] \
+          && [ "${CI_PIPELINE_SOURCE:-}" == "merge_request_event" ] \
+          && [ "${CI_MERGE_REQUEST_EVENT_TYPE:-}" != "merge_train" ] \
+          && [[ "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-}" != "rc--"* ]]; then
+
+          TARGETS=$(gitlab-ci/src/bazel-ci/diff.sh)
+          ARGS=(--no-release)
+
+          if [ "$TARGETS" == "//..." ]; then
+              ARGS+=(-i -c -b)
+          else
+              if grep -q "ic-os" <<<"$TARGETS"; then
+                  ARGS+=(-i)
+              fi
+              if grep -q "publish/canisters" <<<"$TARGETS"; then
+                  ARGS+=(-c)
+              fi
+              if grep -q "publish/binaries" <<<"$TARGETS"; then
+                  ARGS+=(-b)
+              fi
+          fi
+
+          if [ ${#ARGS[@]} -eq 1 ]; then
+              echo "No changes that require building IC-OS, binaries or canisters."
+              exit 0
+          fi
+          gitlab-ci/container/build-ic.sh "${ARGS[@]}"
       else
           gitlab-ci/container/build-ic.sh -i -c -b --no-release
       fi
 
       # release binaries
-      buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
+      [ -d artifacts/release ] && buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
           gitlab-ci/src/artifacts/rclone_upload.py --version="${VERSION}" \
           "artifacts/release" "${CI_JOB_NAME}/release"
       # canister binaries
-      buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
+      [ -d artifacts/canisters ] && buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
           gitlab-ci/src/artifacts/rclone_upload.py --version="${VERSION}" \
           "artifacts/canisters" "${CI_JOB_NAME}/canisters"
 
       # guestos images
-      buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
+      [ -d artifacts/icos/guestos ] && buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
           gitlab-ci/src/artifacts/rclone_upload.py --version="${VERSION}" \
           "artifacts/icos/guestos" "${CI_JOB_NAME}/guest-os"
       # hostos images
-      buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
+      [ -d artifacts/icos/hostos ] && buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
           gitlab-ci/src/artifacts/rclone_upload.py --version="${VERSION}" \
           "artifacts/icos/hostos" "${CI_JOB_NAME}/host-os"
       # setupos images
-      buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
+      [ -d artifacts/icos/setupos ] && buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
           gitlab-ci/src/artifacts/rclone_upload.py --version="${VERSION}" \
           "artifacts/icos/setupos" "${CI_JOB_NAME}/setup-os"
 
@@ -313,57 +253,6 @@
       if [ -f /tmp/nns.release.env ]; then
           mv /tmp/nns.release.env .
       fi
-  tags:
-    - dfinity-ic
-  variables:
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-".build-k8s":
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
-  extends:
-    - ".ic-build-image"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
-".build-k8s-legacy":
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build-legacy:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
-".ic-build-image":
-  artifacts:
-    expire_in: 3 days
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
-  tags:
-    - dfinity-ic
-  variables:
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
 ".rules-build-base-images":
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "build-push-base-images"
@@ -373,7 +262,6 @@
     - changes:
         - gitlab-ci/config/base-images-build.yml
         - ic-os/boundary-guestos/rootfs/Dockerfile.base
-        - ic-os/boundary-api-guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/packages.common
         - ic-os/guestos/rootfs/packages.dev
@@ -389,9 +277,31 @@
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
     - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
+".rules-master-pipeline-and-merge-request-rust-changed":
+  rules:
+    - changes:
+        - "**/*.rs"
+        - "**/*.toml"
+        - "**/*.lock"
+      if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
 ".rules-master-pipeline-no-merge-train":
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
+".rules-master-pipeline-no-merge-train-rust-bazel-changed":
+  rules:
+    - changes:
+        - ".bazelrc"
+        - ".bazelversion"
+        - "**/*.bazel"
+        - "**/*.bzl"
+        - "**/*.lock"
+        - "**/*.rs"
+        - "**/*.toml"
+      if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
     - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
 ".rules-post-master":
@@ -413,28 +323,14 @@
     - allow_failure: true
       if: $CI_PIPELINE_SOURCE == "trigger"
       when: manual
-after-script-test-ic-build-image:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
-  extends:
-    - ".after-script-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
+after-script-test:
   needs: []
   rules:
     - changes:
-        - gitlab-ci/src/after_script/**/*
-        - gitlab-ci/config/**/*
-      if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\bhotfix\b/i
+        - gitlab-ci/src/after_script/*
+        - gitlab-ci/config/*
+      if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
-    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
   script:
     - |
       set -eExuo pipefail
@@ -444,52 +340,6 @@ after-script-test-ic-build-image:
       shellcheck -x gitlab-ci/src/after_script/*.sh
 
       buildevents cmd "$CI_PIPELINE_ID" "$CI_JOB_ID" "$CI_JOB_NAME" -- "${CI_PROJECT_DIR}"/gitlab-ci/src/after_script/after_script.sh
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
-after-script-test-ic-build-legacy-image:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
-  extends:
-    - ".after-script-test"
-    - ".build-k8s-legacy"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build-legacy:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
-  needs: []
-  rules:
-    - changes:
-        - gitlab-ci/src/after_script/**/*
-        - gitlab-ci/config/**/*
-      if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\bhotfix\b/i
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
-    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
-  script:
-    - |
-      set -eExuo pipefail
-
-      cd "${CI_PROJECT_DIR}"
-
-      shellcheck -x gitlab-ci/src/after_script/*.sh
-
-      buildevents cmd "$CI_PIPELINE_ID" "$CI_JOB_ID" "$CI_JOB_NAME" -- "${CI_PROJECT_DIR}"/gitlab-ci/src/after_script/after_script.sh
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
 after_script:
   - |
     # Start the after_script section
@@ -537,7 +387,6 @@ bazel-build-fuzzers:
         # Finish and collapse the after_script section
         echo -e "\e[0Ksection_end:$(date +%s):after_script\r\e[0K"
   artifacts:
-    expire_in: 3 days
     paths:
       - bazel-build-log*.json*
       - bazel-bep.pb
@@ -547,8 +396,6 @@ bazel-build-fuzzers:
     when: always
   extends:
     - ".bazel-test-all"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"
@@ -572,10 +419,6 @@ bazel-build-fuzzers:
     BAZEL_EXTRA_ARGS: "--keep_going --config=fuzzing --build_tag_filters=libfuzzer"
     BAZEL_STARTUP_ARGS: "--output_base=/var/tmp/bazel-output/"
     BAZEL_TARGETS: "//rs/..."
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     RUSTFLAGS: "--remap-path-prefix=${CI_PROJECT_DIR}=/ic"
 bazel-build-fuzzers-afl:
   after_script:
@@ -611,7 +454,6 @@ bazel-build-fuzzers-afl:
         # Finish and collapse the after_script section
         echo -e "\e[0Ksection_end:$(date +%s):after_script\r\e[0K"
   artifacts:
-    expire_in: 3 days
     paths:
       - bazel-build-log*.json*
       - bazel-bep.pb
@@ -621,8 +463,6 @@ bazel-build-fuzzers-afl:
     when: always
   extends:
     - ".bazel-test-all"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"
@@ -646,10 +486,6 @@ bazel-build-fuzzers-afl:
     BAZEL_EXTRA_ARGS: "--keep_going --config=afl"
     BAZEL_STARTUP_ARGS: "--output_base=/var/tmp/bazel-output/"
     BAZEL_TARGETS: "//rs/..."
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     RUSTFLAGS: "--remap-path-prefix=${CI_PROJECT_DIR}=/ic"
 bazel-build-fuzzers-archives:
   after_script:
@@ -685,7 +521,6 @@ bazel-build-fuzzers-archives:
         # Finish and collapse the after_script section
         echo -e "\e[0Ksection_end:$(date +%s):after_script\r\e[0K"
   artifacts:
-    expire_in: 3 days
     paths:
       - bazel-build-log*.json*
       - bazel-bep.pb
@@ -695,12 +530,9 @@ bazel-build-fuzzers-archives:
     when: always
   extends:
     - ".bazel-test-all"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - changes:
-        - gitlab-ci/config/main.yml
         - bin/build-all-fuzzers.sh
         - bazel/fuzz_testing.bzl
       if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -717,10 +549,6 @@ bazel-build-fuzzers-archives:
     BAZEL_COMMAND: test
     BAZEL_STARTUP_ARGS: "--output_base=/var/tmp/bazel-output/"
     BAZEL_TARGETS: "//..."
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     RUSTFLAGS: "--remap-path-prefix=${CI_PROJECT_DIR}=/ic"
 bazel-build-fuzzers-weekly:
   after_script:
@@ -756,7 +584,6 @@ bazel-build-fuzzers-weekly:
         # Finish and collapse the after_script section
         echo -e "\e[0Ksection_end:$(date +%s):after_script\r\e[0K"
   artifacts:
-    expire_in: 3 days
     paths:
       - bazel-build-log*.json*
       - bazel-bep.pb
@@ -766,8 +593,6 @@ bazel-build-fuzzers-weekly:
     when: always
   extends:
     - ".bazel-test-all"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "build-fuzzers-to-clusterfuzz"
@@ -788,10 +613,6 @@ bazel-build-fuzzers-weekly:
     BAZEL_COMMAND: test
     BAZEL_STARTUP_ARGS: "--output_base=/var/tmp/bazel-output/"
     BAZEL_TARGETS: "//..."
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     RUSTFLAGS: "--remap-path-prefix=${CI_PROJECT_DIR}=/ic"
 bazel-config-check-all-rebuild:
   after_script:
@@ -827,7 +648,6 @@ bazel-config-check-all-rebuild:
         # Finish and collapse the after_script section
         echo -e "\e[0Ksection_end:$(date +%s):after_script\r\e[0K"
   artifacts:
-    expire_in: 3 days
     paths:
       - bazel-build-log*.json*
       - bazel-bep.pb
@@ -837,20 +657,20 @@ bazel-config-check-all-rebuild:
     when: always
   extends:
     - ".bazel-test-all"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"
-      variables:
-        BAZEL_EXTRA_ARGS_RULES: "--test_timeout_filters=short,moderate --flaky_test_attempts=3"
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\bhotfix\b/i
-      variables:
-        BAZEL_EXTRA_ARGS_RULES: "--test_timeout_filters=short,moderate"
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "tnet-test"
-    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"
+    - - changes:
+          - ".bazelrc"
+          - ".bazelversion"
+          - "**/*.bazel"
+          - "**/*.bzl"
+          - "**/*.lock"
+          - "**/*.rs"
+          - "**/*.toml"
+        if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+      - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
+      - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
   script:
     - "./gitlab-ci/src/bazel-ci/main.sh"
   tags:
@@ -862,10 +682,6 @@ bazel-config-check-all-rebuild:
     BAZEL_EXTRA_ARGS: "--keep_going --config=check"
     BAZEL_STARTUP_ARGS: "--output_base=/var/tmp/bazel-output/"
     BAZEL_TARGETS: "//rs/..."
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     RUSTFLAGS: "--remap-path-prefix=${CI_PROJECT_DIR}=/ic"
 bazel-system-test-hotfix:
   after_script:
@@ -901,7 +717,6 @@ bazel-system-test-hotfix:
         # Finish and collapse the after_script section
         echo -e "\e[0Ksection_end:$(date +%s):after_script\r\e[0K"
   artifacts:
-    expire_in: 3 days
     paths:
       - bazel-build-log*.json*
       - bazel-bep.pb
@@ -911,8 +726,6 @@ bazel-system-test-hotfix:
     when: always
   extends:
     - ".bazel-test-all"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: "$CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/"
@@ -937,10 +750,69 @@ bazel-system-test-hotfix:
     BAZEL_EXTRA_ARGS: "--test_tag_filters=system_test_hotfix"
     BAZEL_STARTUP_ARGS: "--output_base=/var/tmp/bazel-output/"
     BAZEL_TARGETS: "//..."
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
+    RUSTFLAGS: "--remap-path-prefix=${CI_PROJECT_DIR}=/ic"
+bazel-system-test-hourly:
+  after_script:
+    - |
+      set +e # Do not fail in the after_script, try to do as much as possible instead.
+      echo -e "\033[0;31m"
+      echo -e "************************************************************************"
+      echo -e "*** NEED BAZEL HELP? See #project-bazel and                          ***"
+      echo -e "***  https://github.com/dfinity/ic/blob/master/bazel/README.md       ***"
+      echo -e "*** (NEW) To regenerate Cargo Bazel lockfiles run ./bin/bazel-pin.sh ***"
+      echo -e "************************************************************************"
+      echo -e "\033[0m"
+    - cp -R "$(realpath bazel-testlogs)" bazel-testlogs-gitlab
+    - gzip bazel-build-log*.json
+    - |
+      echo -e "\e[0Ksection_start:$(date +%s):bazel_exporter_logs[collapsed=true]\r\e[0KClick to see Bazel exporter logs"
+      bazel run //bazel/exporter:exporter --build_event_binary_file= -- -f "$(pwd)/bazel-bep.pb"
+      echo -e "\e[0Ksection_end:$(date +%s):bazel_exporter_logs\r\e[0K"
+    - |
+      if [ "$(uname)" == "Linux" ]; then
+          bazel clean --expunge
+      fi
+    - - |
+        # Start the after_script section
+        echo -e "\e[0Ksection_start:$(date +%s):after_script[collapsed=true]\r\e[0KClick here to see the after_script section. It does not affect the job success status"
+
+        # Export all the environmental variables so that the GITLAB configured variables are available to after_script.sh
+        export ROOT_PIPELINE_ID=${PARENT_PIPELINE_ID:-$CI_PIPELINE_ID}
+        buildevents cmd "$ROOT_PIPELINE_ID" "$CI_JOB_ID" after-script -- "${CI_PROJECT_DIR}"/gitlab-ci/src/after_script/after_script.sh
+
+        rm -rf "${CI_PROJECT_DIR}/target"
+
+        # Finish and collapse the after_script section
+        echo -e "\e[0Ksection_end:$(date +%s):after_script\r\e[0K"
+  artifacts:
+    paths:
+      - bazel-build-log*.json*
+      - bazel-bep.pb
+    reports:
+      junit:
+        - bazel-testlogs-gitlab/**/test.xml
+    when: always
+  extends:
+    - ".bazel-test-all"
+    - ".rules-post-master"
+  needs: []
+  rules:
+    - allow_failure: true
+      if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+      when: manual
+    - if: $SCHEDULE_NAME == "run-all-master"
+  script:
+    - "./gitlab-ci/src/bazel-ci/main.sh"
+  tags:
+    - dfinity-ic
+    - bazel
+  timeout: 120 minutes
+  variables:
+    BAZEL_CI_CONFIG: "--config=ci --repository_cache=/cache/bazel"
+    BAZEL_COMMAND: test
+    BAZEL_EXTRA_ARGS: "--test_tag_filters=system_test_hourly"
+    BAZEL_STARTUP_ARGS: "--output_base=/var/tmp/bazel-output/"
+    BAZEL_TARGETS: "//..."
     RUSTFLAGS: "--remap-path-prefix=${CI_PROJECT_DIR}=/ic"
 bazel-system-test-nightly:
   after_script:
@@ -976,7 +848,6 @@ bazel-system-test-nightly:
         # Finish and collapse the after_script section
         echo -e "\e[0Ksection_end:$(date +%s):after_script\r\e[0K"
   artifacts:
-    expire_in: 3 days
     paths:
       - bazel-build-log*.json*
       - bazel-bep.pb
@@ -987,8 +858,6 @@ bazel-system-test-nightly:
   extends:
     - ".bazel-test-all"
     - ".rules-rollout-pipeline-auto"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - allow_failure: true
@@ -1014,10 +883,6 @@ bazel-system-test-nightly:
     BAZEL_EXTRA_ARGS: "--test_tag_filters=system_test_nightly"
     BAZEL_STARTUP_ARGS: "--output_base=/var/tmp/bazel-output/"
     BAZEL_TARGETS: "//..."
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     RUSTFLAGS: "--remap-path-prefix=${CI_PROJECT_DIR}=/ic"
 bazel-system-test-nightly-nns:
   after_script:
@@ -1053,7 +918,6 @@ bazel-system-test-nightly-nns:
         # Finish and collapse the after_script section
         echo -e "\e[0Ksection_end:$(date +%s):after_script\r\e[0K"
   artifacts:
-    expire_in: 3 days
     paths:
       - bazel-build-log*.json*
       - bazel-bep.pb
@@ -1063,8 +927,6 @@ bazel-system-test-nightly-nns:
     when: always
   extends:
     - ".bazel-test-all"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - allow_failure: true
@@ -1083,10 +945,6 @@ bazel-system-test-nightly-nns:
     BAZEL_EXTRA_ARGS: "--test_tag_filters=system_test_nightly_nns"
     BAZEL_STARTUP_ARGS: "--output_base=/var/tmp/bazel-output/"
     BAZEL_TARGETS: "//..."
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     RUSTFLAGS: "--remap-path-prefix=${CI_PROJECT_DIR}=/ic"
 bazel-system-test-staging:
   after_script:
@@ -1123,7 +981,6 @@ bazel-system-test-staging:
         echo -e "\e[0Ksection_end:$(date +%s):after_script\r\e[0K"
   allow_failure: true
   artifacts:
-    expire_in: 3 days
     paths:
       - bazel-build-log*.json*
       - bazel-bep.pb
@@ -1134,8 +991,6 @@ bazel-system-test-staging:
   extends:
     - ".bazel-test-all"
     - ".rules-rollout-pipeline-auto"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - allow_failure: true
@@ -1160,11 +1015,73 @@ bazel-system-test-staging:
     BAZEL_EXTRA_ARGS: "--test_tag_filters=system_test_staging"
     BAZEL_STARTUP_ARGS: "--output_base=/var/tmp/bazel-output/"
     BAZEL_TARGETS: "//..."
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     RUSTFLAGS: "--remap-path-prefix=${CI_PROJECT_DIR}=/ic"
+bazel-system-tests-k8s:
+  after_script:
+    - |
+      set +e # Do not fail in the after_script, try to do as much as possible instead.
+      echo -e "\033[0;31m"
+      echo -e "************************************************************************"
+      echo -e "*** NEED BAZEL HELP? See #project-bazel and                          ***"
+      echo -e "***  https://github.com/dfinity/ic/blob/master/bazel/README.md       ***"
+      echo -e "*** (NEW) To regenerate Cargo Bazel lockfiles run ./bin/bazel-pin.sh ***"
+      echo -e "************************************************************************"
+      echo -e "\033[0m"
+    - cp -R "$(realpath bazel-testlogs)" bazel-testlogs-gitlab
+    - gzip bazel-build-log*.json
+    - |
+      echo -e "\e[0Ksection_start:$(date +%s):bazel_exporter_logs[collapsed=true]\r\e[0KClick to see Bazel exporter logs"
+      bazel run //bazel/exporter:exporter --build_event_binary_file= -- -f "$(pwd)/bazel-bep.pb"
+      echo -e "\e[0Ksection_end:$(date +%s):bazel_exporter_logs\r\e[0K"
+    - |
+      if [ "$(uname)" == "Linux" ]; then
+          bazel clean --expunge
+      fi
+    - - |
+        # Start the after_script section
+        echo -e "\e[0Ksection_start:$(date +%s):after_script[collapsed=true]\r\e[0KClick here to see the after_script section. It does not affect the job success status"
+
+        # Export all the environmental variables so that the GITLAB configured variables are available to after_script.sh
+        export ROOT_PIPELINE_ID=${PARENT_PIPELINE_ID:-$CI_PIPELINE_ID}
+        buildevents cmd "$ROOT_PIPELINE_ID" "$CI_JOB_ID" after-script -- "${CI_PROJECT_DIR}"/gitlab-ci/src/after_script/after_script.sh
+
+        rm -rf "${CI_PROJECT_DIR}/target"
+
+        # Finish and collapse the after_script section
+        echo -e "\e[0Ksection_end:$(date +%s):after_script\r\e[0K"
+  artifacts:
+    paths:
+      - bazel-build-log*.json*
+      - bazel-bep.pb
+    reports:
+      junit:
+        - bazel-testlogs-gitlab/**/test.xml
+    when: always
+  extends:
+    - ".bazel-test-all"
+  needs: []
+  rules:
+    - allow_failure: true
+      if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+      when: manual
+    - allow_failure: true
+      if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
+      when: manual
+  script:
+    - "./gitlab-ci/src/bazel-ci/main.sh"
+  tags:
+    - dfinity-ic
+    - sf
+  timeout: 150 minutes
+  variables:
+    BAZEL_CI_CONFIG: "--config=ci --repository_cache=/cache/bazel"
+    BAZEL_COMMAND: test
+    BAZEL_EXTRA_ARGS: "--repository_cache=/cache/bazel $BAZEL_EXTRA_ARGS_RULES --jobs=5 --test_tag_filters=k8s,-manual --k8s"
+    BAZEL_STARTUP_ARGS: "--output_base=/var/tmp/bazel-output/"
+    BAZEL_TARGETS: "//..."
+    KUBECONFIG: "$KUBECONFIG_TNET_CREATOR"
+    RUSTFLAGS: "--remap-path-prefix=${CI_PROJECT_DIR}=/ic"
+    RUST_LOG: info
 bazel-test-all:
   after_script:
     - |
@@ -1199,18 +1116,16 @@ bazel-test-all:
         # Finish and collapse the after_script section
         echo -e "\e[0Ksection_end:$(date +%s):after_script\r\e[0K"
   artifacts:
-    expire_in: 3 days
     paths:
-      - bazel-build-log*.json*
+      - bazel-build-log*.json.gz
       - bazel-bep.pb
+      - bazel-targets
     reports:
       junit:
         - bazel-testlogs-gitlab/**/test.xml
     when: always
   extends:
     - ".bazel-test-all"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"
@@ -1236,10 +1151,7 @@ bazel-test-all:
     BAZEL_EXTRA_ARGS: "--keep_going $BAZEL_EXTRA_ARGS_RULES"
     BAZEL_STARTUP_ARGS: "--output_base=/var/tmp/bazel-output/"
     BAZEL_TARGETS: "//..."
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
+    RUN_ON_DIFF_ONLY: 'true'
     RUSTFLAGS: "--remap-path-prefix=${CI_PROJECT_DIR}=/ic"
 bazel-test-all-rebuild:
   after_script:
@@ -1275,7 +1187,6 @@ bazel-test-all-rebuild:
         # Finish and collapse the after_script section
         echo -e "\e[0Ksection_end:$(date +%s):after_script\r\e[0K"
   artifacts:
-    expire_in: 3 days
     paths:
       - bazel-build-log*.json*
       - bazel-bep.pb
@@ -1286,8 +1197,6 @@ bazel-test-all-rebuild:
   extends:
     - ".bazel-test-all"
     - ".rules-post-master"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - allow_failure: true
@@ -1306,10 +1215,77 @@ bazel-test-all-rebuild:
     BAZEL_EXTRA_ARGS: "--repository_cache= --disk_cache= --noremote_accept_cached --remote_instance_name=${CI_COMMIT_SHA} --@rules_rust//rust/settings:pipelined_compilation=True"
     BAZEL_STARTUP_ARGS: "--output_base=/var/tmp/bazel-output/"
     BAZEL_TARGETS: "//..."
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
+    RUSTFLAGS: "--remap-path-prefix=${CI_PROJECT_DIR}=/ic"
+bazel-test-bare-metal:
+  after_script:
+    - |
+      set +e # Do not fail in the after_script, try to do as much as possible instead.
+      echo -e "\033[0;31m"
+      echo -e "************************************************************************"
+      echo -e "*** NEED BAZEL HELP? See #project-bazel and                          ***"
+      echo -e "***  https://github.com/dfinity/ic/blob/master/bazel/README.md       ***"
+      echo -e "*** (NEW) To regenerate Cargo Bazel lockfiles run ./bin/bazel-pin.sh ***"
+      echo -e "************************************************************************"
+      echo -e "\033[0m"
+    - cp -R "$(realpath bazel-testlogs)" bazel-testlogs-gitlab
+    - gzip bazel-build-log*.json
+    - |
+      echo -e "\e[0Ksection_start:$(date +%s):bazel_exporter_logs[collapsed=true]\r\e[0KClick to see Bazel exporter logs"
+      bazel run //bazel/exporter:exporter --build_event_binary_file= -- -f "$(pwd)/bazel-bep.pb"
+      echo -e "\e[0Ksection_end:$(date +%s):bazel_exporter_logs\r\e[0K"
+    - |
+      if [ "$(uname)" == "Linux" ]; then
+          bazel clean --expunge
+      fi
+    - - |
+        # Start the after_script section
+        echo -e "\e[0Ksection_start:$(date +%s):after_script[collapsed=true]\r\e[0KClick here to see the after_script section. It does not affect the job success status"
+
+        # Export all the environmental variables so that the GITLAB configured variables are available to after_script.sh
+        export ROOT_PIPELINE_ID=${PARENT_PIPELINE_ID:-$CI_PIPELINE_ID}
+        buildevents cmd "$ROOT_PIPELINE_ID" "$CI_JOB_ID" after-script -- "${CI_PROJECT_DIR}"/gitlab-ci/src/after_script/after_script.sh
+
+        rm -rf "${CI_PROJECT_DIR}/target"
+
+        # Finish and collapse the after_script section
+        echo -e "\e[0Ksection_end:$(date +%s):after_script\r\e[0K"
+  artifacts:
+    paths:
+      - bazel-build-log*.json*
+      - bazel-bep.pb
+    reports:
+      junit:
+        - bazel-testlogs-gitlab/**/test.xml
+    when: always
+  extends:
+    - ".bazel-test-all"
+  needs: []
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "setupos-bare-metal-smoke-test"
+  script:
+    - |
+      bazel run //ic-os/setupos/envs/dev:launch_bare_metal -- \
+      --config_path "$(realpath  ./ic-os/utils/bare_metal_deployment/zh2-dll01.yaml)" \
+      --csv_filename "$(realpath "$ZH2_DLL01_CSV_SECRETS_PATH")" \
+      --file_share_ssh_key "$(realpath "$ZH2_FILE_SHARE_KEY_PATH")" \
+      --file_share_username ci_interim \
+      --ci_mode
+
+      bazel run //ic-os/setupos/envs/prod:launch_bare_metal -- \
+      --config_path "$(realpath  ./ic-os/utils/bare_metal_deployment/zh2-dll01.yaml)" \
+      --csv_filename "$(realpath "$ZH2_DLL01_CSV_SECRETS_PATH")" \
+      --file_share_ssh_key "$(realpath "$ZH2_FILE_SHARE_KEY_PATH")" \
+      --file_share_username ci_interim \
+      --ci_mode
+  tags:
+    - dfinity-ic
+    - bazel
+    - zh
+  variables:
+    BAZEL_CI_CONFIG: "--config=ci --repository_cache=/cache/bazel"
+    BAZEL_COMMAND: test
+    BAZEL_STARTUP_ARGS: "--output_base=/var/tmp/bazel-output/"
+    BAZEL_TARGETS: "//..."
     RUSTFLAGS: "--remap-path-prefix=${CI_PROJECT_DIR}=/ic"
 bazel-test-coverage:
   after_script:
@@ -1327,8 +1303,6 @@ bazel-test-coverage:
   extends:
     - ".bazel-test-all"
     - ".rules-post-master"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - allow_failure: true
@@ -1354,10 +1328,6 @@ bazel-test-coverage:
     BAZEL_EXTRA_ARGS: "--combined_report=lcov"
     BAZEL_STARTUP_ARGS: "--output_base=/var/tmp/bazel-output/"
     BAZEL_TARGETS: "//..."
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     RUSTFLAGS: "--remap-path-prefix=${CI_PROJECT_DIR}=/ic"
 bazel-test-macos:
   after_script:
@@ -1393,7 +1363,6 @@ bazel-test-macos:
         # Finish and collapse the after_script section
         echo -e "\e[0Ksection_end:$(date +%s):after_script\r\e[0K"
   artifacts:
-    expire_in: 3 days
     paths:
       - bazel-build-log*.json*
       - bazel-bep.pb
@@ -1403,16 +1372,22 @@ bazel-test-macos:
     when: always
   extends:
     - ".bazel-test-all"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train" && $CI_MERGE_REQUEST_TITLE =~ /\bhotfix\b/i
       variables:
         BAZEL_EXTRA_ARGS_RULES: "--test_timeout_filters=short,moderate"
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
-    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
+    - - changes:
+          - ".bazelrc"
+          - ".bazelversion"
+          - "**/*.bazel"
+          - "**/*.bzl"
+          - "**/*.lock"
+          - "**/*.rs"
+          - "**/*.toml"
+        if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+      - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
+      - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
   script:
     - "./gitlab-ci/src/bazel-ci/main.sh"
   tags:
@@ -1424,10 +1399,6 @@ bazel-test-macos:
     BAZEL_EXTRA_ARGS: "--test_tag_filters=test_macos"
     BAZEL_STARTUP_ARGS: "--output_base /var/tmp/bazel-output//${CI_CONCURRENT_ID}"
     BAZEL_TARGETS: "//rs/... //publish/binaries/..."
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     RUSTFLAGS: "--remap-path-prefix=${CI_PROJECT_DIR}=/ic"
 before_script:
   - |
@@ -1471,14 +1442,11 @@ before_script:
   - echo -e "\e[0Ksection_end:$(date +%s):before_script\r\e[0K"
 benchmark-response-payload:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -1506,29 +1474,20 @@ benchmark-response-payload:
       cd -
 
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "scalability/results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
-  tags:
-    - dfinity-ic
   timeout: 3 hours
   variables:
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdslo
 benchmark-xnet:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -1556,16 +1515,10 @@ benchmark-xnet:
       cd -
 
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "scalability/results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
-  tags:
-    - dfinity-ic
   timeout: 6 hours
   variables:
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdslo
@@ -1603,7 +1556,6 @@ benchmarks:
         # Finish and collapse the after_script section
         echo -e "\e[0Ksection_end:$(date +%s):after_script\r\e[0K"
   artifacts:
-    expire_in: 3 days
     paths:
       - report
     reports:
@@ -1612,8 +1564,6 @@ benchmarks:
     when: always
   extends:
     - ".bazel-test-all"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   parallel:
     matrix:
@@ -1659,123 +1609,29 @@ benchmarks:
     BAZEL_COMMAND: run
     BAZEL_STARTUP_ARGS: "--output_base=/var/tmp/bazel-output/"
     BAZEL_TARGETS: "//..."
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     RUSTFLAGS: "--remap-path-prefix=${CI_PROJECT_DIR}=/ic"
     RUST_BACKTRACE: full
-boundary-node-service-worker:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - typescript/service-worker/artifacts
-    reports:
-      junit:
-        - typescript/service-worker/junit.xml
-    when: always
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
-  needs: []
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
-    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
-    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^service-worker_v([0-9\.]+)$/
-    - if: $CI_PARENT_PIPELINE_SOURCE == "trigger"
-  script:
-    - |
-      set -eExuo pipefail
-      # shellcheck disable=SC1090
-      source "$NVM_DIR/nvm.sh"
-
-      (
-        cd typescript/service-worker
-
-        nvm use
-        node --version
-        npm --version
-
-        npm ci
-
-        # perform linting
-        npm run lint
-        npm run format:check
-
-        # run unit tests
-        npm test
-
-        # run e2e tests
-        ./e2e/e2e --add-dependencies --start --run-tests --stop
-
-        # build service worker
-        npm run build
-        npm run build-dev
-
-        # prepase release artifact
-        npm pack
-        mkdir artifacts
-        mv dfinity-service-worker-*.tgz artifacts
-        cd artifacts
-        sha256sum dfinity-service-worker-*.tgz > SHA256SUMS
-      )
-
-      pip3 install --ignore-installed -r requirements.txt
-
-      ROOT_PIPELINE_ID=${PARENT_PIPELINE_ID:-$CI_PIPELINE_ID}
-      GIT_REVISION=$("$CI_PROJECT_DIR"/gitlab-ci/src/artifacts/find-build-id.sh)
-      buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
-        gitlab-ci/src/artifacts/rclone_upload.py --version="${GIT_REVISION}" "typescript/service-worker/artifacts" service-worker
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
 build-base-images-ref-update:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
   dependencies:
     - build-guestos-base
     - build-guestos-base-dev
-    - build-guestos-base-dev-sev
     - build-boundaryos-base
     - build-boundaryos-base-snp
-    - build-boundaryos-api-guestos-base
-    - build-boundaryos-api-guestos-base-snp
     - build-hostos-base
     - build-hostos-base-dev
-    - build-hostos-base-dev-sev
     - build-setupos-base
     - build-setupos-base-dev
-    - build-setupos-base-dev-sev
   extends:
-    - ".build-k8s"
     - ".rules-build-base-images"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs:
     - build-guestos-base
     - build-guestos-base-dev
-    - build-guestos-base-dev-sev
     - build-boundaryos-base
     - build-boundaryos-base-snp
-    - build-boundaryos-api-guestos-base
-    - build-boundaryos-api-guestos-base-snp
     - build-hostos-base
     - build-hostos-base-dev
-    - build-hostos-base-dev-sev
     - build-setupos-base
     - build-setupos-base-dev
-    - build-setupos-base-dev-sev
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "build-push-base-images"
     - allow_failure: true
@@ -1784,7 +1640,6 @@ build-base-images-ref-update:
     - changes:
         - gitlab-ci/config/base-images-build.yml
         - ic-os/boundary-guestos/rootfs/Dockerfile.base
-        - ic-os/boundary-api-guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/packages.common
         - ic-os/guestos/rootfs/packages.dev
@@ -1828,140 +1683,12 @@ build-base-images-ref-update:
           -o merge_request.create \
           -o merge_request.title="Updating container base images refs [$TAG]" \
           origin "base-image-refs-update-${TAG}" 2>&1 | tee push.info
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
-build-boundaryos-api-guestos-base:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - digestfile*
-    when: always
-  extends:
-    - ".build-base-image-job"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
-  needs: []
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "build-push-base-images"
-    - allow_failure: true
-      if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
-      when: manual
-    - changes:
-        - gitlab-ci/config/base-images-build.yml
-        - ic-os/boundary-guestos/rootfs/Dockerfile.base
-        - ic-os/boundary-api-guestos/rootfs/Dockerfile.base
-        - ic-os/guestos/rootfs/Dockerfile.base
-        - ic-os/guestos/rootfs/packages.common
-        - ic-os/guestos/rootfs/packages.dev
-        - ic-os/hostos/rootfs/Dockerfile.base
-        - ic-os/hostos/rootfs/packages.common
-        - ic-os/hostos/rootfs/packages.dev
-        - ic-os/setupos/rootfs/Dockerfile.base
-        - ic-os/setupos/rootfs/packages.common
-        - ic-os/setupos/rootfs/packages.dev
-      if: $CI_PIPELINE_SOURCE == "merge_request_event"
-  script:
-    - |
-      set -euo pipefail
-
-      TAG=$(date '+%Y-%m-%d-%H%M')
-      echo -e "\e[0Ksection_start:$(date +%s):${IMAGE}[collapsed=true]\r\e[0KClick here to see the ${IMAGE} build"
-      pushd "$CONTEXT"
-      podman build "${BUILD_ARGS[@]}" --squash-all --no-cache -t "docker.io/dfinity/${IMAGE}:${TAG}" -f Dockerfile.base .
-      popd
-      echo -e "\e[0Ksection_end:$(date +%s):${IMAGE}\r\e[0K"
-
-      if [ "${CI_COMMIT_REF_NAME:-}" == "master" ]; then
-          podman login -u "$DOCKER_HUB_USER" -p "$DOCKER_HUB_PASSWORD" docker.io
-          podman push "dfinity/${IMAGE}:${TAG}" --digestfile digestfile
-          echo "dfinity/${IMAGE}@$(cat digestfile)" > "digestfile-${IMAGE}"
-          echo "$REF_FILE" >> "digestfile-${IMAGE}"
-          rm -f digestfile
-      fi
-  tags:
-    - dfinity-ic
-  variables:
-    CONTEXT: "${CI_PROJECT_DIR}/ic-os/boundary-api-guestos/rootfs"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
-    IMAGE: boundary-api-guestos-base
-    REF_FILE: ic-os/boundary-api-guestos/rootfs/docker-base.prod
-build-boundaryos-api-guestos-base-snp:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - digestfile*
-    when: always
-  extends:
-    - ".build-base-image-job"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
-  needs: []
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "build-push-base-images"
-    - allow_failure: true
-      if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
-      when: manual
-    - changes:
-        - gitlab-ci/config/base-images-build.yml
-        - ic-os/boundary-guestos/rootfs/Dockerfile.base
-        - ic-os/boundary-api-guestos/rootfs/Dockerfile.base
-        - ic-os/guestos/rootfs/Dockerfile.base
-        - ic-os/guestos/rootfs/packages.common
-        - ic-os/guestos/rootfs/packages.dev
-        - ic-os/hostos/rootfs/Dockerfile.base
-        - ic-os/hostos/rootfs/packages.common
-        - ic-os/hostos/rootfs/packages.dev
-        - ic-os/setupos/rootfs/Dockerfile.base
-        - ic-os/setupos/rootfs/packages.common
-        - ic-os/setupos/rootfs/packages.dev
-      if: $CI_PIPELINE_SOURCE == "merge_request_event"
-  script:
-    - BUILD_ARGS=(--build-arg "CPU_SUPPORT=snp")
-    - |
-      set -euo pipefail
-
-      TAG=$(date '+%Y-%m-%d-%H%M')
-      echo -e "\e[0Ksection_start:$(date +%s):${IMAGE}[collapsed=true]\r\e[0KClick here to see the ${IMAGE} build"
-      pushd "$CONTEXT"
-      podman build "${BUILD_ARGS[@]}" --squash-all --no-cache -t "docker.io/dfinity/${IMAGE}:${TAG}" -f Dockerfile.base .
-      popd
-      echo -e "\e[0Ksection_end:$(date +%s):${IMAGE}\r\e[0K"
-
-      if [ "${CI_COMMIT_REF_NAME:-}" == "master" ]; then
-          podman login -u "$DOCKER_HUB_USER" -p "$DOCKER_HUB_PASSWORD" docker.io
-          podman push "dfinity/${IMAGE}:${TAG}" --digestfile digestfile
-          echo "dfinity/${IMAGE}@$(cat digestfile)" > "digestfile-${IMAGE}"
-          echo "$REF_FILE" >> "digestfile-${IMAGE}"
-          rm -f digestfile
-      fi
-  tags:
-    - dfinity-ic
-  variables:
-    CONTEXT: "${CI_PROJECT_DIR}/ic-os/boundary-api-guestos/rootfs"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
-    IMAGE: boundary-api-guestos-base-snp
-    REF_FILE: ic-os/boundary-api-guestos/rootfs/docker-base.snp
 build-boundaryos-base:
   artifacts:
-    expire_in: 3 days
     paths:
       - digestfile*
-    when: always
   extends:
     - ".build-base-image-job"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "build-push-base-images"
@@ -1971,7 +1698,6 @@ build-boundaryos-base:
     - changes:
         - gitlab-ci/config/base-images-build.yml
         - ic-os/boundary-guestos/rootfs/Dockerfile.base
-        - ic-os/boundary-api-guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/packages.common
         - ic-os/guestos/rootfs/packages.dev
@@ -2000,26 +1726,16 @@ build-boundaryos-base:
           echo "$REF_FILE" >> "digestfile-${IMAGE}"
           rm -f digestfile
       fi
-  tags:
-    - dfinity-ic
   variables:
     CONTEXT: "${CI_PROJECT_DIR}/ic-os/boundary-guestos/rootfs"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     IMAGE: boundaryos-base
     REF_FILE: ic-os/boundary-guestos/rootfs/docker-base.prod
 build-boundaryos-base-snp:
   artifacts:
-    expire_in: 3 days
     paths:
       - digestfile*
-    when: always
   extends:
     - ".build-base-image-job"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "build-push-base-images"
@@ -2029,7 +1745,6 @@ build-boundaryos-base-snp:
     - changes:
         - gitlab-ci/config/base-images-build.yml
         - ic-os/boundary-guestos/rootfs/Dockerfile.base
-        - ic-os/boundary-api-guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/packages.common
         - ic-os/guestos/rootfs/packages.dev
@@ -2059,31 +1774,15 @@ build-boundaryos-base-snp:
           echo "$REF_FILE" >> "digestfile-${IMAGE}"
           rm -f digestfile
       fi
-  tags:
-    - dfinity-ic
   variables:
     CONTEXT: "${CI_PROJECT_DIR}/ic-os/boundary-guestos/rootfs"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     IMAGE: boundaryos-base-snp
     REF_FILE: ic-os/boundary-guestos/rootfs/docker-base.snp
 build-determinism:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
   extends:
-    - ".build-k8s"
     - ".rules-master-pipeline-no-merge-train"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs:
-    - artifacts: false
+    - artifacts: true
       job: bazel-test-all
     - artifacts: false
       job: build-ic
@@ -2091,15 +1790,20 @@ build-determinism:
     matrix:
       - PATH0: release
         PATH1: build-ic/release
+        TARGET: "//publish/binaries:upload"
       - PATH0: canisters
         PATH1: build-ic/canisters
+        TARGET: "//publish/canisters:upload"
       - PATH0: guest-os/update-img
         PATH1: build-ic/guest-os
+        TARGET: "//ic-os/guestos/envs/prod:upload_disk-img"
       - PATH0: host-os/update-img
         PATH1: build-ic/host-os
+        TARGET: "//ic-os/hostos/envs/prod:upload_update-img"
       - PATH0: setup-os/disk-img
         PATH1: build-ic/setup-os
         SETUPOS_FLAG: 'true'
+        TARGET: "//ic-os/setupos/envs/prod:upload_disk-img"
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
@@ -2107,26 +1811,17 @@ build-determinism:
   script:
     - |
       set -eExuo pipefail
-      ./gitlab-ci/tools/build-diff.sh "$PATH0" "$PATH1"
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
+
+      # bazel-targets file is expected from bazel-test-all CI job
+      if [ ! -e bazel-targets ]; then
+          echo "Missing 'bazel-targets' file!"
+          exit 1
+      fi
+
+      if grep -q "$TARGET" bazel-targets || grep -qF "//..." bazel-targets; then
+          gitlab-ci/tools/build-diff.sh "$PATH0" "$PATH1"
+      fi
 build-determinism-release:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs:
     - job: build-ic-release
   parallel:
@@ -2159,23 +1854,12 @@ build-determinism-release:
       P1="/${NNS_RELEASE_VERSION}/${PATH1}"
 
       ./gitlab-ci/tools/build-diff.sh "$P0" "$P1"
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
 build-guestos-base:
   artifacts:
-    expire_in: 3 days
     paths:
       - digestfile*
-    when: always
   extends:
     - ".build-base-image-job"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "build-push-base-images"
@@ -2185,7 +1869,6 @@ build-guestos-base:
     - changes:
         - gitlab-ci/config/base-images-build.yml
         - ic-os/boundary-guestos/rootfs/Dockerfile.base
-        - ic-os/boundary-api-guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/packages.common
         - ic-os/guestos/rootfs/packages.dev
@@ -2214,26 +1897,16 @@ build-guestos-base:
           echo "$REF_FILE" >> "digestfile-${IMAGE}"
           rm -f digestfile
       fi
-  tags:
-    - dfinity-ic
   variables:
     CONTEXT: "${CI_PROJECT_DIR}/ic-os/guestos/rootfs"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     IMAGE: guestos-base
     REF_FILE: ic-os/guestos/rootfs/docker-base.prod
 build-guestos-base-dev:
   artifacts:
-    expire_in: 3 days
     paths:
       - digestfile*
-    when: always
   extends:
     - ".build-base-image-job"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "build-push-base-images"
@@ -2243,7 +1916,6 @@ build-guestos-base-dev:
     - changes:
         - gitlab-ci/config/base-images-build.yml
         - ic-os/boundary-guestos/rootfs/Dockerfile.base
-        - ic-os/boundary-api-guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/packages.common
         - ic-os/guestos/rootfs/packages.dev
@@ -2273,85 +1945,16 @@ build-guestos-base-dev:
           echo "$REF_FILE" >> "digestfile-${IMAGE}"
           rm -f digestfile
       fi
-  tags:
-    - dfinity-ic
   variables:
     CONTEXT: "${CI_PROJECT_DIR}/ic-os/guestos/rootfs"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     IMAGE: guestos-base-dev
     REF_FILE: ic-os/guestos/rootfs/docker-base.dev
-build-guestos-base-dev-sev:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - digestfile*
-    when: always
-  extends:
-    - ".build-base-image-job"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
-  needs: []
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "build-push-base-images"
-    - allow_failure: true
-      if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
-      when: manual
-    - changes:
-        - gitlab-ci/config/base-images-build.yml
-        - ic-os/boundary-guestos/rootfs/Dockerfile.base
-        - ic-os/boundary-api-guestos/rootfs/Dockerfile.base
-        - ic-os/guestos/rootfs/Dockerfile.base
-        - ic-os/guestos/rootfs/packages.common
-        - ic-os/guestos/rootfs/packages.dev
-        - ic-os/hostos/rootfs/Dockerfile.base
-        - ic-os/hostos/rootfs/packages.common
-        - ic-os/hostos/rootfs/packages.dev
-        - ic-os/setupos/rootfs/Dockerfile.base
-        - ic-os/setupos/rootfs/packages.common
-        - ic-os/setupos/rootfs/packages.dev
-      if: $CI_PIPELINE_SOURCE == "merge_request_event"
-  script:
-    - BUILD_ARGS=(--build-arg "PACKAGE_FILES=packages.common packages.dev" --build-arg "CPU_SUPPORT=sev")
-    - |
-      set -euo pipefail
-
-      TAG=$(date '+%Y-%m-%d-%H%M')
-      echo -e "\e[0Ksection_start:$(date +%s):${IMAGE}[collapsed=true]\r\e[0KClick here to see the ${IMAGE} build"
-      pushd "$CONTEXT"
-      podman build "${BUILD_ARGS[@]}" --squash-all --no-cache -t "docker.io/dfinity/${IMAGE}:${TAG}" -f Dockerfile.base .
-      popd
-      echo -e "\e[0Ksection_end:$(date +%s):${IMAGE}\r\e[0K"
-
-      if [ "${CI_COMMIT_REF_NAME:-}" == "master" ]; then
-          podman login -u "$DOCKER_HUB_USER" -p "$DOCKER_HUB_PASSWORD" docker.io
-          podman push "dfinity/${IMAGE}:${TAG}" --digestfile digestfile
-          echo "dfinity/${IMAGE}@$(cat digestfile)" > "digestfile-${IMAGE}"
-          echo "$REF_FILE" >> "digestfile-${IMAGE}"
-          rm -f digestfile
-      fi
-  tags:
-    - dfinity-ic
-  variables:
-    CONTEXT: "${CI_PROJECT_DIR}/ic-os/guestos/rootfs"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
-    IMAGE: guestos-base-dev-sev
-    REF_FILE: ic-os/guestos/rootfs/docker-base.dev-sev
 build-hostos-base:
   artifacts:
-    expire_in: 3 days
     paths:
       - digestfile*
-    when: always
   extends:
     - ".build-base-image-job"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "build-push-base-images"
@@ -2361,7 +1964,6 @@ build-hostos-base:
     - changes:
         - gitlab-ci/config/base-images-build.yml
         - ic-os/boundary-guestos/rootfs/Dockerfile.base
-        - ic-os/boundary-api-guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/packages.common
         - ic-os/guestos/rootfs/packages.dev
@@ -2390,26 +1992,16 @@ build-hostos-base:
           echo "$REF_FILE" >> "digestfile-${IMAGE}"
           rm -f digestfile
       fi
-  tags:
-    - dfinity-ic
   variables:
     CONTEXT: "${CI_PROJECT_DIR}/ic-os/hostos/rootfs"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     IMAGE: hostos-base
     REF_FILE: ic-os/hostos/rootfs/docker-base.prod
 build-hostos-base-dev:
   artifacts:
-    expire_in: 3 days
     paths:
       - digestfile*
-    when: always
   extends:
     - ".build-base-image-job"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "build-push-base-images"
@@ -2419,7 +2011,6 @@ build-hostos-base-dev:
     - changes:
         - gitlab-ci/config/base-images-build.yml
         - ic-os/boundary-guestos/rootfs/Dockerfile.base
-        - ic-os/boundary-api-guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/packages.common
         - ic-os/guestos/rootfs/packages.dev
@@ -2449,78 +2040,12 @@ build-hostos-base-dev:
           echo "$REF_FILE" >> "digestfile-${IMAGE}"
           rm -f digestfile
       fi
-  tags:
-    - dfinity-ic
   variables:
     CONTEXT: "${CI_PROJECT_DIR}/ic-os/hostos/rootfs"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     IMAGE: hostos-base-dev
     REF_FILE: ic-os/hostos/rootfs/docker-base.dev
-build-hostos-base-dev-sev:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - digestfile*
-    when: always
-  extends:
-    - ".build-base-image-job"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
-  needs: []
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "build-push-base-images"
-    - allow_failure: true
-      if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
-      when: manual
-    - changes:
-        - gitlab-ci/config/base-images-build.yml
-        - ic-os/boundary-guestos/rootfs/Dockerfile.base
-        - ic-os/boundary-api-guestos/rootfs/Dockerfile.base
-        - ic-os/guestos/rootfs/Dockerfile.base
-        - ic-os/guestos/rootfs/packages.common
-        - ic-os/guestos/rootfs/packages.dev
-        - ic-os/hostos/rootfs/Dockerfile.base
-        - ic-os/hostos/rootfs/packages.common
-        - ic-os/hostos/rootfs/packages.dev
-        - ic-os/setupos/rootfs/Dockerfile.base
-        - ic-os/setupos/rootfs/packages.common
-        - ic-os/setupos/rootfs/packages.dev
-      if: $CI_PIPELINE_SOURCE == "merge_request_event"
-  script:
-    - BUILD_ARGS=(--build-arg "PACKAGE_FILES=packages.common packages.dev" --build-arg "CPU_SUPPORT=sev")
-    - |
-      set -euo pipefail
-
-      TAG=$(date '+%Y-%m-%d-%H%M')
-      echo -e "\e[0Ksection_start:$(date +%s):${IMAGE}[collapsed=true]\r\e[0KClick here to see the ${IMAGE} build"
-      pushd "$CONTEXT"
-      podman build "${BUILD_ARGS[@]}" --squash-all --no-cache -t "docker.io/dfinity/${IMAGE}:${TAG}" -f Dockerfile.base .
-      popd
-      echo -e "\e[0Ksection_end:$(date +%s):${IMAGE}\r\e[0K"
-
-      if [ "${CI_COMMIT_REF_NAME:-}" == "master" ]; then
-          podman login -u "$DOCKER_HUB_USER" -p "$DOCKER_HUB_PASSWORD" docker.io
-          podman push "dfinity/${IMAGE}:${TAG}" --digestfile digestfile
-          echo "dfinity/${IMAGE}@$(cat digestfile)" > "digestfile-${IMAGE}"
-          echo "$REF_FILE" >> "digestfile-${IMAGE}"
-          rm -f digestfile
-      fi
-  tags:
-    - dfinity-ic
-  variables:
-    CONTEXT: "${CI_PROJECT_DIR}/ic-os/hostos/rootfs"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
-    IMAGE: hostos-base-dev-sev
-    REF_FILE: ic-os/hostos/rootfs/docker-base.dev-sev
 build-ic:
   artifacts:
-    expire_in: 3 days
     paths:
       - bazel-build-log*.json*
     reports:
@@ -2529,8 +2054,6 @@ build-ic:
   extends:
     - ".build-ic"
     - ".rules-master-pipeline-no-merge-train"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
@@ -2557,29 +2080,56 @@ build-ic:
 
       if [ "$CI_COMMIT_REF_PROTECTED" == "true" ]; then
           gitlab-ci/container/build-ic.sh -i -c -b
+      elif [ "${RUN_ON_DIFF_ONLY:-}" == "true" ] \
+          && [ "${CI_PIPELINE_SOURCE:-}" == "merge_request_event" ] \
+          && [ "${CI_MERGE_REQUEST_EVENT_TYPE:-}" != "merge_train" ] \
+          && [[ "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-}" != "rc--"* ]]; then
+
+          TARGETS=$(gitlab-ci/src/bazel-ci/diff.sh)
+          ARGS=(--no-release)
+
+          if [ "$TARGETS" == "//..." ]; then
+              ARGS+=(-i -c -b)
+          else
+              if grep -q "ic-os" <<<"$TARGETS"; then
+                  ARGS+=(-i)
+              fi
+              if grep -q "publish/canisters" <<<"$TARGETS"; then
+                  ARGS+=(-c)
+              fi
+              if grep -q "publish/binaries" <<<"$TARGETS"; then
+                  ARGS+=(-b)
+              fi
+          fi
+
+          if [ ${#ARGS[@]} -eq 1 ]; then
+              echo "No changes that require building IC-OS, binaries or canisters."
+              exit 0
+          fi
+          gitlab-ci/container/build-ic.sh "${ARGS[@]}"
       else
           gitlab-ci/container/build-ic.sh -i -c -b --no-release
       fi
 
       # release binaries
-      buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
+      [ -d artifacts/release ] && buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
           gitlab-ci/src/artifacts/rclone_upload.py --version="${VERSION}" \
           "artifacts/release" "${CI_JOB_NAME}/release"
       # canister binaries
-      buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
+      [ -d artifacts/canisters ] && buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
           gitlab-ci/src/artifacts/rclone_upload.py --version="${VERSION}" \
           "artifacts/canisters" "${CI_JOB_NAME}/canisters"
 
       # guestos images
-      buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
+      [ -d artifacts/icos/guestos ] && buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
           gitlab-ci/src/artifacts/rclone_upload.py --version="${VERSION}" \
           "artifacts/icos/guestos" "${CI_JOB_NAME}/guest-os"
       # hostos images
-      buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
+      [ -d artifacts/icos/hostos ] && buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
           gitlab-ci/src/artifacts/rclone_upload.py --version="${VERSION}" \
           "artifacts/icos/hostos" "${CI_JOB_NAME}/host-os"
       # setupos images
-      buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
+      [ -d artifacts/icos/setupos ] && buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
           gitlab-ci/src/artifacts/rclone_upload.py --version="${VERSION}" \
           "artifacts/icos/setupos" "${CI_JOB_NAME}/setup-os"
 
@@ -2590,13 +2140,11 @@ build-ic:
       if [ -f /tmp/nns.release.env ]; then
           mv /tmp/nns.release.env .
       fi
-  tags:
-    - dfinity-ic
   variables:
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
+    BAZEL_COMMAND: build
+    RUN_ON_DIFF_ONLY: 'true'
 build-ic-release:
   artifacts:
-    expire_in: 3 days
     paths:
       - bazel-build-log*.json*
     reports:
@@ -2604,8 +2152,6 @@ build-ic-release:
         - nns.release.env
   extends:
     - ".build-ic"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "build-reproducibility"
@@ -2630,29 +2176,56 @@ build-ic-release:
 
       if [ "$CI_COMMIT_REF_PROTECTED" == "true" ]; then
           gitlab-ci/container/build-ic.sh -i -c -b
+      elif [ "${RUN_ON_DIFF_ONLY:-}" == "true" ] \
+          && [ "${CI_PIPELINE_SOURCE:-}" == "merge_request_event" ] \
+          && [ "${CI_MERGE_REQUEST_EVENT_TYPE:-}" != "merge_train" ] \
+          && [[ "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-}" != "rc--"* ]]; then
+
+          TARGETS=$(gitlab-ci/src/bazel-ci/diff.sh)
+          ARGS=(--no-release)
+
+          if [ "$TARGETS" == "//..." ]; then
+              ARGS+=(-i -c -b)
+          else
+              if grep -q "ic-os" <<<"$TARGETS"; then
+                  ARGS+=(-i)
+              fi
+              if grep -q "publish/canisters" <<<"$TARGETS"; then
+                  ARGS+=(-c)
+              fi
+              if grep -q "publish/binaries" <<<"$TARGETS"; then
+                  ARGS+=(-b)
+              fi
+          fi
+
+          if [ ${#ARGS[@]} -eq 1 ]; then
+              echo "No changes that require building IC-OS, binaries or canisters."
+              exit 0
+          fi
+          gitlab-ci/container/build-ic.sh "${ARGS[@]}"
       else
           gitlab-ci/container/build-ic.sh -i -c -b --no-release
       fi
 
       # release binaries
-      buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
+      [ -d artifacts/release ] && buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
           gitlab-ci/src/artifacts/rclone_upload.py --version="${VERSION}" \
           "artifacts/release" "${CI_JOB_NAME}/release"
       # canister binaries
-      buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
+      [ -d artifacts/canisters ] && buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
           gitlab-ci/src/artifacts/rclone_upload.py --version="${VERSION}" \
           "artifacts/canisters" "${CI_JOB_NAME}/canisters"
 
       # guestos images
-      buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
+      [ -d artifacts/icos/guestos ] && buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
           gitlab-ci/src/artifacts/rclone_upload.py --version="${VERSION}" \
           "artifacts/icos/guestos" "${CI_JOB_NAME}/guest-os"
       # hostos images
-      buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
+      [ -d artifacts/icos/hostos ] && buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
           gitlab-ci/src/artifacts/rclone_upload.py --version="${VERSION}" \
           "artifacts/icos/hostos" "${CI_JOB_NAME}/host-os"
       # setupos images
-      buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
+      [ -d artifacts/icos/setupos ] && buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
           gitlab-ci/src/artifacts/rclone_upload.py --version="${VERSION}" \
           "artifacts/icos/setupos" "${CI_JOB_NAME}/setup-os"
 
@@ -2663,20 +2236,12 @@ build-ic-release:
       if [ -f /tmp/nns.release.env ]; then
           mv /tmp/nns.release.env .
       fi
-  tags:
-    - dfinity-ic
-  variables:
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
 build-setupos-base:
   artifacts:
-    expire_in: 3 days
     paths:
       - digestfile*
-    when: always
   extends:
     - ".build-base-image-job"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "build-push-base-images"
@@ -2686,7 +2251,6 @@ build-setupos-base:
     - changes:
         - gitlab-ci/config/base-images-build.yml
         - ic-os/boundary-guestos/rootfs/Dockerfile.base
-        - ic-os/boundary-api-guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/packages.common
         - ic-os/guestos/rootfs/packages.dev
@@ -2715,26 +2279,16 @@ build-setupos-base:
           echo "$REF_FILE" >> "digestfile-${IMAGE}"
           rm -f digestfile
       fi
-  tags:
-    - dfinity-ic
   variables:
     CONTEXT: "${CI_PROJECT_DIR}/ic-os/setupos/rootfs"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     IMAGE: setupos-base
     REF_FILE: ic-os/setupos/rootfs/docker-base.prod
 build-setupos-base-dev:
   artifacts:
-    expire_in: 3 days
     paths:
       - digestfile*
-    when: always
   extends:
     - ".build-base-image-job"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "build-push-base-images"
@@ -2744,7 +2298,6 @@ build-setupos-base-dev:
     - changes:
         - gitlab-ci/config/base-images-build.yml
         - ic-os/boundary-guestos/rootfs/Dockerfile.base
-        - ic-os/boundary-api-guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/packages.common
         - ic-os/guestos/rootfs/packages.dev
@@ -2774,120 +2327,36 @@ build-setupos-base-dev:
           echo "$REF_FILE" >> "digestfile-${IMAGE}"
           rm -f digestfile
       fi
-  tags:
-    - dfinity-ic
   variables:
     CONTEXT: "${CI_PROJECT_DIR}/ic-os/setupos/rootfs"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     IMAGE: setupos-base-dev
     REF_FILE: ic-os/setupos/rootfs/docker-base.dev
-build-setupos-base-dev-sev:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - digestfile*
-    when: always
-  extends:
-    - ".build-base-image-job"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
-  needs: []
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "build-push-base-images"
-    - allow_failure: true
-      if: $CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
-      when: manual
-    - changes:
-        - gitlab-ci/config/base-images-build.yml
-        - ic-os/boundary-guestos/rootfs/Dockerfile.base
-        - ic-os/boundary-api-guestos/rootfs/Dockerfile.base
-        - ic-os/guestos/rootfs/Dockerfile.base
-        - ic-os/guestos/rootfs/packages.common
-        - ic-os/guestos/rootfs/packages.dev
-        - ic-os/hostos/rootfs/Dockerfile.base
-        - ic-os/hostos/rootfs/packages.common
-        - ic-os/hostos/rootfs/packages.dev
-        - ic-os/setupos/rootfs/Dockerfile.base
-        - ic-os/setupos/rootfs/packages.common
-        - ic-os/setupos/rootfs/packages.dev
-      if: $CI_PIPELINE_SOURCE == "merge_request_event"
-  script:
-    - BUILD_ARGS=(--build-arg "PACKAGE_FILES=packages.common packages.dev")
-    - |
-      set -euo pipefail
-
-      TAG=$(date '+%Y-%m-%d-%H%M')
-      echo -e "\e[0Ksection_start:$(date +%s):${IMAGE}[collapsed=true]\r\e[0KClick here to see the ${IMAGE} build"
-      pushd "$CONTEXT"
-      podman build "${BUILD_ARGS[@]}" --squash-all --no-cache -t "docker.io/dfinity/${IMAGE}:${TAG}" -f Dockerfile.base .
-      popd
-      echo -e "\e[0Ksection_end:$(date +%s):${IMAGE}\r\e[0K"
-
-      if [ "${CI_COMMIT_REF_NAME:-}" == "master" ]; then
-          podman login -u "$DOCKER_HUB_USER" -p "$DOCKER_HUB_PASSWORD" docker.io
-          podman push "dfinity/${IMAGE}:${TAG}" --digestfile digestfile
-          echo "dfinity/${IMAGE}@$(cat digestfile)" > "digestfile-${IMAGE}"
-          echo "$REF_FILE" >> "digestfile-${IMAGE}"
-          rm -f digestfile
-      fi
-  tags:
-    - dfinity-ic
-  variables:
-    CONTEXT: "${CI_PROJECT_DIR}/ic-os/setupos/rootfs"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
-    IMAGE: setupos-base-dev-sev
-    REF_FILE: ic-os/setupos/rootfs/docker-base.dev-sev
 cargo-build-release-linux:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
   extends:
-    - ".build-k8s"
-    - ".rules-master-pipeline-and-merge-request"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
+    - ".rules-master-pipeline-and-merge-request-rust-changed"
   needs: []
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - changes:
+        - "**/*.rs"
+        - "**/*.toml"
+        - "**/*.lock"
+      if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
     - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
   script:
     - |
       set -eExuo pipefail
       buildevents cmd "$ROOT_PIPELINE_ID" "$CI_JOB_ID" build-command -- cargo build --release
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
 cargo-clippy-linux:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
   extends:
-    - ".build-k8s"
-    - ".rules-master-pipeline-and-merge-request"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
+    - ".rules-master-pipeline-and-merge-request-rust-changed"
   needs: []
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - changes:
+        - "**/*.rs"
+        - "**/*.toml"
+        - "**/*.lock"
+      if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
     - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
   script:
@@ -2895,26 +2364,9 @@ cargo-clippy-linux:
       set -eExuo pipefail
       buildevents cmd "$ROOT_PIPELINE_ID" "$CI_JOB_ID" build-command -- \
           "$CI_PROJECT_DIR"/gitlab-ci/src/rust_lint/lint.sh
-  tags:
-    - dfinity-ic
   variables:
     CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
 commit-lint:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - allow_failure: true
@@ -2931,25 +2383,7 @@ commit-lint:
         echo "Please visit https://www.conventionalcommits.org/en/v1.0.0/ to learn more about conventional commit" >&2
         exit 1
       fi
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
 container-autobuild:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - changes:
@@ -2974,17 +2408,15 @@ container-autobuild:
       TAG="$(./get-image-tag.sh)"
       cd ../config
       # names must match with names in docker-build-image.sh!
-      IMG_NAME="registry.gitlab.com/dfinity-lab/core/docker/ic-build-legacy"
       IMG_BAZEL_NAME="registry.gitlab.com/dfinity-lab/core/docker/ic-build"
       IMG_BAZEL_DOCKER_HUB="dfinity/ic-build"
 
-      IMG_NAME_FULL="$IMG_NAME:$TAG"
       IMG_BAZEL_NAME_FULL="$IMG_BAZEL_NAME:$TAG"
       IMG_BAZEL_DOCKER_HUB_FULL="$IMG_BAZEL_DOCKER_HUB:$TAG"
 
       # return if no changes
-      if grep -q "$IMG_NAME_FULL" -- *; then
-          echo "No changes required to build a new docker ic-build-legacy image"
+      if grep -q "$IMG_BAZEL_NAME_FULL" -- *; then
+          echo "No changes required to build a new docker ic-build image"
           exit 0
       fi
       popd
@@ -2992,9 +2424,8 @@ container-autobuild:
       # build new ic-build* images
       ./gitlab-ci/container/build-image.sh
 
-      # push the new ic-build-legacy image it to gitlab registry
+      # push the new ic-build image it to gitlab registry
       docker login -u gitlab-ci-token -p "$GITLAB_API_TOKEN" registry.gitlab.com
-      docker push "$IMG_NAME_FULL"
       docker push "$IMG_BAZEL_NAME_FULL"
       # clean-up
       docker image prune -f
@@ -3002,7 +2433,6 @@ container-autobuild:
 
       # update gitlab's docker image tags
       pushd gitlab-ci/config
-      sed -i -E "s|$IMG_NAME:[^\"]{5,}|$IMG_NAME_FULL|g" -- *
       sed -i -E "s|$IMG_BAZEL_NAME:[^\"]{5,}|$IMG_BAZEL_NAME_FULL|g" -- *
       cd ../container
       echo "$TAG" > TAG
@@ -3028,25 +2458,7 @@ container-autobuild:
           "https://gitlab-ci-token:${GITLAB_API_TOKEN}@gitlab.com/${CI_PROJECT_PATH}.git" \
           || true
       git push --set-upstream origin HEAD:"$CI_COMMIT_REF_NAME"
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
 container-autobuild-protected:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - changes:
@@ -3061,44 +2473,23 @@ container-autobuild-protected:
       # container image tag
       TAG=$(cat ./gitlab-ci/container/TAG)
       # check if we have it in dockerhub
-      EXISTS=$(curl -s https://hub.docker.com/v2/repositories/dfinity/ic-build-legacy/tags | jq -r "[.results? | .[]? | .name == \"$TAG\"] | any")
       EXISTS_BAZEL=$(curl -s https://hub.docker.com/v2/repositories/dfinity/ic-build/tags | jq -r "[.results? | .[]? | .name == \"$TAG\"] | any")
 
-      if [ "$EXISTS" != "true" ] || [ "$EXISTS_BAZEL" != "true" ]; then
+      if [ "$EXISTS_BAZEL" != "true" ]; then
         # build it
         echo -e "\e[0Ksection_start:$(date +%s):docker_build_script[collapsed=true]\r\e[0KClick here to see the docker_build_script"
         ./gitlab-ci/container/build-image.sh
         echo -e "\e[0Ksection_end:$(date +%s):docker_build_script\r\e[0K"
         # push it to dockerhub
         docker login -u "$DOCKER_HUB_USER" -p "$DOCKER_HUB_PASSWORD"
-        docker push docker.io/dfinity/ic-build-legacy:"$TAG"
-        docker push docker.io/dfinity/ic-build-legacy:latest
         docker push docker.io/dfinity/ic-build:"$TAG"
         docker push docker.io/dfinity/ic-build:latest
         # clean-up
         docker image prune -f
         docker container prune -f
       fi
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
 cut-release-candidate:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
   dependencies: []
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "release-candidate-cut"
   script:
@@ -3113,14 +2504,12 @@ cut-release-candidate:
       RC_BRANCH_NAME="rc--$(date '+%Y-%m-%d_%H-%M')"
       git switch --force-create "$RC_BRANCH_NAME" HEAD
       git push --force --set-upstream origin  "$RC_BRANCH_NAME"
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
 default:
+  artifacts:
+    expire_in: 3 days
+    when: always
+  image:
+    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:b4c69bc09c7128dc2b1ba13e9dc20e2839a31c9957580ff36f41a6b89f5e6af5
   interruptible: true
   retry:
     max: 2
@@ -3128,16 +2517,15 @@ default:
       - unknown_failure
       - api_failure
       - runner_system_failure
+  tags:
+    - dfinity-ic
 delegated-identity-bench:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -3162,35 +2550,30 @@ delegated-identity-bench:
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
 
       cd -
-  tags:
-    - dfinity-ic
   timeout: 3 hours
   variables:
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdslo
 dependencies-check:
   allow_failure: false
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
   extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
+    - ".rules-master-pipeline-no-merge-train-rust-bazel-changed"
   needs: []
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+    - changes:
+        - ".bazelrc"
+        - ".bazelversion"
+        - "**/*.bazel"
+        - "**/*.bzl"
+        - "**/*.lock"
+        - "**/*.rs"
+        - "**/*.toml"
+      if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
   script:
     - |
       set -euo pipefail
@@ -3198,29 +2581,12 @@ dependencies-check:
       $SHELL_WRAPPER cargo install cargo-audit --version "${CARGO_AUDIT_VERSION}"
       cd "${CI_PROJECT_DIR}"/gitlab-ci/src/dependencies/
       $SHELL_WRAPPER python3 job/bazel_rust_ic_scanner_merge_job.py
-  tags:
-    - dfinity-ic
   variables:
-    CARGO_AUDIT_VERSION: 0.16.0
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
+    CARGO_AUDIT_VERSION: 0.18.3
     PYTHONPATH: "${CI_PROJECT_DIR}/gitlab-ci/src:${CI_PROJECT_DIR}/gitlab-ci/src/dependencies"
     SHELL_WRAPPER: "/usr/bin/time"
 dependency-scan-nightly:
   allow_failure: true
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "dependency-scan-nightly"
@@ -3229,39 +2595,24 @@ dependency-scan-nightly:
       set -euo pipefail
       pip3 install --ignore-installed -r requirements.txt
       $SHELL_WRAPPER cargo install cargo-audit --version "${CARGO_AUDIT_VERSION}"
+      $SHELL_WRAPPER cargo install wasm-pack --version "${CARGO_WASMPACK_VERSION}"
       # shellcheck disable=SC1090
       source "${NVM_DIR}/nvm.sh"
-      nvm use ${NVM_VERSION}
+      nvm use ${DEFAULT_NODE_VERSION}
       node --version
       npm --version
       cd "${CI_PROJECT_DIR}"/gitlab-ci/src/dependencies
       $SHELL_WRAPPER python3 job/bazel_rust_ic_scanner_periodic_job.py
       $SHELL_WRAPPER python3 job/npm_scanner_periodic_job.py
       $SHELL_WRAPPER python3 job/bazel_trivy_container_ic_scanner_periodic_job.py
-  tags:
-    - dfinity-ic
   variables:
-    CARGO_AUDIT_VERSION: 0.16.0
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
-    NVM_VERSION: '19'
+    CARGO_AUDIT_VERSION: 0.18.3
+    CARGO_WASMPACK_VERSION: 0.12.1
+    DEFAULT_NODE_VERSION: '20'
     PYTHONPATH: "${CI_PROJECT_DIR}/gitlab-ci/src:${CI_PROJECT_DIR}/gitlab-ci/src/dependencies"
     SHELL_WRAPPER: "/usr/bin/time"
 dependency-scan-release-cut:
   allow_failure: false
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
@@ -3272,26 +2623,17 @@ dependency-scan-release-cut:
       $SHELL_WRAPPER cargo install cargo-audit --version "${CARGO_AUDIT_VERSION}"
       cd "${CI_PROJECT_DIR}"/gitlab-ci/src/dependencies
       $SHELL_WRAPPER python3 job/bazel_rust_ic_scanner_release_job.py
-  tags:
-    - dfinity-ic
   variables:
-    CARGO_AUDIT_VERSION: 0.16.0
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
+    CARGO_AUDIT_VERSION: 0.18.3
     PYTHONPATH: "${CI_PROJECT_DIR}/gitlab-ci/src:${CI_PROJECT_DIR}/gitlab-ci/src/dependencies"
     SHELL_WRAPPER: "/usr/bin/time"
 heavy-memory-update-performance-test-nightly:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-spot-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -3320,17 +2662,11 @@ heavy-memory-update-performance-test-nightly:
       cd -
 
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "scalability/results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
-  tags:
-    - dfinity-ic
   timeout: 1 hour
   variables:
     CD_ENV: BENCHMARK_NIGHTLY
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdrc02
@@ -3338,14 +2674,11 @@ heavy-memory-update-performance-test-nightly:
     cd_target_env: BENCHMARK_NIGHTLY
 large-response-downloading-nightly:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-spot-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -3377,66 +2710,28 @@ large-response-downloading-nightly:
       cd -
 
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "scalability/results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
-  tags:
-    - dfinity-ic
   timeout: 1 hour
   variables:
     CD_ENV: BENCHMARK_NIGHTLY
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdrc02
     WG_TESTNET: cdrc02
     cd_target_env: BENCHMARK_NIGHTLY
-legacy-cargo-check:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
-  extends:
-    - ".build-k8s"
-    - ".rules-master-pipeline-and-merge-request"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
-  needs: []
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
-    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/
-  script:
-    - |
-      set -eExuo pipefail
-      buildevents cmd "$ROOT_PIPELINE_ID" "$CI_JOB_ID" build-command -- cargo check --tests --benches
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
 lock-generate:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - changes:
+        - ".bazelrc"
+        - ".bazelversion"
+        - "**/*.bazel"
+        - "**/*.bzl"
+        - "**/*.lock"
+        - "**/*.rs"
+        - "**/*.toml"
+      if: $CI_PIPELINE_SOURCE == "merge_request_event"
   script:
     - |
       set -euo pipefail
@@ -3484,21 +2779,13 @@ lock-generate:
   tags:
     - dfinity-ic
     - bazel
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
 maximum-capacity-boundary-nodes-queries:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -3507,7 +2794,7 @@ maximum-capacity-boundary-nodes-queries:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "BENCHMARK_SUITE"
       when: always
   script:
-    - |-
+    - |
       set -eExou pipefail
       git fetch
       GIT_REVISION=$("$CI_PROJECT_DIR"/gitlab-ci/src/artifacts/newest_sha_with_disk_image.sh "$DISKIMG_BRANCH")
@@ -3526,29 +2813,20 @@ maximum-capacity-boundary-nodes-queries:
 
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
       cd -
-  tags:
-    - dfinity-ic
   timeout: 3 hours
   variables:
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdslo
 maximum-capacity-canister-http:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -3593,29 +2871,20 @@ maximum-capacity-canister-http:
       cd -
 
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "scalability/results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
-  tags:
-    - dfinity-ic
   timeout: 3 hours
   variables:
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdslo
 maximum-capacity-large-memory-query:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -3643,29 +2912,20 @@ maximum-capacity-large-memory-query:
       cd -
 
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "scalability/results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
-  tags:
-    - dfinity-ic
   timeout: 3 hours
   variables:
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdslo
 maximum-capacity-large-memory-update:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -3693,29 +2953,20 @@ maximum-capacity-large-memory-update:
       cd -
 
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "scalability/results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
-  tags:
-    - dfinity-ic
   timeout: 3 hours
   variables:
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdslo
 maximum-capacity-mixed-counter-memory:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -3746,29 +2997,20 @@ maximum-capacity-mixed-counter-memory:
       cd -
 
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "scalability/results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
-  tags:
-    - dfinity-ic
   timeout: 3 hours
   variables:
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdslo
 maximum-capacity-mixed-workloads:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -3796,29 +3038,20 @@ maximum-capacity-mixed-workloads:
       cd -
 
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "scalability/results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
-  tags:
-    - dfinity-ic
   timeout: 3 hours
   variables:
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdslo
 maximum-capacity-multiple-large-memory-update:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -3846,29 +3079,20 @@ maximum-capacity-multiple-large-memory-update:
       cd -
 
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "scalability/results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
-  tags:
-    - dfinity-ic
   timeout: 3 hours
   variables:
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdslo
 maximum-capacity-qr:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -3896,29 +3120,20 @@ maximum-capacity-qr:
       cd -
 
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "scalability/results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
-  tags:
-    - dfinity-ic
   timeout: 3 hours
   variables:
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdslo
 maximum-capacity-sha256:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -3946,29 +3161,20 @@ maximum-capacity-sha256:
       cd -
 
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "scalability/results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
-  tags:
-    - dfinity-ic
   timeout: 3 hours
   variables:
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdslo
 maximum-capacity-system-baseline-query:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -4011,29 +3217,20 @@ maximum-capacity-system-baseline-query:
 
       # Upload results from both run (the entire folder of that GIT revision)
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "scalability/results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
-  tags:
-    - dfinity-ic
   timeout: 3 hours
   variables:
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdslo
 maximum-capacity-system-baseline-update:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -4061,82 +3258,29 @@ maximum-capacity-system-baseline-update:
       cd -
 
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "scalability/results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
-  tags:
-    - dfinity-ic
   timeout: 3 hours
   variables:
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdslo
 no-interrupt:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   interruptible: false
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
   script:
     - echo "This pipeline is not interruptible"
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
 notify-gitlab-failure:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
   dependencies: []
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   rules:
     - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^rc--/
       when: on_failure
   script:
     - "pip3 install --ignore-installed -r requirements.txt\n\necho \"notify gitlab failure\"\nif [[ \"${CI_COMMIT_MESSAGE,,}\" =~ hotfix ]]; then\n    MESSAGE=\"✘ Hotfix pipeline <$CI_PIPELINE_URL|$CI_COMMIT_REF_NAME> failed. \U0001F336\U0001F336\U0001F336\"\nelse\n    MESSAGE=\"❌ Release candidate pipeline <$CI_PIPELINE_URL|$CI_COMMIT_REF_NAME> failed. \U0001F62D\U0001F62D\U0001F62D\"\nfi\ncd \"${CI_PROJECT_DIR}/gitlab-ci/src\" || true\nbuildevents cmd \"$ROOT_PIPELINE_ID\" \"$CI_JOB_ID\" notify-slack -- notify_slack/notify_slack.py \\\n    \"${MESSAGE}\" --channel \"release-management-alerts\"\n"
   stage: finalize
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
 notify-gitlab-success:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
   dependencies: []
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
       when: on_success
@@ -4145,26 +3289,9 @@ notify-gitlab-success:
   script:
     - "pip3 install --ignore-installed -r requirements.txt\n\n# TODO(IDX-2856): remove this top level \"if\" when we will not need to run the job for schedule pipelines.\nif [[ \"$CI_PIPELINE_SOURCE\" == \"push\" ]] && [[ \"$CI_COMMIT_REF_NAME\" =~ ^rc--.* ]]; then\n  if [[ \"${CI_COMMIT_MESSAGE,,}\" =~ hotfix ]]; then\n      MESSAGE=\"✔ Hotfix pipeline <$CI_PIPELINE_URL|$CI_COMMIT_REF_NAME> succeeded. \U0001FAD1\U0001FAD1\U0001FAD1\"\n  else\n      MESSAGE=\"✅ Release candidate pipeline <$CI_PIPELINE_URL|$CI_COMMIT_REF_NAME> succeeded. \U0001F389\U0001F389\U0001F389\"\n  fi\n  cd \"${CI_PROJECT_DIR}/gitlab-ci/src\" || true\n  buildevents cmd \"$ROOT_PIPELINE_ID\" \"$CI_JOB_ID\" notify-slack -- notify_slack/notify_slack.py \\\n    \"${MESSAGE}\" --channel \"release-management-alerts\"\nfi\n"
   stage: finalize
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
 pre-commit:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
   extends:
-    - ".build-k8s"
     - ".rules-master-pipeline-and-merge-request"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -4195,27 +3322,15 @@ pre-commit:
         echo "And then commit the changes."
         exit 1
       fi
-  tags:
-    - dfinity-ic
   variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PRE_COMMIT_HOME: "/cache/pre-commit/$CI_CONCURRENT_ID"
-python-gitlab-ci-tests:
+python-ci-tests:
   artifacts:
-    expire_in: 3 days
     paths:
       - gitlab-ci/src/htmlcov
     reports:
       junit:
         - test_report.xml
-    when: always
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH
@@ -4226,97 +3341,10 @@ python-gitlab-ci-tests:
       set -xeuo pipefail
       pip3 install --ignore-installed -r requirements.txt
       cd gitlab-ci/src
-      pytest -v -o junit_family=xunit1 --junitxml=../../test_report.xml --cov=. --cov-report=term --cov-report=term-missing --cov-report=html --cov-branch
-  tags:
-    - dfinity-ic
+      pytest --ignore=gitlab_config/ -v -o junit_family=xunit1 --junitxml=../../test_report.xml --cov=. --cov-report=term --cov-report=term-missing --cov-report=html --cov-branch
   variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PYTHONPATH: "${CI_PROJECT_DIR}/gitlab-ci/src:${CI_PROJECT_DIR}/gitlab-ci/src/dependencies"
-release-boundary-node-service-worker:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
-  needs:
-    - boundary-node-service-worker
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^service-worker_v([0-9\.]+)$/
-  script:
-    - |
-      set -eExuo pipefail
-      # shellcheck disable=SC1090
-      source "$NVM_DIR/nvm.sh"
-      nvm use 18
-      node --version
-      npm --version
-
-      pip3 install --ignore-installed -r requirements.txt
-
-      # download previously built artifact (during merge commit pipeline)
-      GIT_REVISION=$("$CI_PROJECT_DIR"/gitlab-ci/src/artifacts/find-build-id.sh)
-      "$CI_PROJECT_DIR"/gitlab-ci/src/artifacts/rclone_download.py \
-        --git-rev="${GIT_REVISION}" --remote-path="service-worker" \
-        --out="typescript/service-worker/artifacts"
-
-      (
-        cd typescript/service-worker
-        if [[ $CI_COMMIT_TAG =~ ^service-worker_v([0-9\.]+)$ ]]; then
-          TAG_VERSION="${BASH_REMATCH[1]}"
-        else
-          echo "could not parse version from commit tag $CI_COMMIT_TAG"
-          echo "check CI configuration, this job should not be run for malformed tags!"
-          exit 1
-        fi
-
-        # verify the source version matches the tag
-        PACKAGE_JSON_VERSION=$(< package.json jq '.version' -r)
-        if [  "$PACKAGE_JSON_VERSION" != "$TAG_VERSION" ]; then
-          echo "package.json version $PACKAGE_JSON_VERSION does not match tag version $TAG_VERSION"
-          exit 1
-        fi
-
-        # extracts to folder package
-        tar -xf "artifacts/dfinity-service-worker-$TAG_VERSION.tgz"
-
-        # verify the prebuilt package version matches the tag
-        PREBUILT_VERSION=$(< package/package.json jq '.version' -r)
-        if [  "$PREBUILT_VERSION" != "$TAG_VERSION" ]; then
-          echo "version $PREBUILT_VERSION contained in the prebuilt artifact does not match tag version $TAG_VERSION!"
-          exit 1
-        fi
-
-        printf '%s\n' "//registry.npmjs.org/:_authToken=\${SW_NODE_AUTH_TOKEN}" "registry=https://registry.npmjs.org/" "always-auth=true" >> .npmrc
-        npm publish "file:artifacts/dfinity-service-worker-$PACKAGE_JSON_VERSION.tgz" --access public
-      )
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
 rosetta-api-docker-image:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs:
     - artifacts: false
       job: bazel-test-all
@@ -4339,7 +3367,6 @@ rosetta-api-docker-image:
       pushd "$(mktemp -d)"
       cp \
         "$CI_PROJECT_DIR"/artifacts/release/ic-rosetta-api \
-        "$CI_PROJECT_DIR"/rs/rosetta-api/log_config.yml \
         .
       docker build \
         --build-arg RELEASE="$CI_COMMIT_SHA" \
@@ -4363,26 +3390,7 @@ rosetta-api-docker-image:
       docker push dfinity/rosetta-api:"$ROSETTA_API_DATE"
       docker push dfinity/rosetta-api:v"$ROSETTA_API_VERSION"
       docker push dfinity/rosetta-api:latest
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
 rosetta-release:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
-  extends:
-    - ".build-k8s"
-    - ".ic-build-image"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   rules:
     - if: $CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "rosetta-release"
   script:
@@ -4419,13 +3427,6 @@ rosetta-release:
 
       git tag "rosetta-release-$ROSETTA_RELEASE_VERSION" "$CI_COMMIT_SHA"
       git push origin "rosetta-release-$ROSETTA_RELEASE_VERSION"
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
 stages:
   - ".pre"
   - init
@@ -4434,14 +3435,11 @@ stages:
   - ".post"
 statesync-experiment:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -4469,29 +3467,20 @@ statesync-experiment:
       cd -
 
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "scalability/results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
-  tags:
-    - dfinity-ic
   timeout: 3 hours
   variables:
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdslo
 system-baseline-query-performance-test-nightly:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-spot-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -4523,17 +3512,11 @@ system-baseline-query-performance-test-nightly:
       cd -
 
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "scalability/results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
-  tags:
-    - dfinity-ic
   timeout: 1 hour
   variables:
     CD_ENV: BENCHMARK_NIGHTLY
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdrc02
@@ -4541,14 +3524,11 @@ system-baseline-query-performance-test-nightly:
     cd_target_env: BENCHMARK_NIGHTLY
 system-baseline-update-performance-test-nightly:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-spot-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -4580,17 +3560,11 @@ system-baseline-update-performance-test-nightly:
       cd -
 
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "scalability/results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
-  tags:
-    - dfinity-ic
   timeout: 1 hour
   variables:
     CD_ENV: BENCHMARK_NIGHTLY
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdrc02
@@ -4598,14 +3572,11 @@ system-baseline-update-performance-test-nightly:
     cd_target_env: BENCHMARK_NIGHTLY
 tecdsa:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -4633,32 +3604,15 @@ tecdsa:
 
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
       cd -
-  tags:
-    - dfinity-ic
   timeout: 3 hours
   variables:
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdslo
 test-push-branch:
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - junit_data/*
-      - coredumps/*.txt
-      - coredumps/*.gz
-    when: always
   dependencies: []
-  extends:
-    - ".build-k8s"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"
       when: on_success
@@ -4673,155 +3627,19 @@ test-push-branch:
 
       git switch --force-create post-merge-tests-passed HEAD
       git push --force --set-upstream origin post-merge-tests-passed
-  tags:
-    - dfinity-ic
-  variables:
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
-tnet-test:
-  after_script:
-    - |
-      set +e # Do not fail in the after_script, try to do as much as possible instead.
-      echo -e "\033[0;31m"
-      echo -e "************************************************************************"
-      echo -e "*** NEED BAZEL HELP? See #project-bazel and                          ***"
-      echo -e "***  https://github.com/dfinity/ic/blob/master/bazel/README.md       ***"
-      echo -e "*** (NEW) To regenerate Cargo Bazel lockfiles run ./bin/bazel-pin.sh ***"
-      echo -e "************************************************************************"
-      echo -e "\033[0m"
-    - cp -R "$(realpath bazel-testlogs)" bazel-testlogs-gitlab
-    - gzip bazel-build-log*.json
-    - |
-      echo -e "\e[0Ksection_start:$(date +%s):bazel_exporter_logs[collapsed=true]\r\e[0KClick to see Bazel exporter logs"
-      bazel run //bazel/exporter:exporter --build_event_binary_file= -- -f "$(pwd)/bazel-bep.pb"
-      echo -e "\e[0Ksection_end:$(date +%s):bazel_exporter_logs\r\e[0K"
-    - |
-      if [ "$(uname)" == "Linux" ]; then
-          bazel clean --expunge
-      fi
-    - - |
-        # Start the after_script section
-        echo -e "\e[0Ksection_start:$(date +%s):after_script[collapsed=true]\r\e[0KClick here to see the after_script section. It does not affect the job success status"
-
-        # Export all the environmental variables so that the GITLAB configured variables are available to after_script.sh
-        export ROOT_PIPELINE_ID=${PARENT_PIPELINE_ID:-$CI_PIPELINE_ID}
-        buildevents cmd "$ROOT_PIPELINE_ID" "$CI_JOB_ID" after-script -- "${CI_PROJECT_DIR}"/gitlab-ci/src/after_script/after_script.sh
-
-        rm -rf "${CI_PROJECT_DIR}/target"
-
-        # Finish and collapse the after_script section
-        echo -e "\e[0Ksection_end:$(date +%s):after_script\r\e[0K"
-  allow_failure: true
-  artifacts:
-    expire_in: 3 days
-    paths:
-      - bazel-build-log*.json*
-      - bazel-bep.pb
-    reports:
-      junit:
-        - bazel-testlogs-gitlab/**/test.xml
-    when: always
-  extends:
-    - ".bazel-test-all"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
-  needs:
-    - artifacts: false
-      job: bazel-test-all
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "tnet-test"
-    - changes:
-        - rs/tests/k8s/**/*
-      if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
-    - allow_failure: true
-      if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
-      when: manual
-  script:
-    - |
-      # TODO: switch to bazel after chrono issue is handled
-      #bazel build //rs/tests/k8s:tnetctl
-      #TNETCTL=$(bazel cquery --output=files //rs/tests/k8s:tnetctl)
-      cd rs/tests/k8s
-      cargo build --release
-      TNETCTL=target/release/tnetctl
-
-      export KUBECONFIG=$KUBECONFIG_TNET_CREATOR
-      export RUST_LOG=info
-      export NAME="CI-$CI_JOB_ID"
-
-      # Build a subnet with a "zero" version, unless our built images actually
-      # contain a "real" version.
-      use_zero_version="true"
-      if [ "$CI_COMMIT_REF_PROTECTED" = "true" ]; then
-          use_zero_version="false"
-      fi
-      if [[ "$CI_COMMIT_REF_NAME" =~ ^hotfix-.+-rc--.+ ]]; then
-          use_zero_version="false"
-      fi
-
-      echo "Testing tnetctl on the following environment"
-      kubectl config get-contexts
-
-      ./$TNETCTL list
-      N=$(./$TNETCTL list | grep 'CI-' -c) || true
-      N_LIMIT=20
-      if [ "$N" -gt "$N_LIMIT" ]; then
-          echo "Seeing already $N_LIMIT CI-* testnets deployed."
-          echo "They should have been deleted by GC. Investigate and purge them."
-          exit 1
-      fi
-
-      if [ "${use_zero_version}" == "true" ]; then
-        ./$TNETCTL create \
-            --version "$CI_COMMIT_SHA" \
-            --use-zero-version \
-            --init \
-            --nns 2 \
-            --app 1 \
-            -n "$NAME"
-      else
-        ./$TNETCTL create \
-            --version "$CI_COMMIT_SHA" \
-            --init \
-            --nns 2 \
-            --app 1 \
-            -n "$NAME"
-      fi
-
-      TNET_OPERATOR=$(./$TNETCTL list | grep $NAME | awk '{ print $1 }')-operator
-      kubectl -n tnets wait --timeout=120s --for=condition=PodScheduled pod/"$TNET_OPERATOR"
-      sleep 30
-      kubectl -n tnets logs -f "$TNET_OPERATOR" -c init &
-      timeout 10m \
-          bash -c "kubectl -n tnets logs -f $TNET_OPERATOR -c init | grep -q 'All NNS canisters have been set up'"
-      kill "$(jobs -p)" || true
-  tags:
-    - dfinity-ic
-    - ch
-  variables:
-    BAZEL_CI_CONFIG: "--config=ci --repository_cache=/cache/bazel"
-    BAZEL_COMMAND: build
-    BAZEL_STARTUP_ARGS: "--output_base=/var/tmp/bazel-output/"
-    BAZEL_TARGETS: "//rs/tests/k8s:tnetctl"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
-    RUSTFLAGS: "--remap-path-prefix=${CI_PROJECT_DIR}=/ic"
 variables:
+  GET_SOURCES_ATTEMPTS: 5
+  GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
+  GIT_DEPTH: 0
+  GIT_STRATEGY: fetch
   TEST_ES_HOSTNAMES: elasticsearch.testnet.dfinity.network:443
 xnet-nightly:
   artifacts:
-    expire_in: 3 days
     paths:
       - scalability/
     when: always
   dependencies: []
   extends: ".benchmark-spot-test"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   resource_group: "$TESTNET"
   rules:
     - allow_failure: true
@@ -4851,29 +3669,17 @@ xnet-nightly:
       cd -
 
       $SHELL_WRAPPER rclone --config="${CI_PROJECT_DIR}/.rclone.conf"  copyto "scalability/results/$GIT_REVISION" "performance-testing:performance-testing-results/$GIT_REVISION"
-  tags:
-    - dfinity-ic
   timeout: 1 hour
   variables:
     CD_ENV: BENCHMARK_NIGHTLY
     CURRENT_BRANCH: "$CI_COMMIT_REF_NAME"
     DISKIMG_BRANCH: "${CI_COMMIT_SHA}"
-    GET_SOURCES_ATTEMPTS: 5
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"
-    GIT_DEPTH: 0
-    GIT_STRATEGY: fetch
     PARENT_PIPELINE_ID: "${CI_PIPELINE_ID}"
     SHELL_WRAPPER: "/usr/bin/time"
     TESTNET: cdrc02
     WG_TESTNET: cdrc02
     cd_target_env: BENCHMARK_NIGHTLY
 zz-generated-gitlab:
-  artifacts:
-    expire_in: 3 days
-  extends:
-    - ".ic-build-image"
-  image:
-    name: registry.gitlab.com/dfinity-lab/core/docker/ic-build:05d4f93d618d6f9b9d4260db3aa0b7809165430b00a7f8d3ad03e0daee7bfdcc
   needs: []
   rules:
     - changes:
@@ -4903,7 +3709,3 @@ zz-generated-gitlab:
       else
           echo "git working tree clean - no changes to be committed"
       fi
-  tags:
-    - dfinity-ic
-  variables:
-    GIT_CLONE_PATH: "$CI_BUILDS_DIR/clean/$CI_PROJECT_NAME"

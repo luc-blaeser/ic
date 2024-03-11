@@ -1,15 +1,19 @@
-use crate::address::Address;
-use crate::eth_logs::{EventSource, ReceivedEthEvent};
+use crate::address::ecdsa_public_key_to_address;
+use crate::erc20::{CkErc20Token, CkTokenSymbol};
+use crate::eth_logs::{EventSource, ReceivedEthEvent, ReceivedEvent};
 use crate::eth_rpc::BlockTag;
 use crate::eth_rpc_client::responses::{TransactionReceipt, TransactionStatus};
 use crate::lifecycle::upgrade::UpgradeArg;
 use crate::lifecycle::EthereumNetwork;
 use crate::logs::DEBUG;
+use crate::map::MultiKeyMap;
 use crate::numeric::{BlockNumber, LedgerBurnIndex, LedgerMintIndex, TransactionNonce, Wei};
+use crate::tx::TransactionPriceEstimate;
 use candid::Principal;
 use ic_canister_log::log;
 use ic_cdk::api::management_canister::ecdsa::EcdsaPublicKeyResponse;
 use ic_crypto_ecdsa_secp256k1::PublicKey;
+use ic_ethereum_types::Address;
 use std::cell::RefCell;
 use std::collections::{btree_map, BTreeMap, BTreeSet, HashSet};
 use strum_macros::EnumIter;
@@ -28,7 +32,7 @@ thread_local! {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MintedEvent {
-    pub deposit_event: ReceivedEthEvent,
+    pub deposit_event: ReceivedEvent,
     pub mint_block_index: LedgerMintIndex,
 }
 
@@ -43,14 +47,16 @@ pub struct State {
     pub ethereum_network: EthereumNetwork,
     pub ecdsa_key_name: String,
     pub ledger_id: Principal,
-    pub ethereum_contract_address: Option<Address>,
+    pub eth_helper_contract_address: Option<Address>,
+    pub erc20_helper_contract_address: Option<Address>,
     pub ecdsa_public_key: Option<EcdsaPublicKeyResponse>,
     pub minimum_withdrawal_amount: Wei,
     pub ethereum_block_height: BlockTag,
     pub first_scraped_block_number: BlockNumber,
     pub last_scraped_block_number: BlockNumber,
+    pub last_erc20_scraped_block_number: BlockNumber,
     pub last_observed_block_number: Option<BlockNumber>,
-    pub events_to_mint: BTreeMap<EventSource, ReceivedEthEvent>,
+    pub events_to_mint: BTreeMap<EventSource, ReceivedEvent>,
     pub minted_events: BTreeMap<EventSource, MintedEvent>,
     pub invalid_events: BTreeMap<EventSource, String>,
     pub eth_transactions: EthTransactions,
@@ -68,6 +74,18 @@ pub struct State {
     /// Number of HTTP outcalls since the last upgrade.
     /// Used to correlate request and response in logs.
     pub http_request_counter: u64,
+
+    pub last_transaction_price_estimate: Option<(u64, TransactionPriceEstimate)>,
+
+    /// Canister ID of the ledger suite orchestrator that
+    /// can add new ERC-20 token to the minter
+    pub ledger_suite_orchestrator_id: Option<Principal>,
+
+    /// ERC-20 tokens that the minter can mint:
+    /// - primary key: ckERC20 token symbol
+    /// - secondary key: ERC-20 contract address on Ethereum
+    /// - value: ledger ID for the ckERC20 token
+    pub ckerc20_tokens: MultiKeyMap<CkTokenSymbol, Address, Principal>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -93,12 +111,12 @@ impl State {
             ));
         }
         if self
-            .ethereum_contract_address
+            .eth_helper_contract_address
             .iter()
             .any(|address| address == &Address::ZERO)
         {
             return Err(InvalidStateError::InvalidEthereumContractAddress(
-                "ethereum_contract_address cannot be the zero address".to_string(),
+                "eth_helper_contract_address cannot be the zero address".to_string(),
             ));
         }
         if self.minimum_withdrawal_amount == Wei::ZERO {
@@ -114,10 +132,24 @@ impl State {
             .unwrap_or_else(|e| {
                 ic_cdk::trap(&format!("failed to decode minter's public key: {:?}", e))
             });
-        Some(Address::from_pubkey(&pubkey))
+        Some(ecdsa_public_key_to_address(&pubkey))
     }
 
-    fn record_event_to_mint(&mut self, event: &ReceivedEthEvent) {
+    pub fn eth_events_to_mint(&self) -> Vec<ReceivedEthEvent> {
+        self.events_to_mint
+            .values()
+            .filter_map(|evt| {
+                if let ReceivedEvent::Eth(evt) = evt {
+                    Some(evt)
+                } else {
+                    None
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn record_event_to_mint(&mut self, event: &ReceivedEvent) {
         let event_source = event.source();
         assert!(
             !self.events_to_mint.contains_key(&event_source),
@@ -133,6 +165,12 @@ impl State {
 
     pub fn has_events_to_mint(&self) -> bool {
         !self.events_to_mint.is_empty()
+    }
+
+    pub fn find_ck_erc20_ledger(&self, symbol: &CkTokenSymbol) -> Option<Principal> {
+        self.ckerc20_tokens
+            .get_entry(symbol)
+            .map(|(_, ledger_id)| *ledger_id)
     }
 
     fn record_invalid_deposit(&mut self, source: EventSource, error: String) -> bool {
@@ -169,8 +207,8 @@ impl State {
                 source,
                 MintedEvent {
                     deposit_event,
-                    mint_block_index
-                }
+                    mint_block_index,
+                },
             ),
             None,
             "attempted to mint ckETH twice for the same event {source:?}"
@@ -195,8 +233,11 @@ impl State {
         current_request_id
     }
 
-    fn update_eth_balance_upon_deposit(&mut self, event: &ReceivedEthEvent) {
-        self.eth_balance.eth_balance_add(event.value);
+    fn update_eth_balance_upon_deposit(&mut self, event: &ReceivedEvent) {
+        // Only update the ETH balance if it is an ETH event
+        if let ReceivedEvent::Eth(event) = event {
+            self.eth_balance.eth_balance_add(event.value);
+        }
     }
 
     fn update_eth_balance_upon_withdrawal(
@@ -235,6 +276,36 @@ impl State {
         );
     }
 
+    pub fn record_add_ckerc20_token(&mut self, ckerc20_token: CkErc20Token) {
+        assert_eq!(
+            self.ethereum_network, ckerc20_token.erc20_ethereum_network,
+            "ERROR: Expected {}, but got {}",
+            self.ethereum_network, ckerc20_token.erc20_ethereum_network
+        );
+        let duplicate_ledger_id: MultiKeyMap<_, _, _> = self
+            .ckerc20_tokens
+            .iter()
+            .filter(|(_erc20_address, _ckerc20_token_symbol, &ledger_id)| {
+                ledger_id == ckerc20_token.ckerc20_ledger_id
+            })
+            .collect();
+        assert_eq!(
+            duplicate_ledger_id,
+            MultiKeyMap::default(),
+            "ERROR: ledger ID {} is already in use",
+            ckerc20_token.ckerc20_ledger_id
+        );
+        assert_eq!(
+            self.ckerc20_tokens.try_insert(
+                ckerc20_token.ckerc20_token_symbol,
+                ckerc20_token.erc20_contract_address,
+                ckerc20_token.ckerc20_ledger_id,
+            ),
+            Ok(()),
+            "ERROR: some ckERC20 tokens use the same ERC-20 address or symbol"
+        );
+    }
+
     pub const fn ethereum_network(&self) -> EthereumNetwork {
         self.ethereum_network
     }
@@ -251,6 +322,7 @@ impl State {
             minimum_withdrawal_amount,
             ethereum_contract_address,
             ethereum_block_height,
+            ledger_suite_orchestrator_id,
         } = upgrade_args;
         if let Some(nonce) = next_transaction_nonce {
             let nonce = TransactionNonce::try_from(nonce)
@@ -264,13 +336,16 @@ impl State {
             self.minimum_withdrawal_amount = minimum_withdrawal_amount;
         }
         if let Some(address) = ethereum_contract_address {
-            let ethereum_contract_address = Address::from_str(&address).map_err(|e| {
+            let eth_helper_contract_address = Address::from_str(&address).map_err(|e| {
                 InvalidStateError::InvalidEthereumContractAddress(format!("ERROR: {}", e))
             })?;
-            self.ethereum_contract_address = Some(ethereum_contract_address);
+            self.eth_helper_contract_address = Some(eth_helper_contract_address);
         }
         if let Some(block_height) = ethereum_block_height {
             self.ethereum_block_height = block_height.into();
+        }
+        if let Some(orchestrator_id) = ledger_suite_orchestrator_id {
+            self.ledger_suite_orchestrator_id = Some(orchestrator_id);
         }
         self.validate_config()
     }
@@ -290,8 +365,8 @@ impl State {
         ensure_eq!(self.ledger_id, other.ledger_id);
         ensure_eq!(self.ecdsa_key_name, other.ecdsa_key_name);
         ensure_eq!(
-            self.ethereum_contract_address,
-            other.ethereum_contract_address
+            self.eth_helper_contract_address,
+            other.eth_helper_contract_address
         );
         ensure_eq!(
             self.minimum_withdrawal_amount,
@@ -309,6 +384,11 @@ impl State {
         ensure_eq!(self.events_to_mint, other.events_to_mint);
         ensure_eq!(self.minted_events, other.minted_events);
         ensure_eq!(self.invalid_events, other.invalid_events);
+        ensure_eq!(
+            self.ledger_suite_orchestrator_id,
+            other.ledger_suite_orchestrator_id
+        );
+        ensure_eq!(self.ckerc20_tokens, other.ckerc20_tokens);
 
         self.eth_transactions
             .is_equivalent_to(&other.eth_transactions)
@@ -376,7 +456,7 @@ pub async fn lazy_call_ecdsa_public_key() -> PublicKey {
 }
 
 pub async fn minter_address() -> Address {
-    Address::from_pubkey(&lazy_call_ecdsa_public_key().await)
+    ecdsa_public_key_to_address(&lazy_call_ecdsa_public_key().await)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

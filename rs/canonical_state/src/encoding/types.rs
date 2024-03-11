@@ -13,13 +13,15 @@
 use crate::CertificationVersion;
 use ic_error_types::TryFromError;
 use ic_protobuf::proxy::ProxyDecodeError;
-use ic_types::{xnet::StreamIndex, Time};
+use ic_types::{messages::NO_DEADLINE, xnet::StreamIndex, Time};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     convert::{From, Into, TryFrom, TryInto},
     sync::Arc,
 };
+use strum::EnumCount;
+use strum_macros::EnumIter;
 
 pub(crate) type Bytes = Vec<u8>;
 
@@ -38,6 +40,8 @@ pub struct StreamHeader {
     /// Note that `signals_end` is NOT part of the reject signals.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reject_signal_deltas: Vec<u64>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub flags: u64,
 }
 
 /// Canonical representation of `ic_types::messages::RequestOrResponse`.
@@ -55,9 +59,9 @@ pub struct RequestMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call_tree_depth: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub call_tree_start_time: Option<Time>,
+    pub call_tree_start_time_u64: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub call_subtree_deadline: Option<Time>,
+    pub call_subtree_deadline_u64: Option<u64>,
 }
 
 /// Canonical representation of `ic_types::messages::Request`.
@@ -159,6 +163,21 @@ pub struct SubnetMetrics {
     pub update_transactions_total: u64,
 }
 
+/// Bits used for encoding `ic_types::xnet::StreamFlags`.
+#[derive(EnumCount, EnumIter)]
+#[repr(u64)]
+pub enum StreamFlagBits {
+    ResponsesOnly = 1,
+}
+
+/// Constant version of `ic_types::xnet::StreamFlags::default()`.
+pub const STREAM_DEFAULT_FLAGS: ic_types::xnet::StreamFlags = ic_types::xnet::StreamFlags {
+    responses_only: false,
+};
+
+/// A mask containing the supported bits.
+pub const STREAM_SUPPORTED_FLAGS: u64 = (1 << StreamFlagBits::COUNT) - 1;
+
 impl From<(&ic_types::xnet::StreamHeader, CertificationVersion)> for StreamHeader {
     fn from(
         (header, certification_version): (&ic_types::xnet::StreamHeader, CertificationVersion),
@@ -167,23 +186,35 @@ impl From<(&ic_types::xnet::StreamHeader, CertificationVersion)> for StreamHeade
         // includes replicas with certification version 8, but they may "inherit" reject
         // signals from a replica with certification version 9 after a downgrade.
         assert!(
-            header.reject_signals.is_empty() || certification_version >= CertificationVersion::V8,
+            header.reject_signals().is_empty() || certification_version >= CertificationVersion::V8,
             "Replicas with certification version < 9 should not be producing reject signals"
         );
+        // Replicas with certification version < 17 should not have flags set.
+        assert!(
+            *header.flags() == STREAM_DEFAULT_FLAGS
+                || certification_version >= CertificationVersion::V17
+        );
 
-        let mut next_index = header.signals_end;
-        let mut reject_signal_deltas = vec![0; header.reject_signals.len()];
-        for (i, stream_index) in header.reject_signals.iter().enumerate().rev() {
+        let mut next_index = header.signals_end();
+        let mut reject_signal_deltas = vec![0; header.reject_signals().len()];
+        for (i, stream_index) in header.reject_signals().iter().enumerate().rev() {
             assert!(next_index > *stream_index);
             reject_signal_deltas[i] = next_index.get() - stream_index.get();
             next_index = *stream_index;
         }
 
+        let mut flags = 0;
+        let ic_types::xnet::StreamFlags { responses_only } = *header.flags();
+        if responses_only {
+            flags |= StreamFlagBits::ResponsesOnly as u64;
+        }
+
         Self {
-            begin: header.begin.get(),
-            end: header.end.get(),
-            signals_end: header.signals_end.get(),
+            begin: header.begin().get(),
+            end: header.end().get(),
+            signals_end: header.signals_end().get(),
             reject_signal_deltas,
+            flags,
         }
     }
 }
@@ -206,12 +237,23 @@ impl TryFrom<StreamHeader> for ic_types::xnet::StreamHeader {
             reject_signals.push_front(stream_index);
         }
 
-        Ok(Self {
-            begin: header.begin.into(),
-            end: header.end.into(),
-            signals_end: header.signals_end.into(),
+        if header.flags & !STREAM_SUPPORTED_FLAGS != 0 {
+            return Err(ProxyDecodeError::Other(format!(
+                "StreamHeader: unsupported flags: got `flags` {:#b}, `supported_flags` {:#b}",
+                header.flags, STREAM_SUPPORTED_FLAGS,
+            )));
+        }
+        let flags = ic_types::xnet::StreamFlags {
+            responses_only: header.flags & StreamFlagBits::ResponsesOnly as u64 != 0,
+        };
+
+        Ok(Self::new(
+            header.begin.into(),
+            header.end.into(),
+            header.signals_end.into(),
             reject_signals,
-        })
+            flags,
+        ))
     }
 }
 
@@ -260,10 +302,21 @@ impl TryFrom<RequestOrResponse> for ic_types::messages::RequestOrResponse {
 impl From<&ic_types::messages::RequestMetadata> for RequestMetadata {
     fn from(metadata: &ic_types::messages::RequestMetadata) -> Self {
         RequestMetadata {
-            call_tree_depth: metadata.call_tree_depth,
-            call_tree_start_time: metadata.call_tree_start_time,
-            call_subtree_deadline: metadata.call_subtree_deadline,
+            call_tree_depth: Some(*metadata.call_tree_depth()),
+            call_tree_start_time_u64: Some(
+                metadata.call_tree_start_time().as_nanos_since_unix_epoch(),
+            ),
+            call_subtree_deadline_u64: None,
         }
+    }
+}
+
+impl From<RequestMetadata> for ic_types::messages::RequestMetadata {
+    fn from(metadata: RequestMetadata) -> Self {
+        ic_types::messages::RequestMetadata::new(
+            metadata.call_tree_depth.unwrap_or(0),
+            Time::from_nanos_since_unix_epoch(metadata.call_tree_start_time_u64.unwrap_or(0)),
+        )
     }
 }
 
@@ -275,17 +328,6 @@ impl From<(&ic_types::messages::Request, CertificationVersion)> for Request {
             cycles: (&request.payment, certification_version).into(),
             icp: 0,
         };
-        let metadata = match request.metadata.as_ref() {
-            Some(ic_types::messages::RequestMetadata {
-                call_tree_depth: None,
-                call_tree_start_time: None,
-                call_subtree_deadline: None,
-            })
-            | None => None,
-            Some(metadata) => {
-                (certification_version >= CertificationVersion::V14).then_some(metadata.into())
-            }
-        };
 
         Self {
             receiver: request.receiver.get().to_vec(),
@@ -295,17 +337,9 @@ impl From<(&ic_types::messages::Request, CertificationVersion)> for Request {
             method_name: request.method_name.clone(),
             method_payload: request.method_payload.clone(),
             cycles_payment: None,
-            metadata,
-        }
-    }
-}
-
-impl From<RequestMetadata> for ic_types::messages::RequestMetadata {
-    fn from(metadata: RequestMetadata) -> Self {
-        ic_types::messages::RequestMetadata {
-            call_tree_depth: metadata.call_tree_depth,
-            call_tree_start_time: metadata.call_tree_start_time,
-            call_subtree_deadline: metadata.call_subtree_deadline,
+            metadata: request.metadata.as_ref().and_then(|metadata| {
+                (certification_version >= CertificationVersion::V14).then_some(metadata.into())
+            }),
         }
     }
 }
@@ -332,6 +366,7 @@ impl TryFrom<Request> for ic_types::messages::Request {
             method_name: request.method_name,
             method_payload: request.method_payload,
             metadata: request.metadata.map(From::from),
+            deadline: NO_DEADLINE,
         })
     }
 }
@@ -375,6 +410,7 @@ impl TryFrom<Response> for ic_types::messages::Response {
             originator_reply_callback: response.originator_reply_callback.into(),
             refund,
             response_payload: response.response_payload.try_into()?,
+            deadline: NO_DEADLINE,
         })
     }
 }

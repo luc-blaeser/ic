@@ -15,7 +15,7 @@ use ic_replicated_state::{
 };
 use ic_state_machine_tests::{Cycles, IngressStatus, WasmResult};
 use ic_sys::PAGE_SIZE;
-use ic_types::messages::CallbackId;
+use ic_types::messages::{CallbackId, RequestMetadata};
 use ic_types::{NumInstructions, NumPages};
 use ic_universal_canister::{call_args, wasm};
 
@@ -71,7 +71,6 @@ fn dts_update_concurrent_cycles_change_succeeds() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(instruction_limit)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -176,7 +175,6 @@ fn dts_update_concurrent_cycles_change_fails() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(instruction_limit)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -354,7 +352,6 @@ fn dts_update_resume_fails_due_to_cycles_change() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(instruction_limit)
         .with_slice_instruction_limit(10_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -412,7 +409,6 @@ fn dts_update_resume_fails_due_to_call_context_change() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(instruction_limit)
         .with_slice_instruction_limit(10_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -438,7 +434,12 @@ fn dts_update_resume_fails_due_to_call_context_change() {
         .system_state
         .call_context_manager_mut()
         .unwrap()
-        .new_call_context(CallOrigin::SystemTask, Cycles::new(0), time);
+        .new_call_context(
+            CallOrigin::SystemTask,
+            Cycles::new(0),
+            time,
+            RequestMetadata::for_new_call_tree(time),
+        );
 
     test.execute_slice(a_id);
 
@@ -471,7 +472,6 @@ fn dts_update_does_not_expire_while_executing() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(instruction_limit)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 
@@ -541,7 +541,6 @@ fn dts_abort_of_call_works() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(instruction_limit)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_initial_canister_cycles(initial_cycles)
         .with_manual_execution()
         .build();
@@ -564,7 +563,7 @@ fn dts_abort_of_call_works() {
             "update",
             call_args()
                 .other_side(b.clone())
-                .on_reject(wasm().reject_code().reject_message().reject()),
+                .on_reject(wasm().reject_message().reject()),
             transferred_cycles,
         )
         .build();
@@ -625,7 +624,6 @@ fn dts_ingress_induction_cycles_debit_is_applied_on_aborts() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(instruction_limit)
         .with_slice_instruction_limit(1_000_000)
-        .with_deterministic_time_slicing()
         .with_initial_canister_cycles(initial_canister_cycles)
         .with_manual_execution()
         .build();
@@ -685,7 +683,6 @@ fn dts_uninstall_with_aborted_update() {
     let mut test = ExecutionTestBuilder::new()
         .with_instruction_limit(instruction_limit)
         .with_slice_instruction_limit(10_000)
-        .with_deterministic_time_slicing()
         .with_manual_execution()
         .build();
 

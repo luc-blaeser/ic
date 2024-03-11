@@ -58,6 +58,10 @@ RUN sed -e 's/\(backup *= *\)1/\10/' -e 's/\(archive *= *\)1/\10/' -i /etc/lvm/l
 # Deactivate systemd userdb. We don't use it.
 RUN sed -e 's/ *systemd//' -i /etc/nsswitch.conf
 
+# Activate the NSS IC OS Name Service Switch plugin.
+# See ../../../rs/ic_os/nss_icos/README.md for context.
+RUN sed -r -e 's/hosts:( *)files/hosts:\1files icos/' -i /etc/nsswitch.conf
+
 # Divert symbolic link for dynamically generated nftables
 # ruleset.
 RUN ln -sf /run/ic-node/nftables-ruleset/nftables.conf /etc/nftables.conf
@@ -93,7 +97,7 @@ RUN mkdir -p /mnt/var_old /mnt/var_new
 
 RUN \
     for SERVICE in /etc/systemd/system/*; do \
-        if [ -f "$SERVICE" -a ! -L "$SERVICE" ] ; then systemctl enable "${SERVICE#/etc/systemd/system/}" ; fi ; \
+    if [ -f "$SERVICE" -a ! -L "$SERVICE" ] && grep -q '^.Install.' "$SERVICE" ; then systemctl enable "${SERVICE#/etc/systemd/system/}" ; fi ; \
     done
 
 RUN systemctl enable \
@@ -103,6 +107,13 @@ RUN systemctl enable \
     systemd-networkd-wait-online \
     systemd-resolved \
     systemd-journal-gatewayd
+
+RUN systemctl disable \
+    apt-daily.service \
+    apt-daily.timer \
+    apt-daily-upgrade.service \
+    apt-daily-upgrade.timer \
+    motd-news.service
 
 # Add user/group entries specified here: /usr/lib/sysusers.d/systemd.conf E.g., systemd-timesync/coredump. 
 ## `systemd-sysusers` does not honor the SOURCE_DATE_EPOCH env var. 
@@ -197,6 +208,12 @@ RUN addgroup node_exporter && \
     chmod 0644 /etc/default/node_exporter \
                /etc/node_exporter/web.yml
 
+# User which will run the metrics proxy service.
+# Needs access to the node exporter SSL certificate private key,
+# stored in /etc/node_exporter.
+RUN adduser --system --disabled-password --home /var/lib/metrics-proxy --group --no-create-home metrics-proxy && \
+    usermod -a -G node_exporter metrics-proxy
+
 # Clear all files that may lead to indeterministic build.
 RUN apt-get clean && \
     find /usr/local/share/fonts -name .uuid | xargs rm && \
@@ -233,11 +250,6 @@ RUN \
 COPY dev-certs/canister_http_test_ca.cert /usr/local/share/ca-certificates/dev-root-ca.crt
 RUN chmod 0644 /usr/local/share/ca-certificates/dev-root-ca.crt
 RUN update-ca-certificates
-
-# The above steps are also used for dev-sev image
-FROM output_dev as output_dev-sev
-
-RUN echo "UNUSED DOCKERFILE LAYER. This line must exist to not fail."
 
 FROM output_${BUILD_TYPE}
 

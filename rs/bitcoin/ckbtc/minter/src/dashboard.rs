@@ -17,8 +17,11 @@ pub fn build_dashboard() -> Vec<u8> {
         <!DOCTYPE html>
         <html lang=\"en\">
             <head>
-                <title>Minter Dashboard</title>
+                <title>ckBTC Minter Dashboard</title>
                 <style>
+                    body {{
+                        font-family: monospace;
+                    }}
                     table {{
                         border: solid;
                         text-align: left;
@@ -180,11 +183,6 @@ pub fn build_dashboard() -> Vec<u8> {
                 <ul>{}</ul>
                 <h3>Retrieve BTC principals pending</h3>
                 <ul>{}</ul>
-                <h3>Logs</h3>
-                <table>
-                  <thead><tr><th>Priority</th><th>Timestamp</th><th>Location</th><th>Message</th></tr></thead>
-                  <tbody>{}</tbody>
-                </table>
               </div></div>
             </body>
         </html>",
@@ -200,7 +198,6 @@ pub fn build_dashboard() -> Vec<u8> {
         build_account_to_utxos_table(),
         build_update_balance_principals(),
         build_retrieve_btc_principals(),
-        display_logs(),
     );
     html.into_bytes()
 }
@@ -560,46 +557,6 @@ pub fn build_retrieve_btc_principals() -> String {
                 writeln!(buf, "<li>{}</li>", p).unwrap();
             }
         })
-    })
-}
-
-fn display_logs() -> String {
-    use crate::logs::{P0, P1};
-    use ic_canister_log::{export, LogEntry};
-
-    fn display_entry(buf: &mut Vec<u8>, tag: &str, e: &LogEntry) {
-        write!(
-            buf,
-            "<tr><td>{}</td><td class=\"ts-class\">{}</td><td><code>{}:{}</code></td><td>{}</td></tr>",
-            tag, e.timestamp, e.file, e.line, e.message
-        )
-        .unwrap()
-    }
-
-    let p0 = export(&P0);
-    let p1 = export(&P1);
-
-    let mut i0 = 0;
-    let mut i1 = 0;
-
-    with_utf8_buffer(|buf| {
-        // Merge sorted log entries with different priorities.
-        while i0 < p0.len() && i1 < p1.len() {
-            if p0[i0].timestamp <= p1[i1].timestamp {
-                display_entry(buf, "P0", &p0[i0]);
-                i0 += 1;
-            } else {
-                display_entry(buf, "P1", &p1[i1]);
-                i1 += 1;
-            }
-        }
-
-        for e in p0[i0..].iter() {
-            display_entry(buf, "P0", e);
-        }
-        for e in p1[i1..].iter() {
-            display_entry(buf, "P1", e);
-        }
     })
 }
 

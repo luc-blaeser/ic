@@ -73,7 +73,7 @@ mod tests {
             },
             system_state::CyclesUseCase,
         },
-        metadata_state::{Stream, SubnetMetrics},
+        metadata_state::{ApiBoundaryNodeEntry, Stream, SubnetMetrics},
         page_map::{PageIndex, PAGE_SIZE},
         testing::ReplicatedStateTesting,
         ExecutionState, ExportedFunctions, Global, Memory, NumWasmPages, PageMap, ReplicatedState,
@@ -90,7 +90,7 @@ mod tests {
         ingress::{IngressState, IngressStatus},
         messages::RequestMetadata,
         nominal_cycles::NominalCycles,
-        xnet::{StreamIndex, StreamIndexedQueue},
+        xnet::{StreamFlags, StreamIndex, StreamIndexedQueue},
         CryptoHashOfPartialState, Cycles, ExecutionRound, Time,
     };
     use ic_wasm_types::CanisterModule;
@@ -209,17 +209,11 @@ mod tests {
                 stream.push(
                     RequestBuilder::new()
                         .metadata(
-                            (certification_version >= CertificationVersion::V14).then_some(
-                                RequestMetadata {
-                                    call_tree_depth: (i % 2 > 0).then_some(i % 3),
-                                    call_tree_start_time: (i % 3 > 0)
-                                        .then_some(i % 2)
-                                        .map(Time::from_nanos_since_unix_epoch),
-                                    call_subtree_deadline: (i % 4 > 0)
-                                        .then_some(i % 3)
-                                        .map(Time::from_nanos_since_unix_epoch),
-                                },
-                            ),
+                            (certification_version >= CertificationVersion::V14 && i % 5 != 0)
+                                .then_some(RequestMetadata::new(
+                                    i % 3,
+                                    Time::from_nanos_since_unix_epoch(i % 2),
+                                )),
                         )
                         .build()
                         .into(),
@@ -228,6 +222,11 @@ mod tests {
             if certification_version >= CertificationVersion::V8 {
                 stream.push_reject_signal(10.into());
                 stream.increment_signals_end();
+            }
+            if certification_version >= CertificationVersion::V17 {
+                stream.set_reverse_stream_flags(StreamFlags {
+                    responses_only: true,
+                });
             }
             state.modify_streams(|streams| {
                 streams.insert(subnet_test_id(5), stream);
@@ -260,6 +259,21 @@ mod tests {
             state.metadata.node_public_keys = btreemap! {
                 node_test_id(1) => vec![1; 44],
                 node_test_id(2) => vec![2; 44],
+            };
+
+            state.metadata.api_boundary_nodes = btreemap! {
+                node_test_id(11) => ApiBoundaryNodeEntry {
+                    domain: "api-bn11-example.com".to_string(),
+                    ipv4_address: Some("127.0.0.1".to_string()),
+                    ipv6_address: "2001:0db8:85a3:0000:0000:8a2e:0370:7334".to_string(),
+                    pubkey: None,
+                },
+                node_test_id(12) => ApiBoundaryNodeEntry {
+                    domain: "api-bn12-example.com".to_string(),
+                    ipv4_address: None,
+                    ipv6_address: "2001:0db8:85a3:0000:0000:8a2e:0370:7335".to_string(),
+                    pubkey: None,
+                },
             };
 
             let mut routing_table = RoutingTable::new();
@@ -339,8 +353,10 @@ mod tests {
             "1ED37E00D177681A4111B6D45F518DF3E414B0B614333BB6552EBC0D8492B687",
             "62B2E77DFCD17C7E0CE3E762FD37281776C4B0A38CE1B83A1316614C3F849E39",
             "80D4B528CC9E09C775273994261DD544D45EFFF90B655D90FC3A6E3F633ED718",
-            "E1108326097AE9BF8212F333F4F46B9619B947CDF2A73F3223BBEBC6FC2033B6",
-            "EEC0156BE3C97CE6D7E7FBE683FFB4641463648DB6AC6818DCF90114E6A9DA72",
+            "970BC5155AEB4B4F81E470CBF6748EFA7D8805B936998A54AE70B7DD21F5DDCC",
+            "EA3B53B72150E3982CB0E6773F86634685EE7B153DCFE10D86D9927778409D97",
+            "D13F75C42D3E2BDA2F742510029088A9ADB119E30241AC969DE24936489168B5",
+            "D13F75C42D3E2BDA2F742510029088A9ADB119E30241AC969DE24936489168B5",
         ];
 
         for certification_version in CertificationVersion::iter() {

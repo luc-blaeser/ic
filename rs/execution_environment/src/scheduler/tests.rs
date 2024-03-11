@@ -14,25 +14,21 @@ use ic_config::{
     subnet_config::{CyclesAccountManagerConfig, SchedulerConfig, SubnetConfig},
 };
 use ic_error_types::RejectCode;
-use ic_ic00_types::{
+use ic_interfaces::execution_environment::SubnetAvailableMemory;
+use ic_logger::replica_logger::no_op_logger;
+use ic_management_canister_types::{
     self as ic00, BoundedHttpHeaders, CanisterHttpResponsePayload, CanisterIdRecord,
     CanisterStatusType, DerivationPath, EcdsaCurve, EmptyBlob, Method, Payload as _,
 };
-use ic_interfaces::execution_environment::SubnetAvailableMemory;
-use ic_logger::replica_logger::no_op_logger;
 use ic_registry_routing_table::CanisterIdRange;
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::canister_state::system_state::PausedExecutionId;
-use ic_replicated_state::testing::CanisterQueuesTesting;
-use ic_replicated_state::testing::SystemStateTesting;
-use ic_replicated_state::ExportedFunctions;
+use ic_replicated_state::testing::{CanisterQueuesTesting, SystemStateTesting};
 use ic_state_machine_tests::{PayloadBuilder, StateMachineBuilder};
-use ic_test_utilities::types::ids::message_test_id;
 use ic_test_utilities::{
-    mock_time,
     state::{get_running_canister, get_stopped_canister, get_stopping_canister},
     types::{
-        ids::{canister_test_id, subnet_test_id},
+        ids::{canister_test_id, message_test_id, subnet_test_id},
         messages::RequestBuilder,
     },
 };
@@ -40,13 +36,15 @@ use ic_test_utilities_metrics::{
     fetch_counter, fetch_gauge, fetch_gauge_vec, fetch_histogram_stats, fetch_int_gauge,
     fetch_int_gauge_vec, metric_vec, HistogramStats,
 };
-use ic_types::messages::{
-    CallbackId, Payload, RejectContext, Response, StopCanisterCallId, MAX_RESPONSE_COUNT_BYTES,
+use ic_types::{
+    messages::{
+        CallbackId, Payload, RejectContext, Response, StopCanisterCallId, MAX_RESPONSE_COUNT_BYTES,
+        NO_DEADLINE,
+    },
+    methods::SystemMethod,
+    time::{expiry_time_from_now, UNIX_EPOCH},
+    ComputeAllocation, Cycles, Height, NumBytes,
 };
-use ic_types::methods::SystemMethod;
-use ic_types::methods::WasmMethod;
-use ic_types::time::expiry_time_from_now;
-use ic_types::{time::UNIX_EPOCH, ComputeAllocation, Cycles, NumBytes};
 use ic_types_test_utils::ids::user_test_id;
 use ic_universal_canister::{call_args, wasm, UNIVERSAL_CANISTER_WASM};
 use proptest::prelude::*;
@@ -512,20 +510,20 @@ fn induct_messages_on_same_subnet_respects_memory_limits() {
             .receiver(source)
             .build();
         source_canister
-            .push_output_request(self_request.clone().into(), mock_time())
+            .push_output_request(self_request.clone().into(), UNIX_EPOCH)
             .unwrap();
         source_canister
-            .push_output_request(self_request.into(), mock_time())
+            .push_output_request(self_request.into(), UNIX_EPOCH)
             .unwrap();
         let other_request = RequestBuilder::default()
             .sender(source)
             .receiver(dest)
             .build();
         source_canister
-            .push_output_request(other_request.clone().into(), mock_time())
+            .push_output_request(other_request.clone().into(), UNIX_EPOCH)
             .unwrap();
         source_canister
-            .push_output_request(other_request.into(), mock_time())
+            .push_output_request(other_request.into(), UNIX_EPOCH)
             .unwrap();
         test.induct_messages_on_same_subnet();
 
@@ -599,7 +597,7 @@ fn test_message_limit_from_message_overhead() {
     let mut callee = canister0;
     let mut call = other_side(callee, 0);
 
-    for _ in 0..expected_number_of_messages * 10 {
+    for _ in 0..expected_number_of_messages * 3 {
         callee = if callee == canister1 {
             canister0
         } else {
@@ -1864,7 +1862,7 @@ fn scheduler_executes_postponed_raw_rand_requests() {
         .push_raw_rand_request(
             RequestBuilder::new().sender(canister_id).build(),
             last_round,
-            mock_time(),
+            UNIX_EPOCH,
         );
     assert_eq!(
         test.state()
@@ -2075,6 +2073,7 @@ fn can_record_metrics_for_a_round() {
     assert_eq!(metrics.round_scheduling_duration.get_sample_count(), 1);
     assert_eq!(metrics.round_scheduling_duration.get_sample_count(), 1);
     assert!(metrics.round_inner_iteration_prep.get_sample_count() >= 1);
+    assert!(metrics.round_inner_iteration_exe.get_sample_count() >= 1);
     assert!(metrics.round_inner_iteration_fin.get_sample_count() >= 1);
     assert_eq!(metrics.round_finalization_duration.get_sample_count(), 1);
     assert_eq!(
@@ -2498,16 +2497,30 @@ fn execution_round_metrics_are_recorded() {
         13
     );
     assert_eq!(test.state().metadata.subnet_metrics.num_canisters, 3);
-    assert_eq!(3, metrics.round_subnet_queue.duration.get_sample_count());
     assert_eq!(
-        3,
+        1,
+        metrics
+            .round_advance_long_install_code
+            .duration
+            .get_sample_count()
+    );
+    assert_eq!(
+        1,
+        metrics
+            .round_advance_long_install_code
+            .messages
+            .get_sample_count()
+    );
+    assert_eq!(2, metrics.round_subnet_queue.duration.get_sample_count());
+    assert_eq!(
+        2,
         metrics.round_subnet_queue.instructions.get_sample_count()
     );
     assert_eq!(
         30,
         metrics.round_subnet_queue.instructions.get_sample_sum() as u64,
     );
-    assert_eq!(3, metrics.round_subnet_queue.messages.get_sample_count());
+    assert_eq!(2, metrics.round_subnet_queue.messages.get_sample_count());
     assert_eq!(
         3,
         metrics.round_subnet_queue.messages.get_sample_sum() as u64,
@@ -3033,6 +3046,7 @@ fn ecdsa_signature_agreements_metric_is_updated() {
         originator_reply_callback: *callback_id,
         refund: context.request.payment,
         response_payload: Payload::Reject(RejectContext::new(RejectCode::SysFatal, "")),
+        deadline: context.request.deadline,
     };
 
     test.state_mut().consensus_queue.push(response);
@@ -3081,6 +3095,7 @@ fn ecdsa_signature_agreements_metric_is_updated() {
             }
             .encode(),
         ),
+        deadline: NO_DEADLINE,
     };
 
     test.state_mut().consensus_queue.push(response);
@@ -3408,7 +3423,7 @@ fn expired_ingress_messages_are_removed_from_ingress_queues() {
             test.send_ingress_with_expiry(
                 canister_id,
                 ingress(1000),
-                batch_time.saturating_sub_duration(Duration::from_secs(1)),
+                batch_time.saturating_sub(Duration::from_secs(1)),
             );
         } else {
             test.send_ingress_with_expiry(
@@ -3437,7 +3452,7 @@ fn expired_ingress_messages_are_removed_from_ingress_queues() {
             test.inject_ingress_to_ic00(
                 Method::CanisterStatus,
                 payload,
-                batch_time.saturating_sub_duration(Duration::from_secs(1)),
+                batch_time.saturating_sub(Duration::from_secs(1)),
             );
         }
     }
@@ -3638,190 +3653,187 @@ prop_compose! {
     }
 }
 
-proptest! {
-    // In the following tests we use a notion of `minimum_executed_messages` per
-    // execution round. The minimum is defined as `min(available_messages,
-    // floor(`max_instructions_per_round` / `max_instructions_per_message`))`. `available_messages` are the sum of
-    // messages in the input queues of all canisters.
+// In the following tests we use a notion of `minimum_executed_messages` per
+// execution round. The minimum is defined as `min(available_messages,
+// floor(`max_instructions_per_round` / `max_instructions_per_message`))`. `available_messages` are the sum of
+// messages in the input queues of all canisters.
 
-    #[test]
-    // This test verifies that the scheduler will never consume more than
-    // `max_instructions_per_round` in a single execution round per core.
-    fn should_never_consume_more_than_max_instructions_per_round_in_a_single_execution_round(
-        (
-            mut test,
-            scheduler_cores,
-            instructions_per_round,
-            instructions_per_message,
-        ) in arb_scheduler_test(2..10, 1..20, 1..100, M..B, 1..M, 100, false),
-    ) {
-        let available_messages = get_available_messages(test.state());
-        let minimum_executed_messages = min(
-            available_messages,
-            instructions_per_round / instructions_per_message,
-        );
-        test.execute_round(ExecutionRoundType::OrdinaryRound);
-        let mut executed = HashMap::new();
-        for (round, _canister_id, instructions) in test.executed_schedule().into_iter() {
-            let entry = executed.entry(round).or_insert(0);
-            assert!(instructions <= instructions_per_message);
-            *entry += instructions.get();
-        }
-        for instructions in executed.values() {
-            assert!(
-                *instructions / scheduler_cores as u64 <= instructions_per_round.get(),
-                "Executed more instructions than expected: {} <= {}",
-                *instructions,
-                instructions_per_round
-            );
-        }
-        let total_executed_instructions: u64 = executed.into_values().sum();
-        let total_executed_messages: u64 = total_executed_instructions / instructions_per_message.get();
+#[test_strategy::proptest]
+// This test verifies that the scheduler will never consume more than
+// `max_instructions_per_round` in a single execution round per core.
+fn should_never_consume_more_than_max_instructions_per_round_in_a_single_execution_round(
+    #[strategy(arb_scheduler_test(2..10, 1..20, 1..100, M..B, 1..M, 100, false))] test: (
+        SchedulerTest,
+        usize,
+        NumInstructions,
+        NumInstructions,
+    ),
+) {
+    let (mut test, scheduler_cores, instructions_per_round, instructions_per_message) = test;
+    let available_messages = get_available_messages(test.state());
+    let minimum_executed_messages = min(
+        available_messages,
+        instructions_per_round / instructions_per_message,
+    );
+    test.execute_round(ExecutionRoundType::OrdinaryRound);
+    let mut executed = HashMap::new();
+    for (round, _canister_id, instructions) in test.executed_schedule().into_iter() {
+        let entry = executed.entry(round).or_insert(0);
+        assert!(instructions <= instructions_per_message);
+        *entry += instructions.get();
+    }
+    for instructions in executed.values() {
         assert!(
-            minimum_executed_messages <= total_executed_messages,
-            "Executed {} messages but expected at least {}.",
-            total_executed_messages,
-            minimum_executed_messages,
+            *instructions / scheduler_cores as u64 <= instructions_per_round.get(),
+            "Executed more instructions than expected: {} <= {}",
+            *instructions,
+            instructions_per_round
         );
     }
+    let total_executed_instructions: u64 = executed.into_values().sum();
+    let total_executed_messages: u64 = total_executed_instructions / instructions_per_message.get();
+    assert!(
+        minimum_executed_messages <= total_executed_messages,
+        "Executed {} messages but expected at least {}.",
+        total_executed_messages,
+        minimum_executed_messages,
+    );
+}
 
-    #[test]
-    // This test verifies that the scheduler is deterministic, i.e. given
-    // the same input, if we execute a round of computation, we always
-    // get the same result.
-    fn scheduler_deterministically_produces_same_output_given_same_input(
-        (
-            mut test1,
-            mut test2,
-            _scheduler_cores,
-            _instructions_per_round,
-            _instructions_per_message,
-        ) in arb_scheduler_test_double(2..10, 1..20, 1..100, M..B, 1..M, 100, false),
-    ) {
-        assert_eq!(test1.state(), test2.state());
-        test1.execute_round(ExecutionRoundType::OrdinaryRound);
-        test2.execute_round(ExecutionRoundType::OrdinaryRound);
-        assert_eq!(test1.state(), test2.state());
+#[test_strategy::proptest]
+// This test verifies that the scheduler is deterministic, i.e. given
+// the same input, if we execute a round of computation, we always
+// get the same result.
+fn scheduler_deterministically_produces_same_output_given_same_input(
+    #[strategy(arb_scheduler_test_double(2..10, 1..20, 1..100, M..B, 1..M, 100, false))] test: (
+        SchedulerTest,
+        SchedulerTest,
+        usize,
+        NumInstructions,
+        NumInstructions,
+    ),
+) {
+    let (mut test1, mut test2, _cores, _instructions_per_round, _instructions_per_message) = test;
+    assert_eq!(test1.state(), test2.state());
+    test1.execute_round(ExecutionRoundType::OrdinaryRound);
+    test2.execute_round(ExecutionRoundType::OrdinaryRound);
+    assert_eq!(test1.state(), test2.state());
+}
+
+#[test_strategy::proptest]
+// This test verifies that the scheduler can successfully deplete the induction
+// pool given sufficient consecutive execution rounds.
+fn scheduler_can_deplete_induction_pool_given_enough_execution_rounds(
+    #[strategy(arb_scheduler_test(2..10, 1..20, 1..100, M..B, 1..M, 100, false))] test: (
+        SchedulerTest,
+        usize,
+        NumInstructions,
+        NumInstructions,
+    ),
+) {
+    let (mut test, _scheduler_cores, instructions_per_round, instructions_per_message) = test;
+    let available_messages = get_available_messages(test.state());
+    let minimum_executed_messages = min(
+        available_messages,
+        instructions_per_round / instructions_per_message,
+    );
+    let required_rounds = if minimum_executed_messages != 0 {
+        available_messages / minimum_executed_messages + 1
+    } else {
+        1
+    };
+    for _ in 0..required_rounds {
+        test.execute_round(ExecutionRoundType::OrdinaryRound);
     }
-
-    #[test]
-    // This test verifies that the scheduler can successfully deplete the induction
-    // pool given sufficient consecutive execution rounds.
-    fn scheduler_can_deplete_induction_pool_given_enough_execution_rounds(
-        (
-            mut test,
-            _scheduler_cores,
-            instructions_per_round,
-            instructions_per_message,
-        ) in arb_scheduler_test(2..10, 1..20, 1..100, M..B, 1..M, 100, false),
-    ) {
-        let available_messages = get_available_messages(test.state());
-        let minimum_executed_messages = min(
-            available_messages,
-            instructions_per_round / instructions_per_message
-        );
-        let required_rounds = if minimum_executed_messages != 0 {
-            available_messages / minimum_executed_messages + 1
-        } else {
-            1
-        };
-        for _ in 0..required_rounds {
-            test.execute_round(ExecutionRoundType::OrdinaryRound);
-        }
-        for canister_state in test.state().canisters_iter() {
-            assert_eq!(canister_state.system_state.queues().ingress_queue_size(), 0);
-        }
-    }
-
-    #[test]
-    // This test verifies that the scheduler does not lose any canisters
-    // after an execution round.
-    fn scheduler_does_not_lose_canisters(
-        (
-            mut test,
-            _scheduler_cores,
-            _instructions_per_round,
-            _instructions_per_message,
-        ) in arb_scheduler_test(2..3, 1..10, 1..100, M..B, 1..M, 100, false),
-    ) {
-        let canisters_before = test.state().canisters_iter().count();
-         test.execute_round(ExecutionRoundType::OrdinaryRound);
-        let canisters_after = test.state().canisters_iter().count();
-        assert_eq!(canisters_before, canisters_after);
+    for canister_state in test.state().canisters_iter() {
+        assert_eq!(canister_state.system_state.queues().ingress_queue_size(), 0);
     }
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: 20, .. ProptestConfig::default()
-    })]
-    #[test]
-    // Verifies that each canister is scheduled as the first of its thread as
-    // much as its compute_allocation requires.
-    fn scheduler_respects_compute_allocation(
-        (
-            mut test,
-            scheduler_cores,
-            _instructions_per_round,
-            _instructions_per_message,
-        ) in arb_scheduler_test(2..10, 1..20, 0..1, B..B+1, B..B+1, 0, true),
-    ) {
-        let replicated_state = test.state();
-        let number_of_canisters = replicated_state.canister_states.len();
-        let total_compute_allocation = replicated_state.total_compute_allocation();
-        assert!(total_compute_allocation <= 100 * scheduler_cores as u64);
+#[test_strategy::proptest]
+// This test verifies that the scheduler does not lose any canisters
+// after an execution round.
+fn scheduler_does_not_lose_canisters(
+    #[strategy(arb_scheduler_test(2..3, 1..10, 1..100, M..B, 1..M, 100, false))] test: (
+        SchedulerTest,
+        usize,
+        NumInstructions,
+        NumInstructions,
+    ),
+) {
+    let (mut test, _scheduler_cores, _instructions_per_round, _instructions_per_message) = test;
+    let canisters_before = test.state().canisters_iter().count();
+    test.execute_round(ExecutionRoundType::OrdinaryRound);
+    let canisters_after = test.state().canisters_iter().count();
+    assert_eq!(canisters_before, canisters_after);
+}
 
-        // Count, for each canister, how many times it is the first canister
-        // to be executed by a thread.
-        let mut scheduled_first_counters = HashMap::<CanisterId, usize>::new();
+#[test_strategy::proptest(ProptestConfig { cases: 20, ..ProptestConfig::default() })]
+// Verifies that each canister is scheduled as the first of its thread as
+// much as its compute_allocation requires.
+fn scheduler_respects_compute_allocation(
+    #[strategy(arb_scheduler_test(2..10, 1..20, 0..1, B..B+1, B..B+1, 0, true))] test: (
+        SchedulerTest,
+        usize,
+        NumInstructions,
+        NumInstructions,
+    ),
+) {
+    let (mut test, scheduler_cores, _instructions_per_round, _instructions_per_message) = test;
+    let replicated_state = test.state();
+    let number_of_canisters = replicated_state.canister_states.len();
+    let total_compute_allocation = replicated_state.total_compute_allocation();
+    assert!(total_compute_allocation <= 100 * scheduler_cores as u64);
 
-        // Because we may be left with as little free compute capacity as 1, run for
-        // enough rounds that every canister gets a chance to be scheduled at least once
-        // for free, i.e. `100 * number_of_canisters` rounds.
-        let number_of_rounds = 100 * number_of_canisters;
+    // Count, for each canister, how many times it is the first canister
+    // to be executed by a thread.
+    let mut scheduled_first_counters = HashMap::<CanisterId, usize>::new();
 
-        let canister_ids: Vec<_> = test.state().canister_states.iter().map(|x| *x.0).collect();
+    // Because we may be left with as little free compute capacity as 1, run for
+    // enough rounds that every canister gets a chance to be scheduled at least once
+    // for free, i.e. `100 * number_of_canisters` rounds.
+    let number_of_rounds = 100 * number_of_canisters;
 
-        for _ in 0..number_of_rounds {
-            for canister_id in canister_ids.iter() {
-                test.expect_heartbeat(*canister_id, instructions(B as u64));
-            }
-            test.execute_round(ExecutionRoundType::OrdinaryRound);
-            for (canister_id, canister) in test.state().canister_states.iter() {
-                if canister.scheduler_state.last_full_execution_round == test.last_round() {
-                    let count = scheduled_first_counters.entry(*canister_id).or_insert(0);
-                    *count += 1;
-                }
-            }
+    let canister_ids: Vec<_> = test.state().canister_states.iter().map(|x| *x.0).collect();
+
+    for _ in 0..number_of_rounds {
+        for canister_id in canister_ids.iter() {
+            test.expect_heartbeat(*canister_id, instructions(B as u64));
         }
-
-        // Check that the compute allocations of the canisters are respected.
+        test.execute_round(ExecutionRoundType::OrdinaryRound);
         for (canister_id, canister) in test.state().canister_states.iter() {
-            let compute_allocation =
-                canister.scheduler_state.compute_allocation.as_percent() as usize;
-
-            let count = scheduled_first_counters.get(canister_id).unwrap_or(&0);
-
-            // Due to `total_compute_allocation < 100 * scheduler_cores`, all canisters
-            // except those with an allocation of 100 should have gotten scheduled for free
-            // at least once.
-            let expected_count = if compute_allocation == 100 {
-                number_of_rounds
-            } else {
-                number_of_rounds / 100 * compute_allocation + 1
-            };
-
-            assert!(
-                *count >= expected_count,
-                "Canister {} (allocation {}) should have been scheduled \
-                    {} out of {} rounds, was scheduled only {} rounds instead.",
-                canister_id,
-                compute_allocation,
-                expected_count,
-                number_of_rounds,
-                *count
-            );
+            if canister.scheduler_state.last_full_execution_round == test.last_round() {
+                let count = scheduled_first_counters.entry(*canister_id).or_insert(0);
+                *count += 1;
+            }
         }
+    }
+
+    // Check that the compute allocations of the canisters are respected.
+    for (canister_id, canister) in test.state().canister_states.iter() {
+        let compute_allocation = canister.scheduler_state.compute_allocation.as_percent() as usize;
+
+        let count = scheduled_first_counters.get(canister_id).unwrap_or(&0);
+
+        // Due to `total_compute_allocation < 100 * scheduler_cores`, all canisters
+        // except those with an allocation of 100 should have gotten scheduled for free
+        // at least once.
+        let expected_count = if compute_allocation == 100 {
+            number_of_rounds
+        } else {
+            number_of_rounds / 100 * compute_allocation + 1
+        };
+
+        assert!(
+            *count >= expected_count,
+            "Canister {} (allocation {}) should have been scheduled \
+                    {} out of {} rounds, was scheduled only {} rounds instead.",
+            canister_id,
+            compute_allocation,
+            expected_count,
+            number_of_rounds,
+            *count
+        );
     }
 }
 
@@ -3840,7 +3852,6 @@ fn rate_limiting_of_install_code() {
             ..SchedulerConfig::application_subnet()
         })
         .with_rate_limiting_of_instructions()
-        .with_deterministic_time_slicing()
         .build();
 
     let canister = test.create_canister();
@@ -3922,7 +3933,6 @@ fn dts_long_execution_completes() {
             max_instructions_per_slice: NumInstructions::from(100),
             ..SchedulerConfig::application_subnet()
         })
-        .with_deterministic_time_slicing()
         .build();
 
     let canister = test.create_canister();
@@ -3958,7 +3968,6 @@ fn cannot_execute_management_message_for_targeted_long_execution_canister() {
             max_instructions_per_slice: NumInstructions::from(100),
             ..SchedulerConfig::application_subnet()
         })
-        .with_deterministic_time_slicing()
         .build();
 
     let canister = test.create_canister();
@@ -4025,7 +4034,6 @@ fn dts_long_execution_runs_out_of_instructions() {
             max_instructions_per_slice: NumInstructions::from(100),
             ..SchedulerConfig::application_subnet()
         })
-        .with_deterministic_time_slicing()
         .build();
 
     let canister = test.create_canister();
@@ -4066,7 +4074,6 @@ fn complete_concurrent_long_executions(
             max_paused_executions: num_canisters,
             ..SchedulerConfig::application_subnet()
         })
-        .with_deterministic_time_slicing()
         .build();
 
     let mut message_ids = vec![];
@@ -4108,7 +4115,6 @@ fn respect_max_paused_executions(
             max_paused_executions,
             ..SchedulerConfig::application_subnet()
         })
-        .with_deterministic_time_slicing()
         .build();
 
     let mut message_ids = vec![];
@@ -4162,7 +4168,6 @@ fn break_after_long_executions(#[strategy(2..10_usize)] scheduler_cores: usize) 
             max_paused_executions: num_canisters,
             ..SchedulerConfig::application_subnet()
         })
-        .with_deterministic_time_slicing()
         .build();
 
     // Create one canister with many long messages
@@ -4228,7 +4233,6 @@ fn filter_after_long_executions() {
             max_instructions_per_message_without_dts: max_instructions_per_slice.into(),
             ..SchedulerConfig::application_subnet()
         })
-        .with_deterministic_time_slicing()
         .build();
 
     // Create a canister with long messages
@@ -4271,7 +4275,6 @@ fn dts_allow_only_one_long_install_code_execution_at_any_time() {
             max_instructions_per_install_code_slice: NumInstructions::new(10),
             ..SchedulerConfig::application_subnet()
         })
-        .with_deterministic_time_slicing()
         .build();
 
     let canister_1 = test.create_canister();
@@ -4322,7 +4325,15 @@ fn dts_allow_only_one_long_install_code_execution_at_any_time() {
             .round_subnet_queue
             .slices
             .get_sample_sum(),
-        2.0
+        1.0
+    );
+    assert_eq!(
+        test.scheduler()
+            .metrics
+            .round_advance_long_install_code
+            .slices
+            .get_sample_sum(),
+        1.0
     );
     assert_eq!(
         test.scheduler()
@@ -4374,7 +4385,7 @@ fn dts_allow_only_one_long_install_code_execution_at_any_time() {
             .round_subnet_queue
             .slices
             .get_sample_sum(),
-        4.0
+        2.0
     );
     assert_eq!(
         test.scheduler()
@@ -4382,7 +4393,23 @@ fn dts_allow_only_one_long_install_code_execution_at_any_time() {
             .round_subnet_queue
             .messages
             .get_sample_sum(),
+        1.0
+    );
+    assert_eq!(
+        test.scheduler()
+            .metrics
+            .round_advance_long_install_code
+            .slices
+            .get_sample_sum(),
         2.0
+    );
+    assert_eq!(
+        test.scheduler()
+            .metrics
+            .round_advance_long_install_code
+            .messages
+            .get_sample_sum(),
+        1.0
     );
 
     // Execute another round to refresh the metrics
@@ -4415,7 +4442,6 @@ fn dts_resume_install_code_after_abort() {
             max_instructions_per_install_code_slice: NumInstructions::new(10),
             ..SchedulerConfig::application_subnet()
         })
-        .with_deterministic_time_slicing()
         .build();
 
     let canister = test.create_canister();
@@ -4467,7 +4493,6 @@ fn dts_resume_long_execution_after_abort() {
             max_instructions_per_slice: NumInstructions::from(100),
             ..SchedulerConfig::application_subnet()
         })
-        .with_deterministic_time_slicing()
         .build();
 
     let canister = test.create_canister();
@@ -4516,7 +4541,6 @@ fn dts_update_and_heartbeat() {
             max_instructions_per_slice: NumInstructions::from(100),
             ..SchedulerConfig::application_subnet()
         })
-        .with_deterministic_time_slicing()
         .build();
 
     let canister = test.create_canister_with(
@@ -4649,18 +4673,18 @@ fn scheduler_resets_accumulated_priorities() {
 
 #[test]
 fn test_is_next_method_added_to_task_queue() {
-    let mut test = SchedulerTestBuilder::new()
-        .with_deterministic_time_slicing()
-        .build();
+    let mut test = SchedulerTestBuilder::new().build();
 
     let canister = test.create_canister_with(
         Cycles::new(1_000_000_000_000),
         ComputeAllocation::zero(),
         MemoryAllocation::BestEffort,
-        Some(SystemMethod::CanisterGlobalTimer),
+        None,
         None,
         None,
     );
+    let may_schedule_heartbeat = false;
+    let may_schedule_global_timer = false;
 
     let mut heartbeat_and_timer_canister_ids = BTreeSet::new();
     assert!(!test
@@ -4675,22 +4699,17 @@ fn test_is_next_method_added_to_task_queue() {
         assert!(!is_next_method_chosen(
             test.canister_state_mut(canister),
             &mut heartbeat_and_timer_canister_ids,
-            false
+            may_schedule_heartbeat,
+            may_schedule_global_timer,
         ));
         assert_eq!(heartbeat_and_timer_canister_ids, BTreeSet::new());
         test.canister_state_mut(canister)
             .inc_next_scheduled_method();
     }
 
-    // Make canister export heartbeat and global timer.
-    test.canister_state_mut(canister)
-        .execution_state
-        .as_mut()
-        .unwrap()
-        .exports = ExportedFunctions::new(BTreeSet::from([
-        WasmMethod::System(SystemMethod::CanisterHeartbeat),
-        WasmMethod::System(SystemMethod::CanisterGlobalTimer),
-    ]));
+    // Make canister able to schedule both heartbeat and global timer.
+    let may_schedule_heartbeat = true;
+    let may_schedule_global_timer = true;
 
     // Set input.
     test.canister_state_mut(canister)
@@ -4724,7 +4743,8 @@ fn test_is_next_method_added_to_task_queue() {
     assert!(is_next_method_chosen(
         test.canister_state_mut(canister),
         &mut heartbeat_and_timer_canister_ids,
-        true
+        may_schedule_heartbeat,
+        may_schedule_global_timer,
     ));
 
     // Since NextScheduledMethod is Message it is not expected that Heartbeat
@@ -4760,7 +4780,8 @@ fn test_is_next_method_added_to_task_queue() {
     assert!(is_next_method_chosen(
         test.canister_state_mut(canister),
         &mut heartbeat_and_timer_canister_ids,
-        true
+        may_schedule_heartbeat,
+        may_schedule_global_timer,
     ));
 
     assert_eq!(heartbeat_and_timer_canister_ids, BTreeSet::from([canister]));
@@ -4807,7 +4828,8 @@ fn test_is_next_method_added_to_task_queue() {
     assert!(is_next_method_chosen(
         test.canister_state_mut(canister),
         &mut heartbeat_and_timer_canister_ids,
-        true
+        may_schedule_heartbeat,
+        may_schedule_global_timer,
     ));
 
     assert_eq!(heartbeat_and_timer_canister_ids, BTreeSet::from([canister]));
@@ -4838,6 +4860,168 @@ fn test_is_next_method_added_to_task_queue() {
         .pop_front();
 
     assert_eq!(heartbeat_and_timer_canister_ids, BTreeSet::from([canister]));
+}
+
+pub(crate) fn make_key_id(id: u64) -> EcdsaKeyId {
+    EcdsaKeyId::from_str(&format!("Secp256k1:key_{:?}", id)).unwrap()
+}
+
+fn inject_ecdsa_signing_request(test: &mut SchedulerTest, key_id: &EcdsaKeyId) {
+    let canister_id = test.create_canister();
+
+    let payload = Encode!(&SignWithECDSAArgs {
+        message_hash: [0; 32],
+        derivation_path: DerivationPath::new(Vec::new()),
+        key_id: key_id.clone()
+    })
+    .unwrap();
+
+    test.inject_call_to_ic00(
+        Method::SignWithECDSA,
+        payload.clone(),
+        test.ecdsa_signature_fee(),
+        canister_id,
+        InputQueueType::RemoteSubnet,
+    );
+}
+
+#[test]
+fn test_sign_with_ecdsa_contexts_are_not_updated_without_quadruples() {
+    let key_id = make_key_id(0);
+    let mut test = SchedulerTestBuilder::new()
+        .with_ecdsa_key(key_id.clone())
+        .build();
+
+    inject_ecdsa_signing_request(&mut test, &key_id);
+
+    // Check that nonce isn't set in the following round
+    for _ in 0..2 {
+        test.execute_round(ExecutionRoundType::OrdinaryRound);
+
+        let sign_with_ecdsa_context = &test
+            .state()
+            .sign_with_ecdsa_contexts()
+            .values()
+            .next()
+            .expect("Context should exist");
+
+        // Check that quadruple and nonce are none
+        assert!(sign_with_ecdsa_context.nonce.is_none());
+        assert!(sign_with_ecdsa_context.matched_quadruple.is_none());
+    }
+}
+
+#[test]
+fn test_sign_with_ecdsa_contexts_are_updated_with_quadruples() {
+    let key_id = make_key_id(0);
+    let mut test = SchedulerTestBuilder::new()
+        .with_ecdsa_key(key_id.clone())
+        .build();
+    let quadruple_id = QuadrupleId(0, Some(key_id.clone()));
+    let quadruple_ids = BTreeSet::from_iter([quadruple_id.clone()]);
+
+    inject_ecdsa_signing_request(&mut test, &key_id);
+    test.deliver_quadruple_ids(BTreeMap::from_iter([(key_id, quadruple_ids)]));
+
+    test.execute_round(ExecutionRoundType::OrdinaryRound);
+    let sign_with_ecdsa_context = &test
+        .state()
+        .sign_with_ecdsa_contexts()
+        .values()
+        .next()
+        .expect("Context should exist");
+
+    let expected_height = Height::from(test.last_round().get());
+
+    // Check that quadruple was matched
+    assert_eq!(
+        sign_with_ecdsa_context.matched_quadruple,
+        Some((quadruple_id.clone(), expected_height))
+    );
+    // Check that nonce is still none
+    assert!(sign_with_ecdsa_context.nonce.is_none());
+
+    test.execute_round(ExecutionRoundType::OrdinaryRound);
+    let sign_with_ecdsa_context = &test
+        .state()
+        .sign_with_ecdsa_contexts()
+        .values()
+        .next()
+        .expect("Context should exist");
+
+    // Check that quadruple is still matched
+    assert_eq!(
+        sign_with_ecdsa_context.matched_quadruple,
+        Some((quadruple_id, expected_height))
+    );
+    // Check that nonce is set
+    let nonce = sign_with_ecdsa_context.nonce;
+    assert!(nonce.is_some());
+
+    test.execute_round(ExecutionRoundType::OrdinaryRound);
+    let sign_with_ecdsa_context = &test
+        .state()
+        .sign_with_ecdsa_contexts()
+        .values()
+        .next()
+        .expect("Context should exist");
+
+    // Check that nonce wasn't changed
+    let nonce = sign_with_ecdsa_context.nonce;
+    assert_eq!(sign_with_ecdsa_context.nonce, nonce);
+}
+
+#[test]
+fn test_sign_with_ecdsa_contexts_are_matched_under_multiple_keys() {
+    let key_ids: Vec<_> = (0..3).map(make_key_id).collect();
+    let mut test = SchedulerTestBuilder::new()
+        .with_ecdsa_keys(key_ids.clone())
+        .build();
+
+    // Deliver 2 quadruples for the first key, 1 for the second, 0 for the third
+    let quadruple_ids0 = BTreeSet::from_iter([
+        QuadrupleId(0, Some(key_ids[0].clone())),
+        QuadrupleId(1, Some(key_ids[0].clone())),
+    ]);
+    let quadruple_ids1 = BTreeSet::from_iter([QuadrupleId(2, Some(key_ids[1].clone()))]);
+    let quadruple_id_map = BTreeMap::from_iter([
+        (key_ids[0].clone(), quadruple_ids0.clone()),
+        (key_ids[1].clone(), quadruple_ids1.clone()),
+    ]);
+    test.deliver_quadruple_ids(quadruple_id_map);
+
+    // Inject 3 contexts requesting the third, second and first key in order
+    for i in (0..3).rev() {
+        inject_ecdsa_signing_request(&mut test, &key_ids[i])
+    }
+
+    // Execute two rounds
+    for _ in 0..2 {
+        test.execute_round(ExecutionRoundType::OrdinaryRound);
+    }
+
+    let sign_with_ecdsa_contexts = &test.state().sign_with_ecdsa_contexts();
+
+    // First context (requesting key 3) should be unmatched
+    let context0 = sign_with_ecdsa_contexts.get(&CallbackId::from(0)).unwrap();
+    assert!(context0.nonce.is_none());
+    assert!(context0.matched_quadruple.is_none());
+
+    // Remaining contexts should have been matched
+    let expected_height = Height::from(test.last_round().get() - 1);
+    let context1 = sign_with_ecdsa_contexts.get(&CallbackId::from(1)).unwrap();
+    assert!(context1.nonce.is_some());
+    assert_eq!(
+        context1.matched_quadruple,
+        Some((quadruple_ids1.first().unwrap().clone(), expected_height))
+    );
+
+    let context2 = sign_with_ecdsa_contexts.get(&CallbackId::from(2)).unwrap();
+    assert!(context2.nonce.is_some());
+    assert_eq!(
+        context2.matched_quadruple,
+        Some((quadruple_ids0.first().unwrap().clone(), expected_height))
+    );
 }
 
 #[test]
@@ -4877,7 +5061,7 @@ fn clean_in_progress_raw_rand_request_from_subnet_call_context_manager() {
         .push_raw_rand_request(
             RequestBuilder::new().sender(canister_id).build(),
             last_round,
-            mock_time(),
+            UNIX_EPOCH,
         );
     // `SubnetCallContextManager` contains one `RawRandContext`.
     assert_eq!(

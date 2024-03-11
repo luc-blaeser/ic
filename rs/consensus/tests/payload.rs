@@ -3,7 +3,7 @@ mod framework;
 use crate::framework::ConsensusDriver;
 use ic_artifact_pool::{consensus_pool, dkg_pool, ecdsa_pool};
 use ic_consensus::consensus::dkg_key_manager::DkgKeyManager;
-use ic_consensus::{certification::CertifierImpl, dkg};
+use ic_consensus::{certification::CertifierImpl, dkg, ecdsa};
 use ic_consensus_utils::{membership::Membership, pool_reader::PoolReader};
 use ic_https_outcalls_consensus::test_utils::FakeCanisterHttpPayloadBuilder;
 use ic_interfaces_state_manager::Labeled;
@@ -11,6 +11,7 @@ use ic_interfaces_state_manager_mocks::MockStateManager;
 use ic_logger::replica_logger::no_op_logger;
 use ic_metrics::MetricsRegistry;
 use ic_test_utilities::consensus::batch::MockBatchPayloadBuilder;
+use ic_test_utilities::consensus::EcdsaStatsNoOp;
 use ic_test_utilities::{
     consensus::make_genesis,
     crypto::CryptoReturningOk,
@@ -21,11 +22,11 @@ use ic_test_utilities::{
     types::ids::{node_test_id, subnet_test_id},
     types::messages::SignedIngressBuilder,
     xnet_payload_builder::FakeXNetPayloadBuilder,
-    FastForwardTimeSource,
 };
 use ic_test_utilities_registry::{
     setup_registry, FakeLocalStoreCertifiedTimeReader, SubnetRecordBuilder,
 };
+use ic_test_utilities_time::FastForwardTimeSource;
 use ic_types::{
     crypto::CryptoHash, malicious_flags::MaliciousFlags, replica_config::ReplicaConfig,
     CryptoHashOfState, Height,
@@ -77,6 +78,9 @@ fn consensus_produces_expected_batches() {
                 Height::new(0),
                 Arc::new(get_initial_state(0, 0)),
             )));
+        state_manager
+            .expect_get_certified_state_snapshot()
+            .returning(|| None);
         let state_manager = Arc::new(state_manager);
 
         let router = FakeMessageRouting::default();
@@ -89,7 +93,7 @@ fn consensus_produces_expected_batches() {
         let fake_crypto = CryptoReturningOk::default();
         let fake_crypto = Arc::new(fake_crypto);
         let metrics_registry = MetricsRegistry::new();
-        let time = FastForwardTimeSource::new();
+        let time_source = FastForwardTimeSource::new();
         let dkg_pool = Arc::new(RwLock::new(dkg_pool::DkgPoolImpl::new(
             metrics_registry.clone(),
             no_op_logger(),
@@ -98,6 +102,7 @@ fn consensus_produces_expected_batches() {
             pool_config.clone(),
             no_op_logger(),
             metrics_registry.clone(),
+            Box::new(EcdsaStatsNoOp {}),
         )));
 
         let registry_client = setup_registry(
@@ -112,6 +117,7 @@ fn consensus_produces_expected_batches() {
             pool_config.clone(),
             MetricsRegistry::new(),
             no_op_logger(),
+            time_source.clone(),
         )));
         let consensus_cache = consensus_pool.read().unwrap().get_cache();
         let membership = Membership::new(
@@ -127,7 +133,7 @@ fn consensus_produces_expected_batches() {
             &PoolReader::new(&*consensus_pool.read().unwrap()),
         )));
         let fake_local_store_certified_time_reader =
-            Arc::new(FakeLocalStoreCertifiedTimeReader::new(time.clone()));
+            Arc::new(FakeLocalStoreCertifiedTimeReader::new(time_source.clone()));
 
         let (consensus, consensus_gossip) = ic_consensus::consensus::setup(
             replica_config.clone(),
@@ -144,7 +150,7 @@ fn consensus_produces_expected_batches() {
             dkg_key_manager.clone(),
             Arc::clone(&router) as Arc<_>,
             Arc::clone(&state_manager) as Arc<_>,
-            Arc::clone(&time) as Arc<_>,
+            Arc::clone(&time_source) as Arc<_>,
             MaliciousFlags::default(),
             metrics_registry.clone(),
             no_op_logger(),
@@ -158,6 +164,15 @@ fn consensus_produces_expected_batches() {
             dkg_key_manager,
             metrics_registry.clone(),
             no_op_logger(),
+        );
+        let ecdsa = ecdsa::EcdsaImpl::new(
+            replica_config.node_id,
+            consensus_pool.read().unwrap().get_block_cache(),
+            Arc::clone(&fake_crypto) as Arc<_>,
+            Arc::clone(&state_manager) as Arc<_>,
+            metrics_registry.clone(),
+            no_op_logger(),
+            MaliciousFlags::default(),
         );
         let certifier = CertifierImpl::new(
             replica_config.clone(),
@@ -175,16 +190,18 @@ fn consensus_produces_expected_batches() {
             Box::new(consensus),
             consensus_gossip,
             dkg,
+            Box::new(ecdsa),
             Box::new(certifier),
             consensus_pool,
             dkg_pool,
+            ecdsa_pool,
             no_op_logger(),
             metrics_registry,
         );
         driver.step(); // this stops before notary timeout expires after making 1st block
-        time.advance_time(Duration::from_millis(2000));
+        time_source.advance_time(Duration::from_millis(2000));
         driver.step(); // this stops before notary timeout expires after making 2nd block
-        time.advance_time(Duration::from_millis(2000));
+        time_source.advance_time(Duration::from_millis(2000));
         driver.step(); // this stops before notary timeout expires after making 3rd block
         let batches = router.batches.read().unwrap().clone();
         *router.batches.write().unwrap() = Vec::new();

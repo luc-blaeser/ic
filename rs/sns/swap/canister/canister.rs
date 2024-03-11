@@ -309,11 +309,9 @@ fn get_init() {
 
 /// Returns the initialization data of the canister
 #[candid_method(query, rename = "get_init")]
-async fn get_init_(_request: GetInitRequest) -> GetInitResponse {
+async fn get_init_(request: GetInitRequest) -> GetInitResponse {
     log!(INFO, "get_init");
-    GetInitResponse {
-        init: swap().init.clone(),
-    }
+    swap().get_init(&request)
 }
 
 /// Return the current derived state of the Swap
@@ -687,13 +685,13 @@ mod tests {
             module_hash: Some(vec![0_u8]),
             settings: DefiniteCanisterSettingsArgs {
                 controllers: vec![PrincipalId::new_user_test_id(0)],
-                compute_allocation: candid::Nat::from(0),
-                memory_allocation: candid::Nat::from(0),
-                freezing_threshold: candid::Nat::from(0),
+                compute_allocation: candid::Nat::from(0_u32),
+                memory_allocation: candid::Nat::from(0_u32),
+                freezing_threshold: candid::Nat::from(0_u32),
             },
-            memory_size: candid::Nat::from(0),
-            cycles: candid::Nat::from(0),
-            idle_cycles_burned_per_day: candid::Nat::from(0),
+            memory_size: candid::Nat::from(0_u32),
+            cycles: candid::Nat::from(0_u32),
+            idle_cycles_burned_per_day: candid::Nat::from(0_u32),
         };
 
         let management_canister_client = MockManagementCanisterClient::new(vec![
@@ -701,15 +699,15 @@ mod tests {
                 CanisterStatusResultFromManagementCanister {
                     status: CanisterStatusType::Running,
                     module_hash: Some(vec![0_u8]),
-                    memory_size: candid::Nat::from(0),
+                    memory_size: candid::Nat::from(0_u32),
                     settings: DefiniteCanisterSettingsFromManagementCanister {
-                        controllers: vec![PrincipalId::new_user_test_id(0)],
-                        compute_allocation: candid::Nat::from(0),
-                        memory_allocation: candid::Nat::from(0),
-                        freezing_threshold: candid::Nat::from(0),
+                        controllers: vec![PrincipalId::new_user_test_id(0_u64)],
+                        compute_allocation: candid::Nat::from(0_u32),
+                        memory_allocation: candid::Nat::from(0_u32),
+                        freezing_threshold: candid::Nat::from(0_u32),
                     },
-                    cycles: candid::Nat::from(0),
-                    idle_cycles_burned_per_day: candid::Nat::from(0),
+                    cycles: candid::Nat::from(0_u32),
+                    idle_cycles_burned_per_day: candid::Nat::from(0_u32),
                 },
             )),
         ]);

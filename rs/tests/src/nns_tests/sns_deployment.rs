@@ -34,8 +34,8 @@ use ic_ledger_core::Tokens;
 use ic_nervous_system_common::E8;
 use ic_nervous_system_proto::pb::v1::Canister;
 use ic_nns_governance::pb::v1::CreateServiceNervousSystem;
-use ic_rosetta_api::models::RosettaSupportedKeyPair;
 use ic_rosetta_test_utils::EdKeypair;
+use rosetta_core::models::RosettaSupportedKeyPair;
 
 use ic_sns_governance::pb::v1::governance::Mode;
 use ic_sns_swap::pb::v1::{new_sale_ticket_response, Lifecycle};
@@ -265,7 +265,7 @@ pub fn workload_static_testnet_sale_bot(env: TestEnv) {
     env.emit_report(format!("{metrics}"));
 }
 
-/// Like [`setup_legacy`], but initiates the SNS with an "openchat-ish" init payload.
+/// Like [`setup`], but initiates the SNS with an "openchat-ish" init payload.
 /// (Not guaranteed to be exactly the same as the actual payload used by
 /// openchat.)
 ///
@@ -274,14 +274,14 @@ pub fn workload_static_testnet_sale_bot(env: TestEnv) {
 ///
 /// The NNS will be initialized with only the "test" neurons.
 /// (See [`ic_nns_governance::init::GovernanceCanisterInitPayloadBuilder::with_test_neurons`].)
-pub fn setup_with_oc_parameters_legacy(
+pub fn setup_with_oc_parameters(
     env: TestEnv,
     sale_participants: Vec<SaleParticipant>,
     canister_wasm_strategy: NnsCanisterWasmStrategy,
     fast_test_setup: bool,
 ) {
-    setup_legacy(
-        env,
+    setup(
+        &env,
         sale_participants,
         vec![], // no neurons
         openchat_create_service_nervous_system_proposal(),
@@ -334,28 +334,6 @@ pub fn setup(
     block_on(dapp_canister.check_exclusively_owned_by_sns_root(env));
 }
 
-/// Sets up the IC, the NNS, and sets up an SNS using the legacy, non-one-proposal flow.
-pub fn setup_legacy(
-    env: TestEnv,
-    sale_participants: Vec<SaleParticipant>,
-    neurons: Vec<NnsNfNeuron>, // NNS Neurons to add in addition to the "test" neurons
-    create_service_nervous_system_proposal: CreateServiceNervousSystem,
-    canister_wasm_strategy: NnsCanisterWasmStrategy,
-    fast_test_setup: bool,
-) {
-    setup_ic(&env, fast_test_setup);
-
-    install_nns(&env, canister_wasm_strategy, sale_participants, neurons);
-
-    // Install the SNS with an "OC-ish" init payload (generated from an "OC-ish"
-    // CreateServiceNervousSystem proposal)
-    install_sns_legacy(
-        &env,
-        canister_wasm_strategy,
-        create_service_nervous_system_proposal,
-    );
-}
-
 /// Sets up and starts the IC, and creates two subnets (one system subnet and
 /// one application subnet). If `fast_test_setup` is false, also sets up
 /// Prometheus.
@@ -403,18 +381,16 @@ fn setup_ic(env: &TestEnv, fast_test_setup: bool) {
 }
 
 /// Sets up an SNS using "openchat-ish" parameters.
-pub fn sns_setup_legacy(env: TestEnv) {
-    setup_with_oc_parameters_legacy(
+pub fn sns_setup(env: TestEnv) {
+    setup_with_oc_parameters(
         env,
         vec![],
         NnsCanisterWasmStrategy::TakeBuiltFromSources,
         false,
     );
 }
-
-/// Sets up an SNS using "openchat-ish" parameters, with the "fast" configuration.
-pub fn sns_setup_fast_legacy(env: TestEnv) {
-    setup_with_oc_parameters_legacy(
+pub fn sns_setup_fast(env: TestEnv) {
+    setup_with_oc_parameters(
         env,
         vec![],
         NnsCanisterWasmStrategy::TakeBuiltFromSources,
@@ -453,7 +429,7 @@ fn sns_setup_with_many_sale_participants_impl(env: TestEnv, fast_test_setup: boo
     participants.write_attribute(&env);
 
     // Run the actual setup
-    setup_with_oc_parameters_legacy(
+    setup_with_oc_parameters(
         env,
         participants,
         NnsCanisterWasmStrategy::TakeBuiltFromSources,
@@ -486,7 +462,7 @@ pub fn sns_setup_with_many_icp_users(env: TestEnv) {
     participants.write_attribute(&env);
 
     // Run the actual setup
-    setup_with_oc_parameters_legacy(
+    setup_with_oc_parameters(
         env,
         participants,
         NnsCanisterWasmStrategy::TakeBuiltFromSources,
@@ -652,36 +628,6 @@ pub fn install_sns(
         log,
         "========== The SNS has been installed successfully in {:?} ===========\n\
         (Installation was performed using the one-proposal flow.)",
-        start_time.elapsed()
-    );
-}
-
-/// Installs the SNS using the legacy, non-one-proposal flow.
-pub fn install_sns_legacy(
-    env: &TestEnv,
-    canister_wasm_strategy: NnsCanisterWasmStrategy,
-    create_service_nervous_system_proposal: CreateServiceNervousSystem,
-) {
-    let log = env.logger();
-    let start_time = Instant::now();
-    let sns_client = SnsClient::install_sns_legacy_and_check_healthy(
-        env,
-        canister_wasm_strategy,
-        create_service_nervous_system_proposal,
-    );
-    {
-        let observed = sns_client.sns_canisters.swap().get();
-        let expected = PrincipalId::from_str(SNS_SWAP_CANISTER_ID)
-            .expect("cannot parse PrincipalId of the SNS swap canister");
-        assert_eq!(
-            observed, expected,
-            "SNS swap canister got unexpected PrincipalId {observed:?} (expected {expected:?})"
-        );
-    }
-    info!(
-        log,
-        "========== The SNS has been installed successfully in {:?} ===========\n\
-        (Installation was performed using the legacy, non-one-proposal flow.)",
         start_time.elapsed()
     );
 }
@@ -866,7 +812,7 @@ impl SaleParticipant {
 
 impl Identity for SaleParticipant {
     fn sender(&self) -> Result<Principal, String> {
-        let principal = Principal::try_from(self.principal_id).unwrap();
+        let principal = Principal::from(self.principal_id);
         Ok(principal)
     }
     fn public_key(&self) -> Option<Vec<u8>> {
@@ -926,7 +872,7 @@ pub fn add_one_participant(env: TestEnv) {
             nns_node.get_public_url().as_str(),
             wealthy_user_identity.clone(),
         ));
-        let ledger_canister_id = Principal::try_from(LEDGER_CANISTER_ID.get()).unwrap();
+        let ledger_canister_id = Principal::from(LEDGER_CANISTER_ID.get());
         Icrc1Agent {
             agent,
             ledger_canister_id,
@@ -1045,7 +991,7 @@ pub fn add_one_participant(env: TestEnv) {
         "Second update call to `icp_ledger.transfer` returned {block_idx_2:?} (elapsed {:?})",
         start_time.elapsed()
     );
-    assert_eq!(block_idx_1 + 1, block_idx_2);
+    assert_eq!(block_idx_1 + 1u8, block_idx_2);
 
     info!(log, "Validating the participation setup by calling `sns_sale.refresh_buyer_tokens` in two different ways ...");
     // Use the default identity to call refresh_buyer_tokens for the wealthy user
@@ -1155,7 +1101,7 @@ pub fn generate_ticket_participants_workload(
         let sns_node = env.get_first_healthy_application_node_snapshot();
         let sns_client = SnsClient::read_attribute(env);
         let sns_request_provider = SnsRequestProvider::from_sns_client(&sns_client);
-        let ledger_canister_id = Principal::try_from(LEDGER_CANISTER_ID.get()).unwrap();
+        let ledger_canister_id = Principal::from(LEDGER_CANISTER_ID.get());
 
         move |idx| {
             let (nns_node, app_node) = (nns_node.clone(), sns_node.clone());

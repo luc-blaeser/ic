@@ -2,7 +2,8 @@
 Utilities for building IC replica and canisters.
 """
 
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test", "rust_test_suite")
 load("//publish:defs.bzl", "release_nostrip_binary")
 
 _COMPRESS_CONCURRENCY = 16
@@ -43,7 +44,7 @@ def _zstd_compress(ctx):
     # TODO: install zstd as dependency.
     ctx.actions.run(
         executable = "zstd",
-        arguments = ["--threads=0", "-10", "-f", "-z", "-o", out.path] + [s.path for s in ctx.files.srcs],
+        arguments = ["-q", "--threads=0", "-10", "-f", "-z", "-o", out.path] + [s.path for s in ctx.files.srcs],
         inputs = ctx.files.srcs,
         outputs = [out],
         env = {"ZSTDMT_NBWORKERS_MAX": str(_COMPRESS_CONCURRENCY)},
@@ -112,9 +113,10 @@ def _sha256sum2url_impl(ctx):
     Waits for the artifact to be published before returning url.
     """
     out = ctx.actions.declare_file(ctx.label.name)
+    timeout = ctx.attr.timeout_value[BuildSettingInfo].value
     ctx.actions.run(
         executable = "timeout",
-        arguments = ["10m", ctx.executable._sha256sum2url_sh.path],
+        arguments = [timeout, ctx.executable._sha256sum2url_sh.path],
         inputs = [ctx.file.src],
         outputs = [out],
         tools = [ctx.executable._sha256sum2url_sh],
@@ -130,6 +132,7 @@ _sha256sum2url = rule(
     attrs = {
         "src": attr.label(allow_single_file = True),
         "_sha256sum2url_sh": attr.label(executable = True, cfg = "exec", default = "//bazel:sha256sum2url_sh"),
+        "timeout_value": attr.label(default = "//bazel:timeout_value"),
     },
 )
 
@@ -153,6 +156,20 @@ def sha256sum2url(name, src, tags = [], **kwargs):
         tags = tags + ["requires-network", "manual"],
         **kwargs
     )
+
+# Binaries needed for testing with canister_sandbox
+_SANDBOX_DATA = [
+    "//rs/canister_sandbox",
+    "//rs/canister_sandbox:compiler_sandbox",
+    "//rs/canister_sandbox:sandbox_launcher",
+]
+
+# Env needed for testing with canister_sandbox
+_SANDBOX_ENV = {
+    "COMPILER_BINARY": "$(rootpath //rs/canister_sandbox:compiler_sandbox)",
+    "LAUNCHER_BINARY": "$(rootpath //rs/canister_sandbox:sandbox_launcher)",
+    "SANDBOX_BINARY": "$(rootpath //rs/canister_sandbox)",
+}
 
 def rust_test_suite_with_extra_srcs(name, srcs, extra_srcs, **kwargs):
     """ A rule for creating a test suite for a set of `rust_test` targets.
@@ -194,13 +211,59 @@ def rust_test_suite_with_extra_srcs(name, srcs, extra_srcs, **kwargs):
         tags = kwargs.get("tags", None),
     )
 
-def rust_bench(name, env = {}, data = [], **kwargs):
+def rust_ic_test_suite_with_extra_srcs(name, srcs, extra_srcs, env = {}, data = [], **kwargs):
+    """ A rule for creating a test suite for a set of `rust_test` targets.
+
+    Like `rust_test_suite_with_extra_srcs`, but adds data and env params required for canister sandbox
+
+    Args:
+      see description for `rust_test_suite_with_extra_srcs`
+    """
+    rust_test_suite_with_extra_srcs(
+        name,
+        srcs,
+        extra_srcs,
+        env = dict(env.items() + _SANDBOX_ENV.items()),
+        data = data + _SANDBOX_DATA,
+        **kwargs
+    )
+
+def rust_ic_test_suite(env = {}, data = [], **kwargs):
+    """ A rule for creating a test suite for a set of `rust_test` targets.
+
+    Like `rust_test_suite`, but adds data and env params required for canister sandbox
+
+    Args:
+      see description for `rust_test_suite`
+    """
+    rust_test_suite(
+        env = dict(env.items() + _SANDBOX_ENV.items()),
+        data = data + _SANDBOX_DATA,
+        **kwargs
+    )
+
+def rust_ic_test(env = {}, data = [], **kwargs):
+    """ A rule for creating a test suite for a set of `rust_test` targets.
+
+    Like `rust_test`, but adds data and env params required for canister sandbox
+
+    Args:
+      see description for `rust_test`
+    """
+    rust_test(
+        env = dict(env.items() + _SANDBOX_ENV.items()),
+        data = data + _SANDBOX_DATA,
+        **kwargs
+    )
+
+def rust_bench(name, env = {}, data = [], pin_cpu = False, **kwargs):
     """A rule for defining a rust benchmark.
 
     Args:
       name: the name of the executable target.
       env: additional environment variables to pass to the benchmark binary.
       data: data dependencies required to run the benchmark.
+      pin_cpu: pins the benchmark process to a single CPU if set `True`.
       **kwargs: see docs for `rust_binary`.
     """
 
@@ -217,6 +280,8 @@ def rust_bench(name, env = {}, data = [], **kwargs):
         testonly = kwargs.get("testonly", False),
     )
 
+    bench_prefix = "taskset -c 0 " if pin_cpu else ""
+
     # The benchmark binary is a shell script that runs the binary
     # (similar to how `cargo bench` runs the benchmark binary).
     native.sh_binary(
@@ -224,7 +289,23 @@ def rust_bench(name, env = {}, data = [], **kwargs):
         name = name,
         # Allow benchmark targets to use test-only libraries.
         testonly = kwargs.get("testonly", False),
-        env = dict(env.items() + {"BAZEL_DEFS_BENCH_BIN": "$(location :%s)" % binary_name_publish}.items()),
+        env = dict(env.items() +
+                   [("BAZEL_DEFS_BENCH_PREFIX", bench_prefix)] +
+                   {"BAZEL_DEFS_BENCH_BIN": "$(location :%s)" % binary_name_publish}.items()),
         data = data + [":" + binary_name_publish],
         tags = kwargs.get("tags", []) + ["rust_bench"],
+    )
+
+def rust_ic_bench(env = {}, data = [], **kwargs):
+    """A rule for defining a rust benchmark.
+
+    Like `rust_bench`, but adds data and env params required for canister sandbox
+
+    Args:
+      see description for `rust_bench`
+    """
+    rust_bench(
+        env = dict(env.items() + _SANDBOX_ENV.items()),
+        data = data + _SANDBOX_DATA,
+        **kwargs
     )

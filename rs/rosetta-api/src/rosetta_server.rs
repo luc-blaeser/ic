@@ -1,17 +1,15 @@
-use actix_rt::time::interval;
-use actix_web::{
-    dev::{Server, ServerHandle},
-    get, post, web, App, HttpResponse, HttpServer,
-};
-
 use crate::{
     errors::{self, ApiError},
     ledger_client::LedgerAccess,
     models::*,
     request_handler::RosettaRequestHandler,
 };
+use actix_rt::time::interval;
+use actix_web::{
+    dev::{Server, ServerHandle},
+    get, post, web, App, HttpResponse, HttpServer,
+};
 
-use log::{debug, error, info};
 use prometheus::{
     register_gauge, register_histogram, register_histogram_vec, register_int_counter,
     register_int_counter_vec, register_int_gauge, Encoder, Gauge, Histogram, HistogramVec,
@@ -31,6 +29,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
+use tracing::{debug, error, info};
 
 use lazy_static::lazy_static;
 
@@ -398,7 +397,7 @@ impl RosettaApiServer {
             });
             std::fs::write(
                 listen_port_file,
-                server.addrs().get(0).unwrap().port().to_string(),
+                server.addrs().first().unwrap().port().to_string(),
             )
             .unwrap_or_else(|e| panic!("Unable to write to listen_port_file! Error: {}", e));
         }

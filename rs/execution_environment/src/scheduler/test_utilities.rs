@@ -19,14 +19,14 @@ use ic_embedders::{
     CompilationCache, CompilationResult, WasmExecutionInput,
 };
 use ic_error_types::UserError;
-use ic_ic00_types::{
-    CanisterInstallMode, CanisterStatusType, EcdsaKeyId, InstallCodeArgs, Method, Payload, IC_00,
-};
 use ic_interfaces::execution_environment::{
     ExecutionRoundType, HypervisorError, HypervisorResult, IngressHistoryWriter, InstanceStats,
     RegistryExecutionSettings, Scheduler, SystemApiCallCounters, WasmExecutionOutput,
 };
 use ic_logger::{replica_logger::no_op_logger, ReplicaLogger};
+use ic_management_canister_types::{
+    CanisterInstallMode, CanisterStatusType, EcdsaKeyId, InstallCodeArgs, Method, Payload, IC_00,
+};
 use ic_metrics::MetricsRegistry;
 use ic_registry_routing_table::{CanisterIdRange, RoutingTable};
 use ic_registry_subnet_type::SubnetType;
@@ -49,9 +49,12 @@ use ic_test_utilities::{
 };
 use ic_test_utilities_execution_environment::{generate_subnets, test_registry_settings};
 use ic_types::{
+    consensus::ecdsa::QuadrupleId,
     crypto::{canister_threshold_sig::MasterEcdsaPublicKey, AlgorithmId},
     ingress::{IngressState, IngressStatus},
-    messages::{CallContextId, Ingress, MessageId, Request, RequestOrResponse, Response},
+    messages::{
+        CallContextId, Ingress, MessageId, Request, RequestOrResponse, Response, NO_DEADLINE,
+    },
     methods::{Callback, FuncRef, SystemMethod, WasmClosure, WasmMethod},
     CanisterTimer, ComputeAllocation, Cycles, ExecutionRound, MemoryAllocation, NumInstructions,
     Randomness, Time, UserId,
@@ -109,6 +112,8 @@ pub(crate) struct SchedulerTest {
     metrics_registry: MetricsRegistry,
     // ECDSA subnet public keys.
     ecdsa_subnet_public_keys: BTreeMap<EcdsaKeyId, MasterEcdsaPublicKey>,
+    // ECDSA quadruple IDs.
+    ecdsa_quadruple_ids: BTreeMap<EcdsaKeyId, BTreeSet<QuadrupleId>>,
 }
 
 impl std::fmt::Debug for SchedulerTest {
@@ -470,6 +475,7 @@ impl SchedulerTest {
             state,
             Randomness::from([0; 32]),
             self.ecdsa_subnet_public_keys.clone(),
+            self.ecdsa_quadruple_ids.clone(),
             self.round,
             round_type,
             self.registry_settings(),
@@ -588,6 +594,13 @@ impl SchedulerTest {
             .cycles_account_manager
             .memory_cost(bytes, duration, self.subnet_size())
     }
+
+    pub(crate) fn deliver_quadruple_ids(
+        &mut self,
+        ecdsa_quadruple_ids: BTreeMap<EcdsaKeyId, BTreeSet<QuadrupleId>>,
+    ) {
+        self.ecdsa_quadruple_ids = ecdsa_quadruple_ids;
+    }
 }
 
 /// A builder for `SchedulerTest`.
@@ -605,7 +618,7 @@ pub(crate) struct SchedulerTestBuilder {
     rate_limiting_of_heap_delta: bool,
     deterministic_time_slicing: bool,
     log: ReplicaLogger,
-    ecdsa_key: Option<EcdsaKeyId>,
+    ecdsa_keys: Vec<EcdsaKeyId>,
     metrics_registry: MetricsRegistry,
 }
 
@@ -626,9 +639,9 @@ impl Default for SchedulerTestBuilder {
             allocatable_compute_capacity_in_percent: 100,
             rate_limiting_of_instructions: false,
             rate_limiting_of_heap_delta: false,
-            deterministic_time_slicing: false,
+            deterministic_time_slicing: true,
             log: no_op_logger(),
-            ecdsa_key: None,
+            ecdsa_keys: vec![],
             metrics_registry: MetricsRegistry::new(),
         }
     }
@@ -676,18 +689,15 @@ impl SchedulerTestBuilder {
         }
     }
 
-    pub fn with_deterministic_time_slicing(self) -> Self {
+    pub fn with_ecdsa_key(self, ecdsa_key: EcdsaKeyId) -> Self {
         Self {
-            deterministic_time_slicing: true,
+            ecdsa_keys: vec![ecdsa_key],
             ..self
         }
     }
 
-    pub fn with_ecdsa_key(self, ecdsa_key: EcdsaKeyId) -> Self {
-        Self {
-            ecdsa_key: Some(ecdsa_key),
-            ..self
-        }
+    pub fn with_ecdsa_keys(self, ecdsa_keys: Vec<EcdsaKeyId>) -> Self {
+        Self { ecdsa_keys, ..self }
     }
 
     pub fn with_batch_time(self, batch_time: Time) -> Self {
@@ -715,7 +725,7 @@ impl SchedulerTestBuilder {
         state.metadata.batch_time = self.batch_time;
 
         let config = SubnetConfig::new(self.subnet_type).cycles_account_manager_config;
-        if let Some(ecdsa_key) = &self.ecdsa_key {
+        for ecdsa_key in &self.ecdsa_keys {
             state
                 .metadata
                 .network_topology
@@ -731,7 +741,7 @@ impl SchedulerTestBuilder {
                 .insert(ecdsa_key.clone());
         }
         let ecdsa_subnet_public_keys: BTreeMap<EcdsaKeyId, MasterEcdsaPublicKey> = self
-            .ecdsa_key
+            .ecdsa_keys
             .into_iter()
             .map(|key| {
                 (
@@ -834,6 +844,7 @@ impl SchedulerTestBuilder {
             registry_settings: self.registry_settings,
             metrics_registry: self.metrics_registry,
             ecdsa_subnet_public_keys,
+            ecdsa_quadruple_ids: BTreeMap::new(),
         }
     }
 }
@@ -1072,6 +1083,7 @@ impl TestWasmExecutorCore {
                 allocated_message_bytes: NumBytes::from(0),
                 instance_stats: InstanceStats::default(),
                 system_api_call_counters: SystemApiCallCounters::default(),
+                canister_log: Default::default(),
             };
             self.schedule
                 .push((self.round, canister_id, instructions_to_execute));
@@ -1117,6 +1129,7 @@ impl TestWasmExecutorCore {
             num_instructions_left: instructions_left,
             instance_stats,
             system_api_call_counters: SystemApiCallCounters::default(),
+            canister_log: Default::default(),
         };
         self.schedule
             .push((self.round, canister_id, instructions_to_execute));
@@ -1202,17 +1215,19 @@ impl TestWasmExecutorCore {
         let prepayment_for_response_transmission = self
             .cycles_account_manager
             .prepayment_for_response_transmission(self.subnet_size);
+        let deadline = NO_DEADLINE;
         let callback = system_state
             .register_callback(Callback {
                 call_context_id,
-                originator: Some(sender),
-                respondent: Some(receiver),
+                originator: sender,
+                respondent: receiver,
                 cycles_sent: Cycles::zero(),
-                prepayment_for_response_execution: Some(prepayment_for_response_execution),
-                prepayment_for_response_transmission: Some(prepayment_for_response_transmission),
+                prepayment_for_response_execution,
+                prepayment_for_response_transmission,
                 on_reply: closure.clone(),
                 on_reject: closure,
                 on_cleanup: None,
+                deadline,
             })
             .map_err(|err| err.to_string())?;
         let request = Request {
@@ -1223,6 +1238,7 @@ impl TestWasmExecutorCore {
             method_name: "update".into(),
             method_payload: encode_message_id_as_payload(call_message_id),
             metadata: None,
+            deadline,
         };
         if let Err(req) = system_state.push_output_request(
             canister_current_memory_usage,

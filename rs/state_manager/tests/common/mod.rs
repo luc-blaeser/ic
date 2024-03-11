@@ -1,8 +1,12 @@
 use assert_matches::assert_matches;
 use ic_base_types::NumSeconds;
-use ic_config::state_manager::Config;
+use ic_config::{
+    flag_status::FlagStatus,
+    state_manager::{lsmt_config_default, Config, LsmtConfig},
+};
 use ic_interfaces::{
     certification::{CertificationPermanentError, Verifier, VerifierError},
+    p2p::state_sync::{Chunk, ChunkId, Chunkable},
     validation::ValidationResult,
 };
 use ic_interfaces_certified_stream_store::{CertifiedStreamStore, DecodeStreamError};
@@ -11,7 +15,11 @@ use ic_metrics::MetricsRegistry;
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::canister_state::execution_state::WasmBinary;
 use ic_replicated_state::{testing::ReplicatedStateTesting, ReplicatedState, Stream};
-use ic_state_manager::{state_sync::StateSync, stream_encoding, StateManagerImpl};
+use ic_state_manager::{
+    state_sync::types::{StateSyncMessage, MANIFEST_CHUNK_ID_OFFSET},
+    state_sync::StateSync,
+    stream_encoding, StateManagerImpl,
+};
 use ic_test_utilities::{
     consensus::fake::{Fake, FakeVerifier},
     state::{initial_execution_state, new_canister_state},
@@ -20,16 +28,9 @@ use ic_test_utilities::{
 use ic_test_utilities_logger::with_test_replica_logger;
 use ic_test_utilities_tmpdir::tmpdir;
 use ic_types::{
-    artifact::StateSyncMessage,
-    chunkable::{
-        ArtifactChunk,
-        ArtifactErrorCode::{ChunkVerificationFailed, ChunksMoreNeeded},
-        ChunkId, Chunkable,
-    },
     consensus::certification::{Certification, CertificationContent},
     crypto::Signed,
     signature::ThresholdSignature,
-    state_sync::MANIFEST_CHUNK_ID_OFFSET,
     xnet::{CertifiedStreamSlice, StreamIndex, StreamSlice},
     CanisterId, CryptoHashOfState, Cycles, Height, RegistryVersion, SubnetId,
 };
@@ -158,7 +159,7 @@ pub fn encode_decode_stream_test<
             decoded_slice.unwrap_or_else(|e| panic!("Failed to decode slice with error {:?}", e));
 
         assert_eq!(
-            stream.slice(stream.header().begin, size_limit),
+            stream.slice(stream.header().begin(), size_limit),
             decoded_slice
         );
     });
@@ -389,13 +390,16 @@ pub enum StateSyncErrorCode {
     OtherChunkVerificationFailed,
 }
 
-pub fn pipe_state_sync(src: StateSyncMessage, mut dst: Box<dyn Chunkable>) -> StateSyncMessage {
+pub fn pipe_state_sync(
+    src: StateSyncMessage,
+    mut dst: Box<dyn Chunkable<StateSyncMessage>>,
+) -> StateSyncMessage {
     pipe_partial_state_sync(&src, &mut *dst, &Default::default(), false)
         .expect("State sync not completed.")
 }
 
-fn alter_chunk_data(chunk: &mut ArtifactChunk) {
-    let mut chunk_data = chunk.chunk.clone();
+fn alter_chunk_data(chunk: &mut Chunk) {
+    let mut chunk_data = chunk.clone();
     match chunk_data.last_mut() {
         Some(last) => {
             // Alter the last element of chunk_data.
@@ -406,14 +410,14 @@ fn alter_chunk_data(chunk: &mut ArtifactChunk) {
             chunk_data = vec![9; 100];
         }
     }
-    chunk.chunk = chunk_data;
+    *chunk = chunk_data;
 }
 
 /// Pipe the meta-manifest (chunk 0) from src to dest.
 /// Alter the chunk data if `use_bad_chunk` is set to true.
 pub fn pipe_meta_manifest(
     src: &StateSyncMessage,
-    dst: &mut dyn Chunkable,
+    dst: &mut dyn Chunkable<StateSyncMessage>,
     use_bad_chunk: bool,
 ) -> Result<StateSyncMessage, StateSyncErrorCode> {
     let ids: Vec<_> = dst.chunks_to_download().collect();
@@ -423,22 +427,21 @@ pub fn pipe_meta_manifest(
 
     let id = ids[0];
 
-    let mut chunk = ArtifactChunk {
-        chunk_id: id,
-        chunk: src
-            .clone()
-            .get_chunk(id)
-            .unwrap_or_else(|| panic!("Requested unknown chunk {}", id)),
-    };
+    let mut chunk = src
+        .clone()
+        .get_chunk(id)
+        .unwrap_or_else(|| panic!("Requested unknown chunk {}", id));
 
     if use_bad_chunk {
         alter_chunk_data(&mut chunk);
     }
 
-    match dst.add_chunk(chunk) {
-        Ok(msg) => Ok(msg),
-        Err(ChunksMoreNeeded) => Err(StateSyncErrorCode::ChunksMoreNeeded),
-        Err(ChunkVerificationFailed) => Err(StateSyncErrorCode::MetaManifestVerificationFailed),
+    match dst.add_chunk(id, chunk) {
+        Ok(()) => match dst.completed() {
+            Some(artifact) => Ok(artifact),
+            None => Err(StateSyncErrorCode::ChunksMoreNeeded),
+        },
+        Err(_) => Err(StateSyncErrorCode::MetaManifestVerificationFailed),
     }
 }
 
@@ -447,7 +450,7 @@ pub fn pipe_meta_manifest(
 /// Alter the data of the chunk in the middle position if `use_bad_chunk` is set to true.
 pub fn pipe_manifest(
     src: &StateSyncMessage,
-    dst: &mut dyn Chunkable,
+    dst: &mut dyn Chunkable<StateSyncMessage>,
     use_bad_chunk: bool,
 ) -> Result<StateSyncMessage, StateSyncErrorCode> {
     let ids: Vec<_> = dst.chunks_to_download().collect();
@@ -460,25 +463,23 @@ pub fn pipe_manifest(
     assert!(ids.iter().all(|id| manifest_chunks.contains(id)));
 
     for (index, id) in ids.iter().enumerate() {
-        let mut chunk = ArtifactChunk {
-            chunk_id: *id,
-            chunk: src
-                .clone()
-                .get_chunk(*id)
-                .unwrap_or_else(|| panic!("Requested unknown chunk {}", id)),
-        };
+        let mut chunk = src
+            .clone()
+            .get_chunk(*id)
+            .unwrap_or_else(|| panic!("Requested unknown chunk {}", id));
 
         if use_bad_chunk && index == ids.len() / 2 {
             alter_chunk_data(&mut chunk);
         }
 
-        match dst.add_chunk(chunk) {
-            Ok(msg) => {
-                return Ok(msg);
+        match dst.add_chunk(*id, chunk) {
+            Ok(()) => {
+                if let Some(msg) = dst.completed() {
+                    return Ok(msg);
+                }
             }
-            Err(ChunksMoreNeeded) => (),
-            Err(ChunkVerificationFailed) => {
-                return Err(StateSyncErrorCode::ManifestVerificationFailed)
+            Err(_) => {
+                return Err(StateSyncErrorCode::ManifestVerificationFailed);
             }
         }
     }
@@ -489,7 +490,7 @@ pub fn pipe_manifest(
 /// Alter the data of the chunk in the middle position if `use_bad_chunk` is set to true.
 pub fn pipe_partial_state_sync(
     src: &StateSyncMessage,
-    dst: &mut dyn Chunkable,
+    dst: &mut dyn Chunkable<StateSyncMessage>,
     omit: &HashSet<ChunkId>,
     use_bad_chunk: bool,
 ) -> Result<StateSyncMessage, StateSyncErrorCode> {
@@ -506,26 +507,22 @@ pub fn pipe_partial_state_sync(
                 omitted_chunks = true;
                 continue;
             }
-            let mut chunk = ArtifactChunk {
-                chunk_id: *id,
-                chunk: src
-                    .clone()
-                    .get_chunk(*id)
-                    .unwrap_or_else(|| panic!("Requested unknown chunk {}", id)),
-            };
+            let mut chunk = src
+                .clone()
+                .get_chunk(*id)
+                .unwrap_or_else(|| panic!("Requested unknown chunk {}", id));
 
             if use_bad_chunk && index == ids.len() / 2 {
                 alter_chunk_data(&mut chunk);
             }
 
-            match dst.add_chunk(chunk) {
-                Ok(msg) => {
-                    return Ok(msg);
+            match dst.add_chunk(*id, chunk) {
+                Ok(()) => {
+                    if let Some(msg) = dst.completed() {
+                        return Ok(msg);
+                    }
                 }
-                Err(ChunksMoreNeeded) => (),
-                Err(ChunkVerificationFailed) => {
-                    return Err(StateSyncErrorCode::OtherChunkVerificationFailed)
-                }
+                Err(_) => return Err(StateSyncErrorCode::OtherChunkVerificationFailed),
             }
         }
         if omitted_chunks {
@@ -652,12 +649,32 @@ where
     });
 }
 
-pub fn state_manager_restart_test_with_metrics<Test>(test: Test)
+pub fn lsmt_without_sharding() -> LsmtConfig {
+    LsmtConfig {
+        lsmt_status: FlagStatus::Enabled,
+        shard_num_pages: u64::MAX,
+    }
+}
+
+pub fn lsmt_disabled() -> LsmtConfig {
+    LsmtConfig {
+        lsmt_status: FlagStatus::Disabled,
+        shard_num_pages: u64::MAX,
+    }
+}
+
+pub fn state_manager_restart_test_with_lsmt<Test>(lsmt_config: LsmtConfig, test: Test)
 where
     Test: FnOnce(
         &MetricsRegistry,
         StateManagerImpl,
-        Box<dyn Fn(StateManagerImpl, Option<Height>) -> (MetricsRegistry, StateManagerImpl)>,
+        Box<
+            dyn Fn(
+                StateManagerImpl,
+                Option<Height>,
+                LsmtConfig,
+            ) -> (MetricsRegistry, StateManagerImpl),
+        >,
     ),
 {
     let tmp = tmpdir("sm");
@@ -666,8 +683,11 @@ where
     let verifier: Arc<dyn Verifier> = Arc::new(FakeVerifier::new());
 
     with_test_replica_logger(|log| {
-        let make_state_manager = move |starting_height| {
+        let make_state_manager = move |starting_height, lsmt_config| {
             let metrics_registry = MetricsRegistry::new();
+
+            let mut config = config.clone();
+            config.lsmt_config = lsmt_config;
 
             let state_manager = StateManagerImpl::new(
                 Arc::clone(&verifier),
@@ -683,15 +703,34 @@ where
             (metrics_registry, state_manager)
         };
 
-        let (metrics_registry, state_manager) = make_state_manager(None);
+        let (metrics_registry, state_manager) = make_state_manager(None, lsmt_config);
 
-        let restart_fn = Box::new(move |state_manager, starting_height| {
+        let restart_fn = Box::new(move |state_manager, starting_height, lsmt_config| {
             drop(state_manager);
-            make_state_manager(starting_height)
+            make_state_manager(starting_height, lsmt_config)
         });
 
         test(&metrics_registry, state_manager, restart_fn);
     });
+}
+
+pub fn state_manager_restart_test_with_metrics<Test>(test: Test)
+where
+    Test: FnOnce(
+        &MetricsRegistry,
+        StateManagerImpl,
+        Box<dyn Fn(StateManagerImpl, Option<Height>) -> (MetricsRegistry, StateManagerImpl)>,
+    ),
+{
+    state_manager_restart_test_with_lsmt(
+        lsmt_config_default(),
+        |metrics, state_manager, restart_fn| {
+            let restart_fn_simplified = Box::new(move |state_manager, starting_height| {
+                restart_fn(state_manager, starting_height, lsmt_config_default())
+            });
+            test(metrics, state_manager, restart_fn_simplified);
+        },
+    );
 }
 
 pub fn state_manager_restart_test<Test>(test: Test)

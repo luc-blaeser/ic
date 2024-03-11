@@ -1,34 +1,48 @@
 use crate::{
     canister_control::perform_execute_generic_nervous_system_function_validate_and_render_call,
-    governance::{bytes_to_subaccount, log_prefix, NERVOUS_SYSTEM_FUNCTION_DELETION_MARKER},
-    logs::INFO,
+    governance::{
+        bytes_to_subaccount, log_prefix, NERVOUS_SYSTEM_FUNCTION_DELETION_MARKER,
+        TREASURY_SUBACCOUNT_NONCE,
+    },
+    logs::{ERROR, INFO},
     pb::v1::{
         governance::{SnsMetadata, Version},
+        governance_error::ErrorType,
         nervous_system_function::{FunctionType, GenericNervousSystemFunction},
         proposal,
         proposal::Action,
+        proposal_data::{
+            self, ActionAuxiliary as ActionAuxiliaryPb, TransferSnsTreasuryFundsActionAuxiliary,
+        },
         transfer_sns_treasury_funds::TransferFrom,
-        DeregisterDappCanisters, ExecuteGenericNervousSystemFunction, Governance,
-        ManageSnsMetadata, MintSnsTokens, Motion, NervousSystemFunction, NervousSystemParameters,
-        Proposal, ProposalData, ProposalDecisionStatus, ProposalRewardStatus,
+        DeregisterDappCanisters, ExecuteGenericNervousSystemFunction, Governance, GovernanceError,
+        LogVisibility, ManageDappCanisterSettings, ManageLedgerParameters, ManageSnsMetadata,
+        MintSnsTokens, Motion, NervousSystemFunction, NervousSystemParameters, Proposal,
+        ProposalData, ProposalDecisionStatus, ProposalId, ProposalRewardStatus,
         RegisterDappCanisters, Tally, TransferSnsTreasuryFunds, UpgradeSnsControlledCanister,
-        UpgradeSnsToNextVersion, Vote,
+        UpgradeSnsToNextVersion, Valuation as ValuationPb, Vote,
     },
-};
-
-use crate::{
     sns_upgrade::{get_upgrade_params, UpgradeSnsParams},
     types::{Environment, DEFAULT_TRANSFER_FEE},
     validate_chars_count, validate_len, validate_required_field,
 };
+use candid::Principal;
 use dfn_core::api::CanisterId;
 use ic_base_types::PrincipalId;
 use ic_canister_log::log;
 use ic_crypto_sha2::Sha256;
-use ic_nervous_system_common::{i2d, E8};
+use ic_nervous_system_common::{
+    denominations_to_tokens, i2d, ledger::compute_distribution_subaccount_bytes, E8,
+    SECONDS_PER_DAY,
+};
 use ic_nervous_system_proto::pb::v1::Percentage;
+use ic_sns_governance_token_valuation::{
+    try_get_icp_balance_valuation, try_get_sns_token_balance_valuation, Valuation,
+};
+use ic_sns_governance_treasury_transfer_limit::TreasuryTransferTotalUpperBound;
 use icp_ledger::DEFAULT_TRANSFER_FEE as NNS_DEFAULT_TRANSFER_FEE;
 use icrc_ledger_types::icrc1::account::Account;
+use rust_decimal::Decimal;
 use std::{
     collections::{BTreeMap, HashSet},
     convert::TryFrom,
@@ -38,7 +52,7 @@ use std::{
 /// The maximum number of bytes in an SNS proposal's title.
 pub const PROPOSAL_TITLE_BYTES_MAX: usize = 256;
 /// The maximum number of bytes in an SNS proposal's summary.
-pub const PROPOSAL_SUMMARY_BYTES_MAX: usize = 15000;
+pub const PROPOSAL_SUMMARY_BYTES_MAX: usize = 30000;
 /// The maximum number of bytes in an SNS proposal's URL.
 pub const PROPOSAL_URL_CHAR_MAX: usize = 2048;
 /// The maximum number of bytes in an SNS motion proposal's motion_text.
@@ -54,9 +68,24 @@ pub const MAX_NUMBER_OF_PROPOSALS_WITH_BALLOTS: usize = 700;
 /// The maximum number of GenericNervousSystemFunctions the system allows.
 pub const MAX_NUMBER_OF_GENERIC_NERVOUS_SYSTEM_FUNCTIONS: usize = 200_000;
 
-/// The maximum number of dapps that can be registered in a single
-/// RegisterDappCanisters proposal.
-pub const MAX_NUMBER_OF_DAPPS_TO_REGISTER_PER_PROPOSAL: usize = 1_000;
+/// The maximum number of dapps that can be managed in a single
+/// proposal (RegisterDappCanisters, DeregisterDappCanisters,
+/// or ManageDappCanisterSettings).
+pub const MAX_NUMBER_OF_DAPPS_TO_MANAGE_PER_PROPOSAL: usize = 1_000;
+
+// The maximum number of ballots for a proposal that can be returned as part of list_proposals
+// response.
+pub const MAX_NUMBER_OF_BALLOTS_IN_LIST_PROPOSALS_RESPONSE: usize = 100;
+
+/// What the name says: how long to hang onto TreasurySnsTreasuryTransfer proposals that were
+/// successfully executed. (This is used by can_be_purged, and is generally used when calling
+/// total_treasury_transfer_amount_e8s to construct the min_executed_timestamp_seconds argument).
+pub const EXECUTED_TRANSFER_SNS_TREASURY_FUNDS_PROPOSAL_RETENTION_DURATION_SECONDS: u64 =
+    7 * SECONDS_PER_DAY;
+
+/// Analogous to the previous constant; this one is for MintSnsTokens proposals. The value here is
+/// the same, but we keep separate constants, because we consider this to be a coincidence.
+pub const EXECUTED_MINT_SNS_TOKENS_PROPOSAL_RETENTION_DURATION_SECONDS: u64 = 7 * SECONDS_PER_DAY;
 
 impl Proposal {
     /// Returns whether a proposal is allowed to be submitted when
@@ -81,17 +110,116 @@ impl Proposal {
     }
 }
 
+pub(crate) fn get_action_auxiliary(
+    proposals: &BTreeMap<u64, ProposalData>,
+    proposal_id: ProposalId,
+) -> Result<ActionAuxiliary, GovernanceError> {
+    let proposal = proposals.get(&proposal_id.id);
+
+    let proposal = match proposal {
+        Some(ok) => ok,
+
+        None => {
+            return Err(GovernanceError::new_with_message(
+                ErrorType::InconsistentInternalData,
+                format!(
+                    "Unable to find action_auxiliary for proposal {:?}, \
+                     because proposal not found.",
+                    proposal_id,
+                ),
+            ))
+        }
+    };
+
+    let action_auxiliary = &proposal.action_auxiliary;
+
+    ActionAuxiliary::try_from(action_auxiliary)
+        // This is really not expected to happen.
+        .map_err(|err| {
+            GovernanceError::new_with_message(
+                ErrorType::InconsistentInternalData,
+                format!(
+                    "Invalid action_auxiliary {:?} in ProposalData (id={:?}): {}",
+                    action_auxiliary, proposal_id, err,
+                ),
+            )
+        })
+}
+
+#[derive(Debug)]
+pub(crate) enum ActionAuxiliary {
+    TransferSnsTreasuryFunds(Valuation),
+    None,
+}
+
+impl ActionAuxiliary {
+    pub fn unwrap_transfer_sns_treasury_funds_or_err(self) -> Result<Valuation, GovernanceError> {
+        match self {
+            Self::TransferSnsTreasuryFunds(valuation) => Ok(valuation),
+
+            wrong => Err(GovernanceError::new_with_message(
+                ErrorType::InconsistentInternalData,
+                format!(
+                    "Missing supporting information. Specifically, \
+                     no treasury valuation factors: {:#?}",
+                    wrong,
+                ),
+            )),
+        }
+    }
+}
+
+impl TryFrom<ActionAuxiliary> for Option<ActionAuxiliaryPb> {
+    type Error = String;
+
+    fn try_from(src: ActionAuxiliary) -> Result<Self, String> {
+        let result = match src {
+            ActionAuxiliary::None => None,
+
+            ActionAuxiliary::TransferSnsTreasuryFunds(valuation) => {
+                Some(ActionAuxiliaryPb::TransferSnsTreasuryFunds(
+                    proposal_data::TransferSnsTreasuryFundsActionAuxiliary {
+                        valuation: Some(ValuationPb::try_from(valuation)?),
+                    },
+                ))
+            }
+        };
+
+        Ok(result)
+    }
+}
+
+impl TryFrom<&Option<ActionAuxiliaryPb>> for ActionAuxiliary {
+    type Error = String;
+
+    fn try_from(src: &Option<ActionAuxiliaryPb>) -> Result<ActionAuxiliary, String> {
+        let result = match src {
+            None => ActionAuxiliary::None,
+            Some(ActionAuxiliaryPb::TransferSnsTreasuryFunds(action_auxiliary)) => {
+                let TransferSnsTreasuryFundsActionAuxiliary { valuation } = action_auxiliary;
+
+                let valuation = Valuation::try_from(valuation.as_ref().unwrap_or_default())
+                    .map_err(|err| format!("Invalid ActionAuxiliaryPb {:?}: {}", src, err))?;
+
+                ActionAuxiliary::TransferSnsTreasuryFunds(valuation)
+            }
+        };
+
+        Ok(result)
+    }
+}
+
 /// Validates a proposal and returns a displayable text rendering of the payload
 /// if the proposal is valid.
 ///
 /// Takes in the GovernanceProto as to be able to validate against the current
 /// state of governance.
-pub async fn validate_and_render_proposal(
+pub(crate) async fn validate_and_render_proposal(
     proposal: &Proposal,
     env: &dyn Environment,
     governance_proto: &Governance,
     reserved_canister_targets: Vec<CanisterId>,
-) -> Result<String, String> {
+) -> Result<(String, Option<ActionAuxiliaryPb>), String> {
     let mut defects = Vec::new();
 
     let mut defects_push = |r| {
@@ -139,7 +267,7 @@ pub async fn validate_and_render_proposal(
                 defects.join("\n"),
             ))
         }
-        Ok(rendering) => {
+        Ok((rendering, action_auxiliary)) => {
             if !defects.is_empty() {
                 Err(format!(
                     "{} defects in Proposal:\n{}",
@@ -147,7 +275,10 @@ pub async fn validate_and_render_proposal(
                     defects.join("\n"),
                 ))
             } else {
-                Ok(rendering)
+                Ok((
+                    rendering,
+                    Option::<ActionAuxiliaryPb>::try_from(action_auxiliary)?,
+                ))
             }
         }
     }
@@ -155,12 +286,12 @@ pub async fn validate_and_render_proposal(
 
 /// Validates and renders a proposal by calling the method that implements this logic for a given
 /// proposal action.
-pub async fn validate_and_render_action(
+pub(crate) async fn validate_and_render_action(
     action: &Option<proposal::Action>,
     env: &dyn Environment,
     governance_proto: &Governance,
     reserved_canister_targets: Vec<CanisterId>,
-) -> Result<String, String> {
+) -> Result<(String, ActionAuxiliary), String> {
     let current_parameters = governance_proto
         .parameters
         .as_ref()
@@ -173,10 +304,19 @@ pub async fn validate_and_render_action(
         Some(action) => action,
     };
 
+    // Supporting auxiliary data. Not all of these are used in every case. This makes it very
+    // transparent which parts of governance_proto are used by each of the action-specific
+    // validators.
     let disallowed_target_canister_ids: HashSet<CanisterId> =
         reserved_canister_targets.clone().drain(..).collect();
+    let sns_transfer_fee_e8s = governance_proto
+        .parameters
+        .as_ref()
+        .and_then(|params| params.transaction_fee_e8s)
+        .unwrap_or(DEFAULT_TRANSFER_FEE.get_e8s());
 
-    match action {
+    let mut action_auxiliary = ActionAuxiliary::None;
+    let result = match action {
         proposal::Action::Unspecified(_unspecified) => {
             Err("`unspecified` was used, but is not a valid Proposal action.".into())
         }
@@ -231,21 +371,40 @@ pub async fn validate_and_render_action(
             validate_and_render_manage_sns_metadata(manage_sns_metadata)
         }
         proposal::Action::TransferSnsTreasuryFunds(transfer) => {
-            let sns_transfer_fee_e8s = governance_proto
-                .parameters
-                .as_ref()
-                .and_then(|params| params.transaction_fee_e8s)
-                .unwrap_or(DEFAULT_TRANSFER_FEE.get_e8s());
-            validate_and_render_transfer_sns_treasury_funds(transfer, sns_transfer_fee_e8s)
+            let swap_canister_id = governance_proto.swap_canister_id_or_panic();
+            let sns_ledger_canister_id = governance_proto.ledger_canister_id_or_panic();
+            let proposals = governance_proto.proposals.values();
+            let result = validate_and_render_transfer_sns_treasury_funds(
+                transfer,
+                sns_transfer_fee_e8s,
+                env,
+                swap_canister_id,
+                sns_ledger_canister_id,
+                proposals,
+            )
+            .await;
+            match result {
+                Err(err) => Err(err),
+                Ok((rendering, valuation)) => {
+                    action_auxiliary = ActionAuxiliary::TransferSnsTreasuryFunds(valuation);
+                    Ok(rendering)
+                }
+            }
         }
         proposal::Action::MintSnsTokens(mint) => {
-            let sns_transfer_fee_e8s = governance_proto
-                .parameters
-                .as_ref()
-                .and_then(|params| params.transaction_fee_e8s)
-                .unwrap_or(DEFAULT_TRANSFER_FEE.get_e8s());
             validate_and_render_mint_sns_tokens(mint, sns_transfer_fee_e8s)
         }
+        proposal::Action::ManageLedgerParameters(manage_ledger_parameters) => {
+            validate_and_render_manage_ledger_parameters(manage_ledger_parameters)
+        }
+        proposal::Action::ManageDappCanisterSettings(manage_dapp_canister_settings) => {
+            validate_and_render_manage_dapp_canister_settings(manage_dapp_canister_settings)
+        }
+    };
+
+    match result {
+        Err(err) => Err(err),
+        Ok(rendering) => Ok((rendering, action_auxiliary)),
     }
 }
 
@@ -288,11 +447,70 @@ fn validate_and_render_manage_nervous_system_parameters(
 }
 
 /// Validates and render TransferSnsTreasuryFunds proposal
-fn validate_and_render_transfer_sns_treasury_funds(
+async fn validate_and_render_transfer_sns_treasury_funds(
     transfer: &TransferSnsTreasuryFunds,
     sns_transfer_fee_e8s: u64,
+    env: &dyn Environment,
+    swap_canister_id: CanisterId,
+    sns_ledger_canister_id: CanisterId,
+    proposals: impl Iterator<Item = &ProposalData>,
+) -> Result<(String, Valuation), String> {
+    let mut defects = vec![];
+
+    // Validate amount. This requires calling CMC and the swap canister; hence, await.
+    let amount_result = check_transfer_sns_treasury_funds_amount_is_within_limits_or_err(
+        transfer,
+        env,
+        swap_canister_id,
+        sns_ledger_canister_id,
+        proposals,
+    )
+    .await;
+    let valuation = match amount_result {
+        Ok(ok) => Some(ok),
+        Err(err) => {
+            defects.push(err);
+            None
+        }
+    };
+
+    // Validate all other aspects of the proposal action.
+    locally_validate_and_render_transfer_sns_treasury_funds(transfer, sns_transfer_fee_e8s, defects)
+        .and_then(|rendering| {
+            match valuation {
+                Some(valuation) => Ok((rendering, valuation)),
+
+                // Proof that this never happens:
+                //
+                //   1. valuation = None means that amount_result was Err.
+                //
+                //   2. In that case, nonempty defects was passed to
+                //      locally_validate_and_render_transfer_sns_treasury_funds.
+                //
+                //   3. In that case, the function always returns Err.
+                //
+                //   4. Then, this closure doesn't get called.
+                None => Err(
+                    "There is a bug in the amount validator. Somehow, no valuation, \
+                     even though a rendering was generated."
+                        .to_string(),
+                ),
+            }
+        })
+}
+
+/// Performs all the validation on a TransferSnsTreasuryFunds that does not require fetching
+/// information from other canisters.
+fn locally_validate_and_render_transfer_sns_treasury_funds(
+    transfer: &TransferSnsTreasuryFunds,
+    sns_transfer_fee_e8s: u64,
+    mut defects: Vec<String>,
 ) -> Result<String, String> {
-    let mut defects: Vec<String> = vec![];
+    // Two things are happening here:
+    //
+    //     1. make sure that from_treasury is not Unspecified.
+    //
+    //     2. Humanize from_treasury.
     let (from, unit) = match transfer.from_treasury() {
         TransferFrom::IcpTreasury => ("ICP Treasury (ICP Ledger)", "ICP"),
         TransferFrom::SnsTokenTreasury => ("SNS Token Treasury (SNS Ledger)", "SNS Tokens"),
@@ -305,12 +523,12 @@ fn validate_and_render_transfer_sns_treasury_funds(
         }
     };
 
+    // Make sure amount is not too small.
     let minimum_transaction = match transfer.from_treasury() {
         TransferFrom::IcpTreasury => NNS_DEFAULT_TRANSFER_FEE.get_e8s(),
         TransferFrom::SnsTokenTreasury => sns_transfer_fee_e8s,
         TransferFrom::Unspecified => 0,
     };
-
     if transfer.amount_e8s < minimum_transaction {
         defects.push(format!(
             "For transactions from {}, the fee and minimum transaction is {} e8s",
@@ -318,6 +536,7 @@ fn validate_and_render_transfer_sns_treasury_funds(
         ))
     }
 
+    // Inspect to_principal, which must be Some(non_anonymous).
     let to_principal = if let Some(to_principal) = transfer.to_principal {
         if to_principal == PrincipalId::new_anonymous() {
             defects.push("to_principal must not be anonymous.".to_string());
@@ -356,7 +575,6 @@ fn validate_and_render_transfer_sns_treasury_funds(
     }
 
     let display_amount_tokens = i2d(transfer.amount_e8s) / i2d(E8);
-
     Ok(format!(
         r"# Proposal to transfer SNS Treasury funds:
 ## Source treasury: {from}
@@ -368,6 +586,108 @@ fn validate_and_render_transfer_sns_treasury_funds(
         amount_e8s = transfer.amount_e8s,
         memo = transfer.memo.unwrap_or(0)
     ))
+}
+
+impl TransferFrom {
+    fn treasury_account(self, sns_governance_canister_id: CanisterId) -> Result<Account, String> {
+        let sns_governance_canister_id = PrincipalId::from(sns_governance_canister_id);
+        let owner = Principal::from(sns_governance_canister_id);
+
+        match self {
+            TransferFrom::Unspecified => Err("from_treasury is Unspecified.".to_string()),
+
+            TransferFrom::IcpTreasury => Ok(Account {
+                owner,
+                subaccount: None,
+            }),
+
+            TransferFrom::SnsTokenTreasury => Ok(Account {
+                owner,
+                subaccount: Some(compute_distribution_subaccount_bytes(
+                    sns_governance_canister_id,
+                    TREASURY_SUBACCOUNT_NONCE,
+                )),
+            }),
+        }
+    }
+}
+
+async fn check_transfer_sns_treasury_funds_amount_is_within_limits_or_err(
+    transfer: &TransferSnsTreasuryFunds,
+    env: &dyn Environment,
+    swap_canister_id: CanisterId,
+    sns_ledger_canister_id: CanisterId,
+    proposals: impl Iterator<Item = &ProposalData>,
+) -> Result<Valuation, String> {
+    let treasury_transfer_total_tokens = total_treasury_transfer_amount_tokens(
+        proposals,
+        transfer.from_treasury(),
+        env.now() - 7 * SECONDS_PER_DAY,
+    )?;
+
+    let from_treasury = transfer.from_treasury();
+    let treasury_account = from_treasury.treasury_account(env.canister_id())?;
+
+    // Get valuation of the tokens in the treasury.
+    //
+    // TODO(NNS1-2809): This should probably be done higher in the call stack (and then passed
+    // down), because the caller needs valuation later in the proposal lifecycle. Specifically, when
+    // the proposal is executed.
+    let valuation = match from_treasury {
+        TransferFrom::Unspecified => return Err("from_treasury is Unspecified.".to_string()),
+
+        TransferFrom::IcpTreasury => try_get_icp_balance_valuation(treasury_account).await,
+
+        TransferFrom::SnsTokenTreasury => {
+            try_get_sns_token_balance_valuation(
+                treasury_account,
+                sns_ledger_canister_id,
+                swap_canister_id,
+            )
+            .await
+        }
+    }
+    // An Err here is most likely due to a failure to call another canister.
+    .map_err(|valuation_error| format!("Unable to validate amount: {:?}", valuation_error,))?;
+
+    // From valuation, determine limit on the total from the past 7 days.
+    let max_tokens = TreasuryTransferTotalUpperBound::in_tokens(&valuation)
+        // Err is most likely a bug.
+        .map_err(|treasury_limit_error| {
+            format!("Unable to validate amount: {:?}", treasury_limit_error,)
+        })?;
+
+    // Finally, inspect amount: it must not exceed max - spent (remainder). Or if you prefer,
+    // equivalently, amount + spent must be <= max.
+    let allowance_remainder_tokens = max_tokens
+        .checked_sub(treasury_transfer_total_tokens)
+        .ok_or_else(|| {
+            format!(
+                "Arithmetic error while performing {} - {}",
+                max_tokens, treasury_transfer_total_tokens,
+            )
+        })?;
+    let transfer_amount_tokens = denominations_to_tokens(transfer.amount_e8s, E8)
+        // This Err will not be generated, because we are dividing a u64 (amount_e8s) by a positive
+        // number (E8).
+        .ok_or_else(|| {
+            format!(
+                "Unable to convert proposal amount {} e8s to tokens.",
+                transfer.amount_e8s,
+            )
+        })?;
+    if transfer_amount_tokens > allowance_remainder_tokens {
+        // Although it might not be obvious to the user, their proposal is invalid, and we consider
+        // it to be "their fault".
+        return Err(format!(
+            "Amount is too large. Within the past 7 days, a total of {} tokens has already been \
+             transferred. Whereas, at most {} is allowed. An additional {} would cause that upper \
+             bound to be exceeded. Maybe, try again in a few days?",
+            treasury_transfer_total_tokens, max_tokens, transfer_amount_tokens
+        ));
+    }
+
+    Ok(valuation)
 }
 
 /// Validates and render MintSnsTokens proposal
@@ -584,6 +904,10 @@ fn validate_canister_id(
     }
 }
 
+impl ValidGenericNervousSystemFunction {
+    pub const MIN_ID: u64 = 1000;
+}
+
 impl TryFrom<&NervousSystemFunction> for ValidGenericNervousSystemFunction {
     type Error = String;
 
@@ -608,8 +932,11 @@ impl TryFrom<&NervousSystemFunction> for ValidGenericNervousSystemFunction {
 
         let mut defects = vec![];
 
-        if *id < 1000 {
-            defects.push("NervousSystemFunction's must have ids starting at 1000".to_string());
+        if *id < Self::MIN_ID {
+            defects.push(format!(
+                "NervousSystemFunction's must have ids starting at {}",
+                Self::MIN_ID,
+            ));
         }
 
         if name.is_empty() || name.len() > 256 {
@@ -786,8 +1113,8 @@ fn validate_and_render_register_dapp_canisters(
     }
 
     let num_canisters_to_register = register_dapp_canisters.canister_ids.len();
-    if num_canisters_to_register > MAX_NUMBER_OF_DAPPS_TO_REGISTER_PER_PROPOSAL {
-        return Err(format!("RegisterDappCanisters cannot specify more than {MAX_NUMBER_OF_DAPPS_TO_REGISTER_PER_PROPOSAL} canister ids"));
+    if num_canisters_to_register > MAX_NUMBER_OF_DAPPS_TO_MANAGE_PER_PROPOSAL {
+        return Err(format!("RegisterDappCanisters cannot specify more than {MAX_NUMBER_OF_DAPPS_TO_MANAGE_PER_PROPOSAL} canister ids"));
     }
 
     let canisters_to_register = register_dapp_canisters
@@ -837,6 +1164,10 @@ fn validate_and_render_deregister_dapp_canisters(
 ) -> Result<String, String> {
     if deregister_dapp_canisters.canister_ids.is_empty() {
         return Err("DeregisterDappCanisters must specify at least one canister id".to_string());
+    }
+
+    if deregister_dapp_canisters.canister_ids.len() > MAX_NUMBER_OF_DAPPS_TO_MANAGE_PER_PROPOSAL {
+        return Err(format!("DeregisterDappCanisters cannot specify more than {MAX_NUMBER_OF_DAPPS_TO_MANAGE_PER_PROPOSAL} canister ids"));
     }
 
     if deregister_dapp_canisters.new_controllers.is_empty() {
@@ -931,6 +1262,96 @@ pub fn validate_and_render_manage_sns_metadata(
     }
 }
 
+fn validate_and_render_manage_ledger_parameters(
+    manage_ledger_parameters: &ManageLedgerParameters,
+) -> Result<String, String> {
+    let mut no_change = true;
+    let mut render = "# Proposal to change ledger parameters:\n".to_string();
+    if let Some(transfer_fee) = &manage_ledger_parameters.transfer_fee {
+        render += &format!(
+            "# Set token transfer fee: {} token-quantums. \n",
+            transfer_fee
+        );
+        no_change = false;
+    }
+    if no_change {
+        Err(String::from(
+            "ManageLedgerParameters must change at least one value, all values are None",
+        ))
+    } else {
+        Ok(render)
+    }
+}
+
+fn validate_and_render_manage_dapp_canister_settings(
+    manage_dapp_canister_settings: &ManageDappCanisterSettings,
+) -> Result<String, String> {
+    if manage_dapp_canister_settings.canister_ids.is_empty() {
+        return Err("ManageDappCanisterSettings must specify at least one canister".to_string());
+    }
+
+    if manage_dapp_canister_settings.canister_ids.len() > MAX_NUMBER_OF_DAPPS_TO_MANAGE_PER_PROPOSAL
+    {
+        return Err(format!(
+            "ManageDappCanisterSettings cannot specify more than \
+             {MAX_NUMBER_OF_DAPPS_TO_MANAGE_PER_PROPOSAL} canister ids"
+        ));
+    }
+
+    let num_canisters = manage_dapp_canister_settings.canister_ids.len();
+    let canister_list = manage_dapp_canister_settings
+        .canister_ids
+        .iter()
+        .map(|id| format!("  - {id}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut render = format!(
+        "# Proposal to manage settings for {num_canisters} dapp canister{plural}: \n\
+        ## Canister ids: \n\
+        {canister_list}\n",
+        plural = if num_canisters > 1 { "s" } else { "" },
+    );
+
+    let mut no_change = true;
+    if let Some(compute_allocation) = &manage_dapp_canister_settings.compute_allocation {
+        render += &format!("# Set compute allocation to: {}%\n", compute_allocation);
+        no_change = false;
+    }
+    if let Some(memory_allocation) = &manage_dapp_canister_settings.memory_allocation {
+        render += &format!("# Set memory allocation to: {} bytes\n", memory_allocation);
+        no_change = false;
+    }
+    if let Some(freezing_threshold) = &manage_dapp_canister_settings.freezing_threshold {
+        render += &format!(
+            "# Set freezing threshold to: {} seconds\n",
+            freezing_threshold
+        );
+        no_change = false;
+    }
+    if let Some(reserved_cycles_limit) = &manage_dapp_canister_settings.reserved_cycles_limit {
+        render += &format!(
+            "# Set reserved cycles limit to: {} \n",
+            reserved_cycles_limit
+        );
+        no_change = false;
+    }
+    if let Some(log_visibility) = &manage_dapp_canister_settings.log_visibility {
+        render += &format!(
+            "# Set log visibility to: {:?} \n",
+            LogVisibility::try_from(*log_visibility).unwrap_or_default()
+        );
+        no_change = false;
+    }
+
+    if no_change {
+        Err(String::from(
+            "ManageDappCanisterSettings must change at least one value, all values are None",
+        ))
+    } else {
+        Ok(render)
+    }
+}
+
 impl ProposalData {
     /// Returns the proposal's decision status. See [ProposalDecisionStatus] in the SNS's
     /// proto for more information.
@@ -954,6 +1375,11 @@ impl ProposalData {
     /// proto for more information.
     pub fn reward_status(&self, now_seconds: u64) -> ProposalRewardStatus {
         if self.has_been_rewarded() {
+            debug_assert!(
+                self.is_eligible_for_rewards,
+                "Invalid ProposalData: {:#?}",
+                self
+            );
             return ProposalRewardStatus::Settled;
         }
 
@@ -961,7 +1387,6 @@ impl ProposalData {
             return ProposalRewardStatus::AcceptVotes;
         }
 
-        // TODO(NNS1-2731): Replace this with just ReadyToSettle.
         if self.is_eligible_for_rewards {
             ProposalRewardStatus::ReadyToSettle
         } else {
@@ -1343,10 +1768,41 @@ impl ProposalData {
         }
     }
 
-    /// Return true if the proposal can be purged from storage, e.g.,
+    /// Return whether the proposal can be purged from storage, e.g.,
     /// if it is allowed to be garbage collected.
     pub(crate) fn can_be_purged(&self, now_seconds: u64) -> bool {
-        self.status().is_final() && self.reward_status(now_seconds).is_final()
+        // Retain proposals that have not gone through the full lifecycle.
+        if !self.status().is_final() {
+            return false;
+        }
+        if !self.reward_status(now_seconds).is_final() {
+            return false;
+        }
+
+        // At this point, we can let go of most proposals. The only special case is
+        // TransferSnsTreasuryFunds and MintSnsTokens (the common thread between these is that these
+        // affect the value of the treasury). We want to hang onto those for at least 7 days after
+        // they have been successfully executed. This is because they are still needed for the
+        // purposes of limiting amounts.
+        let Some(proposal) = &self.proposal else {
+            log!(ERROR, "Proposal {:?} missing `proposal` field", self.id);
+            return true;
+        };
+        let retention_duration_seconds = match &proposal.action {
+            Some(Action::TransferSnsTreasuryFunds(_)) => {
+                EXECUTED_TRANSFER_SNS_TREASURY_FUNDS_PROPOSAL_RETENTION_DURATION_SECONDS
+            }
+            Some(Action::MintSnsTokens(_)) => {
+                EXECUTED_MINT_SNS_TOKENS_PROPOSAL_RETENTION_DURATION_SECONDS
+            }
+            _ => return true,
+        };
+
+        // Only hang onto proposals that were executed recently enough. In other words, let older
+        // proposals age out.
+        let earliest_unpurgeable_executed_timestamp_seconds =
+            now_seconds - retention_duration_seconds;
+        self.executed_timestamp_seconds < earliest_unpurgeable_executed_timestamp_seconds
     }
 
     // Returns a clone of self, except that "large blob fields" are replaced
@@ -1360,6 +1816,40 @@ impl ProposalData {
                 .map(|proposal| proposal.strip_large_fields()),
             ..self.clone()
         }
+    }
+
+    /// Creates a limited version of the proposal data, suitable for listing proposals.
+    ///
+    /// Specifically, remove the ballots in the proposal data and possibly the proposal's payload.
+    /// The payload is removed if the proposal is an ExecuteNervousSystemFunction or if it's
+    /// a UpgradeSnsControlledCanister. The text rendering should include displayable information about
+    /// the payload contents already.
+    pub fn limited_for_list_proposals(&self, caller_neurons_set: &HashSet<String>) -> Self {
+        let mut limited_proposal_data = self.clone();
+        if let Some(proposal) = limited_proposal_data.proposal.as_mut() {
+            // We can't understand the payloads of nervous system functions, as well as the wasm
+            // for upgrades, so just omit them when listing proposals.
+            match &mut proposal.action {
+                Some(Action::ExecuteGenericNervousSystemFunction(action)) => {
+                    action.payload.clear();
+                }
+                Some(Action::UpgradeSnsControlledCanister(action)) => {
+                    action.new_canister_wasm.clear();
+                }
+                _ => (),
+            }
+        }
+
+        let mut ballots = std::mem::take(&mut limited_proposal_data.ballots);
+        ballots.retain(|neuron_id, _| caller_neurons_set.contains(neuron_id));
+
+        // Truncate the number of ballots to avoid returning too much data.
+        limited_proposal_data.ballots = ballots
+            .into_iter()
+            .take(MAX_NUMBER_OF_BALLOTS_IN_LIST_PROPOSALS_RESPONSE)
+            .collect();
+
+        limited_proposal_data
     }
 }
 
@@ -1384,14 +1874,216 @@ impl ProposalRewardStatus {
     }
 }
 
+pub(crate) fn transfer_sns_treasury_funds_amount_is_small_enough_at_execution_time_or_err<'a>(
+    transfer: &TransferSnsTreasuryFunds,
+    valuation: &Valuation,
+    proposals: impl Iterator<Item = &'a ProposalData>,
+    now_timestamp_seconds: u64,
+) -> Result<(), GovernanceError> {
+    let allowance_tokens = match TreasuryTransferTotalUpperBound::in_tokens(valuation) {
+        Ok(ok) => ok,
+        // This should not be possible, because valuation was already used the same way during
+        // proposal submission/creation/validation.
+        Err(err) => {
+            return Err(GovernanceError::new_with_message(
+                ErrorType::InconsistentInternalData,
+                format!(
+                    "Unable to determined upper bound on the amount of \
+                     TransferSnsTreasuryFunds proposals: {:?}\nvaluation:{:?}",
+                    err, valuation,
+                ),
+            ));
+        }
+    };
+
+    // The total calculated here _could_ be different from what was calculated at proposal
+    // submission/creation time. A difference would result from the execution of (another)
+    // TransferSnsTreasuryFunds proposal between now and then.
+    let spent_tokens = total_treasury_transfer_amount_tokens(
+        proposals,
+        transfer.from_treasury(),
+        now_timestamp_seconds - 7 * SECONDS_PER_DAY,
+    )
+    .map_err(|message| {
+        GovernanceError::new_with_message(ErrorType::InconsistentInternalData, message)
+    })?;
+
+    let remainder_tokens = allowance_tokens - spent_tokens;
+    let transfer_amount_tokens = denominations_to_tokens(transfer.amount_e8s, E8)
+        // This Err cannot be provoked, because we are dividing a u64 (amount_e8s) by a positive
+        // integer (E8).
+        .ok_or_else(|| {
+            GovernanceError::new_with_message(
+                ErrorType::UnreachableCode,
+                format!(
+                    "Unable to convert proposals amount {} e8s to tokens.",
+                    transfer.amount_e8s,
+                ),
+            )
+        })?;
+    if transfer_amount_tokens > remainder_tokens {
+        return Err(GovernanceError::new_with_message(
+            ErrorType::PreconditionFailed,
+            format!(
+                "Executing this proposal is not allowed at this time, because doing \
+                 so would cause the 7 day upper bound of {} tokens to be exceeded. \
+                 Maybe, try again later? The total amount transferred in the past \
+                 7 days stands at {} tokens, and the amount in this proposal is {} \
+                 tokens. The upper bound is based on treasury valuation factors at \
+                 the time of proposal submission: {:?}",
+                allowance_tokens, spent_tokens, transfer_amount_tokens, valuation,
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Returns the total amount (in e8s) that was transfered from the treasury via
+/// TransferSnsTreasuryFunds proposals, or None if there was an overflow.
+///
+/// Arguments:
+/// * `proposals` - Self-explanatory.
+/// * `filter_from_treasury` - Specify the token type (ICP or SNS). The name of this parameter is
+///   based on TransferSnsTreasuryFunds.from_treasury, which specifies which token the proposal is
+///   concerned about. Furthermore, that field is compared against this parameter.
+/// * `min_executed_timestamp_seconds` - Older proposals are not considered.
+///
+/// Currently, the only known way for this to return Err is if proposals is not valid. Specifically,
+/// we require that the `proposal` (singular) field in each element of `proposals` (plural) is
+/// Some(...).
+fn total_treasury_transfer_amount_tokens<'a>(
+    proposals: impl Iterator<Item = &'a ProposalData>,
+    filter_from_treasury: TransferFrom,
+    min_executed_timestamp_seconds: u64,
+) -> Result<Decimal, String> {
+    let filter_proposal_action_amount_e8s = |action: &Action| {
+        let transfer = match action {
+            Action::TransferSnsTreasuryFunds(ok) => ok,
+            // Skip other types of proposals.
+            _ => return None,
+        };
+
+        let is_proposal_token_relevant =
+            // Very confusingly, the from_treasury field specifies which token
+            // the proposal is about.
+            TransferFrom::try_from(transfer.from_treasury) == Ok(filter_from_treasury);
+        if !is_proposal_token_relevant {
+            return None;
+        }
+
+        Some(transfer.amount_e8s)
+    };
+
+    total_proposal_amounts_tokens(
+        proposals,
+        &format!("{:?} transfer", filter_from_treasury),
+        filter_proposal_action_amount_e8s,
+        min_executed_timestamp_seconds,
+    )
+}
+
+/// Analogous to total_treasury_transfer_amount_tokens. Of course, this considers MintSnsTokens
+/// proposals instead of TransferSnsTreasuryFunds proposals.
+#[allow(unused)] // TODO(NNS1-2910): Delete this.
+fn total_minting_amount_tokens<'a>(
+    proposals: impl Iterator<Item = &'a ProposalData>,
+    min_executed_timestamp_seconds: u64,
+) -> Result<Decimal, String> {
+    let filter_proposal_action_amount_e8s = |action: &Action| {
+        let mint = match action {
+            Action::MintSnsTokens(ok) => ok,
+            // Skip other types of proposals.
+            _ => return None,
+        };
+
+        mint.amount_e8s
+    };
+
+    total_proposal_amounts_tokens(
+        proposals,
+        "MintSnsTokens",
+        filter_proposal_action_amount_e8s,
+        min_executed_timestamp_seconds,
+    )
+}
+
+/// Where most of the implementation for other total_*_amount_tokens functions lives. The only
+/// difference among those functions is which actions are relevant.
+fn total_proposal_amounts_tokens<'a>(
+    proposals: impl Iterator<Item = &'a ProposalData>,
+    proposal_type_description: &str,
+    filter_proposal_action_amount_e8s: impl Fn(&Action) -> Option<u64>,
+    min_executed_timestamp_seconds: u64,
+) -> Result<Decimal, String> {
+    let mut total_tokens = Decimal::from(0);
+
+    for proposal in proposals {
+        // Skip proposals that were not executed recently enough. (This also skips proposals that
+        // were rejected, or execution failed).
+        if proposal.executed_timestamp_seconds < min_executed_timestamp_seconds {
+            continue;
+        }
+
+        let proposal_id = proposal.id;
+
+        // Filter based on action.
+        let Some(proposal) = &proposal.proposal else {
+            return Err(format!(
+                "ProposalData {:?} is invalid, because its `proposal` field is empty!",
+                proposal_id,
+            ));
+        };
+        let Some(proposal_amount_e8s) = proposal
+            .action
+            .as_ref()
+            .and_then(&filter_proposal_action_amount_e8s)
+        else {
+            continue;
+        };
+
+        // Convert from e8s (u64) to tokens (Decimal).
+        let proposal_amount_tokens = denominations_to_tokens(proposal_amount_e8s, E8)
+            // This Err is impossible, because we are dividing a u64 by a positive number.
+            .ok_or_else(|| {
+                format!(
+                    "Failed to total amount in recent {} proposals: \
+                     Unable to convert amount {} e8s to whole tokens in proposal {:?}.",
+                    proposal_type_description, proposal_amount_e8s, proposal_id,
+                )
+            })?;
+
+        total_tokens = total_tokens
+            .checked_add(proposal_amount_tokens)
+            // Provoking this Err is infeasible: there would have to be > u32::MAX executed
+            // TransferSnsTreasuryFunds proposals that have amount = u64::MAX e8s. In that case,
+            // something much worse than causing this to quietly overflow is probably possible.
+            .ok_or_else(|| {
+                format!(
+                    "Failed to total amount in recent TransferSnsTreasuryFunds proposals: \
+                     overflow while performing {} + {}.",
+                    total_tokens, proposal_amount_tokens,
+                )
+            })?;
+    }
+
+    Ok(total_tokens)
+}
+
+#[cfg(test)]
+mod treasury_tests;
+
+#[cfg(test)]
+mod minting_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         pb::v1::{
             governance::{self, Version},
-            Empty, Governance as GovernanceProto, NeuronId, Proposal, ProposalId, Subaccount,
-            WaitForQuietState,
+            Ballot, Empty, Governance as GovernanceProto, NeuronId, Proposal, ProposalId,
+            Subaccount, WaitForQuietState,
         },
         sns_upgrade::{
             CanisterSummary, GetNextSnsVersionRequest, GetNextSnsVersionResponse,
@@ -1460,6 +2152,7 @@ mod tests {
         )
         .now_or_never()
         .unwrap()
+        .map(|(rendering, _action_auxiliary)| rendering)
     }
 
     fn validate_default_action(action: &Option<proposal::Action>) -> Result<String, String> {
@@ -1472,6 +2165,7 @@ mod tests {
         )
         .now_or_never()
         .unwrap()
+        .map(|(rendering, _action_auxiliary)| rendering)
     }
 
     fn basic_principal_id() -> PrincipalId {
@@ -2149,7 +2843,7 @@ mod tests {
         let (env, governance_proto) = setup_for_upgrade_sns_to_next_version_validation_tests();
         let action = Action::UpgradeSnsToNextVersion(UpgradeSnsToNextVersion {});
         // Same id as setup_env_for_upgrade_sns_proposals
-        let actual_text = validate_and_render_action(
+        let (actual_text, _) = validate_and_render_action(
             &Some(action),
             &env,
             &governance_proto,
@@ -2425,7 +3119,7 @@ Version {
     fn validate_and_render_transfer_sns_treasury_funds_renders_for_valid_inputs() {
         // Valid case
         assert_eq!(
-            validate_and_render_transfer_sns_treasury_funds(
+            locally_validate_and_render_transfer_sns_treasury_funds(
                 &TransferSnsTreasuryFunds {
                     from_treasury: TransferFrom::IcpTreasury.into(),
                     amount_e8s: 1000000,
@@ -2433,7 +3127,8 @@ Version {
                     to_principal: Some(basic_principal_id()),
                     to_subaccount: None
                 },
-                0
+                0,
+                vec![],
             )
             .unwrap(),
             r"# Proposal to transfer SNS Treasury funds:
@@ -2447,7 +3142,7 @@ Version {
 
         // Valid case with default sub-account
         assert_eq!(
-            validate_and_render_transfer_sns_treasury_funds(
+            locally_validate_and_render_transfer_sns_treasury_funds(
                 &TransferSnsTreasuryFunds {
                     from_treasury: TransferFrom::IcpTreasury.into(),
                     amount_e8s: 10000000,
@@ -2457,7 +3152,8 @@ Version {
                         subaccount: vec![0; 32]
                     })
                 },
-                0
+                0,
+                vec![],
             )
             .unwrap(),
             r"# Proposal to transfer SNS Treasury funds:
@@ -2473,7 +3169,7 @@ Version {
         // The textual representation of ICRC-1 Accounts can be
         // found at https://github.com/dfinity/ICRC-1/blob/main/standards/ICRC-1/TextualEncoding.md
         assert_eq!(
-            validate_and_render_transfer_sns_treasury_funds(
+            locally_validate_and_render_transfer_sns_treasury_funds(
                 &TransferSnsTreasuryFunds {
                     from_treasury: TransferFrom::IcpTreasury.into(),
                     amount_e8s: E8,
@@ -2481,7 +3177,8 @@ Version {
                     to_principal: Some(basic_principal_id()),
                     to_subaccount: Some(subaccount_1())
                 },
-                0
+                0,
+                vec![],
             )
             .unwrap(),
             r"# Proposal to transfer SNS Treasury funds:
@@ -2495,7 +3192,7 @@ Version {
 
         // Valid transfer from SNS treasury
         assert_eq!(
-            validate_and_render_transfer_sns_treasury_funds(
+            locally_validate_and_render_transfer_sns_treasury_funds(
                 &TransferSnsTreasuryFunds {
                     from_treasury: TransferFrom::SnsTokenTreasury.into(),
                     amount_e8s: 1000000,
@@ -2503,7 +3200,8 @@ Version {
                     to_principal: Some(basic_principal_id()),
                     to_subaccount: None
                 },
-                0
+                0,
+                vec![],
             )
             .unwrap(),
             r"# Proposal to transfer SNS Treasury funds:
@@ -2520,7 +3218,7 @@ Version {
     fn validate_and_render_transfer_sns_treasury_funds_no_principal() {
         // invalid case no principal
         assert_eq!(
-            validate_and_render_transfer_sns_treasury_funds(
+            locally_validate_and_render_transfer_sns_treasury_funds(
                 &TransferSnsTreasuryFunds {
                     from_treasury: TransferFrom::IcpTreasury.into(),
                     amount_e8s: 1000000,
@@ -2530,7 +3228,8 @@ Version {
                         subaccount: vec![0; 32]
                     })
                 },
-                0
+                0,
+                vec![],
             )
             .unwrap_err(),
             "TransferSnsTreasuryFunds proposal was invalid for the following reason(s):\nMust specify a principal to make the transfer to.".to_string()
@@ -2541,7 +3240,7 @@ Version {
     fn validate_and_render_transfer_sns_treasury_funds_anonymous_principal() {
         // invalid case anonymous principal
         assert_eq!(
-            validate_and_render_transfer_sns_treasury_funds(
+            locally_validate_and_render_transfer_sns_treasury_funds(
                 &TransferSnsTreasuryFunds {
                     from_treasury: TransferFrom::IcpTreasury.into(),
                     amount_e8s: 1000000,
@@ -2549,7 +3248,8 @@ Version {
                     to_principal: Some(PrincipalId::new_anonymous()),
                     to_subaccount: None
                 },
-                0
+                0,
+                vec![],
             )
             .unwrap_err(),
             "TransferSnsTreasuryFunds proposal was invalid for the following reason(s):\nto_principal must not be anonymous.".to_string()
@@ -2560,7 +3260,7 @@ Version {
     fn validate_and_render_transfer_sns_treasury_funds_bad_subaccount() {
         // invalid case bad subaccount
         assert_eq!(
-            validate_and_render_transfer_sns_treasury_funds(
+            locally_validate_and_render_transfer_sns_treasury_funds(
                 &TransferSnsTreasuryFunds {
                     from_treasury: TransferFrom::IcpTreasury.into(),
                     amount_e8s: 1000000,
@@ -2570,7 +3270,8 @@ Version {
                         subaccount: vec![1, 2]
                     })
                 },
-                0
+                0,
+                vec![],
             )
             .unwrap_err(),
             "TransferSnsTreasuryFunds proposal was invalid for the following reason(s):\nInvalid subaccount".to_string()
@@ -2580,7 +3281,7 @@ Version {
     #[test]
     fn validate_and_render_transfer_sns_treasury_funds_amount_less_than_fee() {
         assert_eq!(
-            validate_and_render_transfer_sns_treasury_funds(
+            locally_validate_and_render_transfer_sns_treasury_funds(
                 &TransferSnsTreasuryFunds {
                     from_treasury: TransferFrom::IcpTreasury.into(),
                     amount_e8s: 1000,
@@ -2588,13 +3289,14 @@ Version {
                     to_principal: Some(basic_principal_id()),
                     to_subaccount: None
                 },
-                0
+                0,
+                vec![],
             )
             .unwrap_err(),
             "TransferSnsTreasuryFunds proposal was invalid for the following reason(s):\nFor transactions from ICP Treasury (ICP Ledger), the fee and minimum transaction is 10000 e8s"
         );
         assert_eq!(
-            validate_and_render_transfer_sns_treasury_funds(
+            locally_validate_and_render_transfer_sns_treasury_funds(
                 &TransferSnsTreasuryFunds {
                     from_treasury: TransferFrom::SnsTokenTreasury.into(),
                     amount_e8s: 999,
@@ -2602,7 +3304,8 @@ Version {
                     to_principal: Some(basic_principal_id()),
                     to_subaccount: None
                 },
-                1000
+                1000,
+                vec![],
             )
             .unwrap_err(),
             "TransferSnsTreasuryFunds proposal was invalid for the following reason(s):\nFor transactions from SNS Token Treasury (SNS Ledger), the fee and minimum transaction is 1000 e8s"
@@ -2778,7 +3481,7 @@ Version {
 
     #[test]
     fn validate_and_render_register_dapp_canisters_allows_max_canisters() {
-        let canister_ids = (0..MAX_NUMBER_OF_DAPPS_TO_REGISTER_PER_PROPOSAL)
+        let canister_ids = (0..MAX_NUMBER_OF_DAPPS_TO_MANAGE_PER_PROPOSAL)
             .map(|i| PrincipalId::new_user_test_id(i as u64))
             .collect::<Vec<_>>();
         let disallowed_canister_ids: HashSet<CanisterId> = HashSet::new();
@@ -2794,7 +3497,7 @@ Version {
             assert!(rendered_proposal.contains(&format!("\n- {canister_id}")), "rendered proposal \"{rendered_proposal}\" does not contain canister id \"- {canister_id}\"");
         }
 
-        rendered_proposal.contains(&format!("{MAX_NUMBER_OF_DAPPS_TO_REGISTER_PER_PROPOSAL}"));
+        rendered_proposal.contains(&format!("{MAX_NUMBER_OF_DAPPS_TO_MANAGE_PER_PROPOSAL}"));
 
         for line in rendered_proposal.lines() {
             assert!(!line.starts_with(char::is_whitespace), "rendered proposal \"{rendered_proposal}\" contains a line that starts with whitespace");
@@ -2803,7 +3506,7 @@ Version {
 
     #[test]
     fn validate_and_render_register_dapp_canisters_doesnt_allow_more_than_max_canisters() {
-        let canister_ids = (0..(MAX_NUMBER_OF_DAPPS_TO_REGISTER_PER_PROPOSAL + 1))
+        let canister_ids = (0..(MAX_NUMBER_OF_DAPPS_TO_MANAGE_PER_PROPOSAL + 1))
             .map(|i| PrincipalId::new_user_test_id(i as u64))
             .collect::<Vec<_>>();
         let disallowed_canister_ids: HashSet<CanisterId> = HashSet::new();
@@ -2815,7 +3518,7 @@ Version {
         )
         .unwrap_err();
 
-        rendered_error.contains(&format!("{MAX_NUMBER_OF_DAPPS_TO_REGISTER_PER_PROPOSAL}"));
+        rendered_error.contains(&format!("{MAX_NUMBER_OF_DAPPS_TO_MANAGE_PER_PROPOSAL}"));
     }
 
     #[test]
@@ -3028,6 +3731,7 @@ Version {
             is_eligible_for_rewards: true,
             // This is because the proposal was rejected (see the latest_tally field).
             executed_timestamp_seconds: 0,
+            action_auxiliary: None,
         };
     }
 
@@ -3177,6 +3881,241 @@ Version {
         assert_eq!(
             ProposalData::majority_decision(yes_votes, no_votes + 1, total_votes, threshold),
             Vote::No
+        );
+    }
+
+    #[test]
+    fn validate_and_render_manage_ledger_parameters_must_be_changes() {
+        let rendered_error =
+            validate_and_render_manage_ledger_parameters(&ManageLedgerParameters::default())
+                .unwrap_err();
+        assert!(rendered_error.contains("must change at least one value"));
+    }
+
+    #[test]
+    fn test_validate_and_render_manage_ledger_parameters() {
+        let new_fee = 751;
+        let render = validate_and_render_manage_ledger_parameters(&ManageLedgerParameters {
+            transfer_fee: Some(new_fee),
+        })
+        .unwrap();
+        assert_eq!(
+            render,
+            format!("# Proposal to change ledger parameters:\n# Set token transfer fee: {} token-quantums. \n", new_fee)
+        );
+    }
+
+    #[test]
+    fn validate_and_render_manage_dapp_canister_settings_no_canisters() {
+        let rendered_error = validate_and_render_manage_dapp_canister_settings(
+            &ManageDappCanisterSettings::default(),
+        )
+        .unwrap_err();
+        assert!(rendered_error.contains("must specify at least one canister"));
+    }
+
+    #[test]
+    fn validate_and_render_manage_dapp_canister_settings_max_canisters() {
+        let canister_ids = (0..(MAX_NUMBER_OF_DAPPS_TO_MANAGE_PER_PROPOSAL))
+            .map(|i| PrincipalId::new_user_test_id(i as u64))
+            .collect::<Vec<_>>();
+
+        validate_and_render_manage_dapp_canister_settings(&ManageDappCanisterSettings {
+            canister_ids,
+            compute_allocation: Some(50),
+            memory_allocation: Some(1 << 30),
+            freezing_threshold: Some(1_000),
+            reserved_cycles_limit: Some(1_000_000_000_000),
+            log_visibility: Some(LogVisibility::Public as i32),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn validate_and_render_manage_dapp_canister_settings_too_many_canisters() {
+        let canister_ids = (0..(MAX_NUMBER_OF_DAPPS_TO_MANAGE_PER_PROPOSAL + 1))
+            .map(|i| PrincipalId::new_user_test_id(i as u64))
+            .collect::<Vec<_>>();
+
+        let rendered_error =
+            validate_and_render_manage_dapp_canister_settings(&ManageDappCanisterSettings {
+                canister_ids,
+                ..ManageDappCanisterSettings::default()
+            })
+            .unwrap_err();
+        assert!(rendered_error.contains("cannot specify more than"));
+    }
+
+    #[test]
+    fn validate_and_render_manage_dapp_canister_settings_no_changes() {
+        let rendered_error =
+            validate_and_render_manage_dapp_canister_settings(&ManageDappCanisterSettings {
+                canister_ids: vec![PrincipalId::new_user_test_id(1)],
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(rendered_error.contains("must change at least one value"));
+    }
+
+    #[test]
+    fn validate_and_render_manage_dapp_canister_settings_no_changes_multiple_canisters() {
+        let render =
+            validate_and_render_manage_dapp_canister_settings(&ManageDappCanisterSettings {
+                canister_ids: vec![
+                    PrincipalId::new_user_test_id(1),
+                    PrincipalId::new_user_test_id(2),
+                ],
+                compute_allocation: Some(50),
+                memory_allocation: Some(1 << 30),
+                freezing_threshold: Some(1_000),
+                reserved_cycles_limit: Some(1_000_000_000_000),
+                log_visibility: Some(LogVisibility::Public as i32),
+            })
+            .unwrap();
+        assert_eq!(
+            render,
+            "# Proposal to manage settings for 2 dapp canisters: \n\
+             ## Canister ids: \n  \
+             - 6fyp7-3ibaa-aaaaa-aaaap-4ai\n  \
+             - djduj-3qcaa-aaaaa-aaaap-4ai\n\
+             # Set compute allocation to: 50%\n\
+             # Set memory allocation to: 1073741824 bytes\n\
+             # Set freezing threshold to: 1000 seconds\n\
+             # Set reserved cycles limit to: 1000000000000 \n\
+             # Set log visibility to: Public \n"
+        );
+    }
+
+    #[test]
+    fn limited_proposal_data_for_list_proposals_retain_ballots_by_caller() {
+        let original_proposal_data = ProposalData {
+            proposal: Some(Proposal {
+                action: Some(Action::Motion(Motion {
+                    motion_text: "Some motion text".to_string(),
+                })),
+                ..Default::default()
+            }),
+            ballots: btreemap! {
+                "1".to_string() => Ballot {
+                    vote: Vote::Yes as i32,
+                    ..Default::default()
+                },
+                "2".to_string() => Ballot {
+                    vote: Vote::No as i32,
+                    ..Default::default()
+                },
+                "3".to_string() => Ballot {
+                    vote: Vote::Unspecified as i32,
+                    ..Default::default()
+                },
+            },
+            ..Default::default()
+        };
+        let caller_neurons = hashset! { "1".to_string(), "2".to_string() };
+
+        let limited_proposal_data =
+            original_proposal_data.limited_for_list_proposals(&caller_neurons);
+
+        assert_eq!(
+            limited_proposal_data,
+            ProposalData {
+                ballots: btreemap! {
+                    "1".to_string() => Ballot {
+                        vote: Vote::Yes as i32,
+                        ..Default::default()
+                    },
+                    "2".to_string() => Ballot {
+                        vote: Vote::No as i32,
+                        ..Default::default()
+                    },
+                },
+                ..original_proposal_data
+            }
+        );
+    }
+
+    #[test]
+    fn limited_proposal_data_for_list_proposals_truncate_ballots() {
+        let ballots = (100..300)
+            .map(|i| {
+                (
+                    i.to_string(),
+                    Ballot {
+                        vote: Vote::Yes as i32,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let original_proposal_data = ProposalData {
+            proposal: Some(Proposal {
+                action: Some(Action::Motion(Motion {
+                    motion_text: "Some motion text".to_string(),
+                })),
+                ..Default::default()
+            }),
+            ballots,
+            ..Default::default()
+        };
+        let caller_neurons = (0..1000).map(|i| i.to_string()).collect::<HashSet<_>>();
+
+        let limited_proposal_data =
+            original_proposal_data.limited_for_list_proposals(&caller_neurons);
+
+        let expected_ballots = (100..100 + MAX_NUMBER_OF_BALLOTS_IN_LIST_PROPOSALS_RESPONSE)
+            .map(|i| {
+                (
+                    i.to_string(),
+                    Ballot {
+                        vote: Vote::Yes as i32,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            limited_proposal_data,
+            ProposalData {
+                ballots: expected_ballots,
+                ..original_proposal_data
+            }
+        );
+    }
+
+    #[test]
+    fn limited_proposal_data_for_list_proposals_limited_action() {
+        let original_proposal_data = ProposalData {
+            proposal: Some(Proposal {
+                action: Some(Action::ExecuteGenericNervousSystemFunction(
+                    ExecuteGenericNervousSystemFunction {
+                        function_id: 1,
+                        payload: vec![0, 1, 2, 3],
+                    },
+                )),
+                ..Default::default()
+            }),
+            ballots: BTreeMap::new(),
+            ..Default::default()
+        };
+
+        let limited_proposal_data =
+            original_proposal_data.limited_for_list_proposals(&HashSet::new());
+
+        assert_eq!(
+            limited_proposal_data,
+            ProposalData {
+                proposal: Some(Proposal {
+                    action: Some(Action::ExecuteGenericNervousSystemFunction(
+                        ExecuteGenericNervousSystemFunction {
+                            function_id: 1,
+                            payload: vec![],
+                        },
+                    )),
+                    ..Default::default()
+                }),
+                ballots: BTreeMap::new(),
+                ..Default::default()
+            }
         );
     }
 }

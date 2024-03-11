@@ -1,5 +1,5 @@
 use crate::{
-    CheckpointError, CheckpointMetrics, TipRequest,
+    pagemaptypes_with_num_pages, CheckpointError, CheckpointMetrics, TipRequest,
     CRITICAL_ERROR_CHECKPOINT_SOFT_INVARIANT_BROKEN, NUMBER_OF_CHECKPOINT_THREADS,
 };
 use crossbeam_channel::{unbounded, Sender};
@@ -7,6 +7,7 @@ use ic_base_types::{subnet_id_try_from_protobuf, CanisterId};
 use ic_config::flag_status::FlagStatus;
 use ic_logger::error;
 use ic_registry_subnet_type::SubnetType;
+use ic_replicated_state::canister_snapshots::CanisterSnapshots;
 use ic_replicated_state::page_map::PageAllocatorFileDescriptor;
 use ic_replicated_state::{
     canister_state::execution_state::WasmBinary, page_map::PageMap, CanisterMetrics, CanisterState,
@@ -82,6 +83,7 @@ pub(crate) fn make_checkpoint(
             .make_checkpoint_step_duration
             .with_label_values(&["tip_to_checkpoint"])
             .start_timer();
+        #[allow(clippy::disallowed_methods)]
         let (send, recv) = unbounded();
         tip_channel
             .send(TipRequest::TipToCheckpoint {
@@ -90,11 +92,12 @@ pub(crate) fn make_checkpoint(
             })
             .unwrap();
         let cp = recv.recv().unwrap()?;
-        // With lsmt storage, this happens later (after manifest)
+        // With lsmt storage, ResetTipAndMerge happens later (after manifest).
         if lsmt_storage == FlagStatus::Disabled {
             tip_channel
-                .send(TipRequest::ResetTipTo {
+                .send(TipRequest::ResetTipAndMerge {
                     checkpoint_layout: cp.clone(),
+                    pagemaptypes_with_num_pages: pagemaptypes_with_num_pages(state),
                 })
                 .unwrap();
         }
@@ -107,6 +110,7 @@ pub(crate) fn make_checkpoint(
             .make_checkpoint_step_duration
             .with_label_values(&["wait_for_reflinking"])
             .start_timer();
+        #[allow(clippy::disallowed_methods)]
         let (send, recv) = unbounded();
         tip_channel.send(TipRequest::Wait { sender: send }).unwrap();
         recv.recv().unwrap();
@@ -257,8 +261,15 @@ pub fn load_checkpoint<P: ReadPolicy + Send + Sync>(
         canister_states
     };
 
-    let state =
-        ReplicatedState::new_from_checkpoint(canister_states, metadata, subnet_queues, query_stats);
+    // TODO(EXC-1539): Load canister snapshots from checkpoint.
+    let canister_snapshots = CanisterSnapshots::default();
+    let state = ReplicatedState::new_from_checkpoint(
+        canister_states,
+        metadata,
+        subnet_queues,
+        query_stats,
+        canister_snapshots,
+    );
 
     Ok(state)
 }
@@ -408,6 +419,8 @@ pub fn load_canister_state<P: ReadPolicy>(
         canister_state_bits.canister_history,
         wasm_chunk_store_data,
         canister_state_bits.wasm_chunk_store_metadata,
+        canister_state_bits.log_visibility,
+        canister_state_bits.canister_log,
     );
 
     let canister_state = CanisterState {

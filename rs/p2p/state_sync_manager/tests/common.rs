@@ -9,19 +9,20 @@ use std::{
     time::Duration,
 };
 
-use ic_interfaces::p2p::state_sync::StateSyncClient;
+use ic_interfaces::p2p::state_sync::{
+    AddChunkError, Chunk, ChunkId, Chunkable, StateSyncArtifactId, StateSyncClient,
+};
 use ic_logger::ReplicaLogger;
 use ic_memory_transport::TransportRouter;
 use ic_metrics::MetricsRegistry;
 use ic_p2p_test_utils::mocks::{MockChunkable, MockStateSync};
+use ic_quic_transport::Shutdown;
+use ic_state_manager::state_sync::types::{Manifest, MetaManifest, StateSyncMessage};
 use ic_types::{
-    artifact::{StateSyncArtifactId, StateSyncMessage},
-    chunkable::{ArtifactChunk, ArtifactErrorCode, Chunk, ChunkId, Chunkable},
-    crypto::CryptoHash,
-    state_sync::{Manifest, MetaManifest, StateSyncVersion},
-    CryptoHashOfState, Height, NodeId, PrincipalId,
+    crypto::CryptoHash, state_sync::StateSyncVersion, CryptoHashOfState, Height, NodeId,
+    PrincipalId,
 };
-use tokio::{runtime::Handle, task::JoinHandle};
+use tokio::runtime::Handle;
 
 const META_MANIFEST_ID: u32 = u32::MAX - 1;
 
@@ -110,7 +111,7 @@ impl State {
         state.chunks.hash(&mut hasher);
         StateSyncArtifactId {
             height: state.height,
-            hash: CryptoHashOfState::from(CryptoHash(hasher.finish().to_be_bytes().to_vec())),
+            hash: CryptoHash(hasher.finish().to_be_bytes().to_vec()),
         }
     }
 
@@ -183,6 +184,8 @@ impl FakeStateSync {
 }
 
 impl StateSyncClient for FakeStateSync {
+    type Message = StateSyncMessage;
+
     fn available_states(&self) -> Vec<StateSyncArtifactId> {
         if self.disconnected.load(Ordering::SeqCst) {
             return vec![];
@@ -197,7 +200,7 @@ impl StateSyncClient for FakeStateSync {
     fn start_state_sync(
         &self,
         id: &StateSyncArtifactId,
-    ) -> Option<Box<dyn Chunkable + Send + Sync>> {
+    ) -> Option<Box<dyn Chunkable<StateSyncMessage> + Send>> {
         if !self.uses_global() && id.height > self.current_height() && !self.disconnected() {
             return Some(Box::new(FakeChunkable::new(
                 self.local_state.clone(),
@@ -263,7 +266,7 @@ impl FakeChunkable {
     }
 }
 
-impl Chunkable for FakeChunkable {
+impl Chunkable<StateSyncMessage> for FakeChunkable {
     /// Returns iterator for chunks to download.
     /// Tries to first download metamanifest, then manifest and then chunks. Does not advance if previous didn't complete.
     fn chunks_to_download(&self) -> Box<dyn Iterator<Item = ChunkId>> {
@@ -279,39 +282,39 @@ impl Chunkable for FakeChunkable {
         Box::new(to_download.into_iter().map(ChunkId::from))
     }
 
-    fn add_chunk(
-        &mut self,
-        artifact_chunk: ArtifactChunk,
-    ) -> Result<StateSyncMessage, ArtifactErrorCode> {
+    fn add_chunk(&mut self, chunk_id: ChunkId, chunk: Chunk) -> Result<(), AddChunkError> {
         for set in self.chunk_sets.iter_mut() {
             if set.is_empty() {
                 continue;
             }
-            if set.remove(&artifact_chunk.chunk_id) {
+            if set.remove(&chunk_id) {
                 break;
             } else {
-                panic!("Downloaded chunk {} twice", artifact_chunk.chunk_id)
+                panic!("Downloaded chunk {} twice", chunk_id)
             }
         }
 
         // Add chunk to state if not part of manifest
-        if !is_manifest_chunk(artifact_chunk.chunk_id) {
-            self.local_state
-                .add_chunk(artifact_chunk.chunk_id, artifact_chunk.chunk.len())
+        if !is_manifest_chunk(chunk_id) {
+            self.local_state.add_chunk(chunk_id, chunk.len())
         }
 
+        Ok(())
+    }
+
+    fn completed(&self) -> Option<StateSyncMessage> {
         let elems = self.chunk_sets.iter().map(|set| set.len()).sum::<usize>();
         if elems == 0 {
-            Ok(state_sync_artifact(self.syncing_state.clone()))
+            Some(state_sync_artifact(self.syncing_state.clone()))
         } else {
-            Err(ArtifactErrorCode::ChunksMoreNeeded)
+            None
         }
     }
 }
 
 #[derive(Clone, Default)]
 pub struct SharableMockChunkable {
-    mock: Arc<Mutex<MockChunkable>>,
+    mock: Arc<Mutex<MockChunkable<StateSyncMessage>>>,
     chunks_to_download_calls: Arc<AtomicUsize>,
     add_chunks_calls: Arc<AtomicUsize>,
 }
@@ -323,7 +326,7 @@ impl SharableMockChunkable {
             ..Default::default()
         }
     }
-    pub fn get_mut(&self) -> MutexGuard<'_, MockChunkable> {
+    pub fn get_mut(&self) -> MutexGuard<'_, MockChunkable<StateSyncMessage>> {
         self.mock.lock().unwrap()
     }
     pub fn add_chunks_calls(&self) -> usize {
@@ -335,23 +338,24 @@ impl SharableMockChunkable {
     }
 }
 
-impl Chunkable for SharableMockChunkable {
+impl Chunkable<StateSyncMessage> for SharableMockChunkable {
     fn chunks_to_download(&self) -> Box<dyn Iterator<Item = ChunkId>> {
         self.chunks_to_download_calls.fetch_add(1, Ordering::SeqCst);
         self.mock.lock().unwrap().chunks_to_download()
     }
-    fn add_chunk(
-        &mut self,
-        artifact_chunk: ArtifactChunk,
-    ) -> Result<StateSyncMessage, ArtifactErrorCode> {
+    fn add_chunk(&mut self, chunk_id: ChunkId, chunk: Chunk) -> Result<(), AddChunkError> {
         self.add_chunks_calls.fetch_add(1, Ordering::SeqCst);
-        self.mock.lock().unwrap().add_chunk(artifact_chunk)
+        self.mock.lock().unwrap().add_chunk(chunk_id, chunk)
+    }
+
+    fn completed(&self) -> Option<StateSyncMessage> {
+        self.mock.lock().unwrap().completed()
     }
 }
 
 #[derive(Clone, Default)]
 pub struct SharableMockStateSync {
-    mock: Arc<Mutex<MockStateSync>>,
+    mock: Arc<Mutex<MockStateSync<StateSyncMessage>>>,
     available_states_calls: Arc<AtomicUsize>,
     start_state_sync_calls: Arc<AtomicUsize>,
     should_cancel_calls: Arc<AtomicUsize>,
@@ -366,7 +370,7 @@ impl SharableMockStateSync {
             ..Default::default()
         }
     }
-    pub fn get_mut(&self) -> MutexGuard<'_, MockStateSync> {
+    pub fn get_mut(&self) -> MutexGuard<'_, MockStateSync<StateSyncMessage>> {
         self.mock.lock().unwrap()
     }
     pub fn start_state_sync_calls(&self) -> usize {
@@ -382,6 +386,8 @@ impl SharableMockStateSync {
 }
 
 impl StateSyncClient for SharableMockStateSync {
+    type Message = StateSyncMessage;
+
     fn available_states(&self) -> Vec<StateSyncArtifactId> {
         self.available_states_calls.fetch_add(1, Ordering::SeqCst);
         self.mock.lock().unwrap().available_states()
@@ -389,7 +395,7 @@ impl StateSyncClient for SharableMockStateSync {
     fn start_state_sync(
         &self,
         id: &StateSyncArtifactId,
-    ) -> Option<Box<dyn Chunkable + Send + Sync>> {
+    ) -> Option<Box<dyn Chunkable<StateSyncMessage> + Send>> {
         self.start_state_sync_calls.fetch_add(1, Ordering::SeqCst);
         self.mock.lock().unwrap().start_state_sync(id)
     }
@@ -426,11 +432,12 @@ fn state_sync_artifact(id: StateSyncArtifactId) -> StateSyncMessage {
 
     StateSyncMessage {
         height: id.height,
-        root_hash: id.hash,
+        root_hash: CryptoHashOfState::from(id.hash),
         checkpoint_root: PathBuf::new(),
         manifest,
         meta_manifest: Arc::new(meta_manifest),
         state_sync_file_group: Default::default(),
+        malicious_flags: Default::default(),
     }
 }
 
@@ -442,7 +449,7 @@ pub fn create_node(
     uses_global: bool,
     global_state: State,
     link: (Duration, usize),
-) -> (Arc<FakeStateSync>, JoinHandle<()>) {
+) -> (Arc<FakeStateSync>, Shutdown) {
     let local_state = State::new();
     let state_sync = Arc::new(FakeStateSync {
         local_state,
@@ -462,8 +469,8 @@ pub fn create_node(
         link.0,
         link.1,
     );
-    let jh = ic_state_sync_manager::start_state_sync_manager(
-        log,
+    let shutdown = ic_state_sync_manager::start_state_sync_manager(
+        &log,
         &MetricsRegistry::default(),
         rt,
         Arc::new(transport),
@@ -471,5 +478,5 @@ pub fn create_node(
         rx,
     );
 
-    (state_sync, jh)
+    (state_sync, shutdown)
 }

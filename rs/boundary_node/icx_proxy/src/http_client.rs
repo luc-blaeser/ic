@@ -25,11 +25,13 @@ use hyper::{
         HttpConnector,
     },
     service::Service,
-    Client,
+    Client, Uri,
 };
 use hyper_rustls::HttpsConnectorBuilder;
+use hyperlocal::UnixClientExt;
 use ic_agent::agent::http_transport::hyper_transport;
 use itertools::Either;
+use tokio::task_local;
 
 use crate::domain_addr::DomainAddr;
 
@@ -103,36 +105,72 @@ pub const HEADER_IC_SUBNET_TYPE: HeaderName = HeaderName::from_static("x-ic-subn
 #[allow(clippy::declare_interior_mutable_const)]
 pub const HEADER_IC_NODE_ID: HeaderName = HeaderName::from_static("x-ic-node-id");
 #[allow(clippy::declare_interior_mutable_const)]
-const HEADER_IC_CANISTER_ID: HeaderName = HeaderName::from_static("x-ic-canister-id");
+pub const HEADER_IC_CANISTER_ID: HeaderName = HeaderName::from_static("x-ic-canister-id");
+#[allow(clippy::declare_interior_mutable_const)]
+const HEADER_IC_CANISTER_ID_CBOR: HeaderName = HeaderName::from_static("x-ic-canister-id-cbor");
 #[allow(clippy::declare_interior_mutable_const)]
 const HEADER_IC_METHOD_NAME: HeaderName = HeaderName::from_static("x-ic-method-name");
 #[allow(clippy::declare_interior_mutable_const)]
 const HEADER_IC_SENDER: HeaderName = HeaderName::from_static("x-ic-sender");
 #[allow(clippy::declare_interior_mutable_const)]
 const HEADER_IC_REQUEST_TYPE: HeaderName = HeaderName::from_static("x-ic-request-type");
+#[allow(clippy::declare_interior_mutable_const)]
+const HEADER_IC_RETRIES: HeaderName = HeaderName::from_static("x-ic-retries");
+#[allow(clippy::declare_interior_mutable_const)]
+const HEADER_IC_ERROR_CAUSE: HeaderName = HeaderName::from_static("x-ic-error-cause");
+#[allow(clippy::declare_interior_mutable_const)]
+const HEADER_IC_CACHE: HeaderName = HeaderName::from_static("x-ic-cache-status");
+#[allow(clippy::declare_interior_mutable_const)]
+const HEADER_IC_CACHE_BYPASS_REASON: HeaderName =
+    HeaderName::from_static("x-ic-cache-bypass-reason");
+#[allow(clippy::declare_interior_mutable_const)]
+pub const HEADER_X_REAL_IP: http::HeaderName = http::HeaderName::from_static("x-real-ip");
+#[allow(clippy::declare_interior_mutable_const)]
+pub const HEADER_X_IC_COUNTRY_CODE: http::HeaderName =
+    http::HeaderName::from_static("x-ic-country-code");
 
 // Headers to pass from replica to the caller
 #[allow(clippy::declare_interior_mutable_const)]
-pub const HEADERS_PASS_IN: [HeaderName; 7] = [
+pub const HEADERS_PASS_IN: [HeaderName; 11] = [
     HEADER_IC_SUBNET_ID,
     HEADER_IC_NODE_ID,
     HEADER_IC_SUBNET_TYPE,
-    HEADER_IC_CANISTER_ID,
+    HEADER_IC_CANISTER_ID_CBOR,
     HEADER_IC_METHOD_NAME,
     HEADER_IC_SENDER,
     HEADER_IC_REQUEST_TYPE,
+    HEADER_IC_RETRIES,
+    HEADER_IC_ERROR_CAUSE,
+    HEADER_IC_CACHE,
+    HEADER_IC_CACHE_BYPASS_REASON,
 ];
 
 // Headers to pass from caller to replica
 #[allow(clippy::declare_interior_mutable_const)]
-pub const HEADERS_PASS_OUT: [HeaderName; 1] = [HEADER_X_REQUEST_ID];
+pub const HEADERS_PASS_OUT: [HeaderName; 2] = [HEADER_X_REQUEST_ID, HEADER_X_REAL_IP];
 
-thread_local!(pub static HEADERS_IN: RefCell<HeaderMap<HeaderValue>> = RefCell::new(HeaderMap::new()));
-thread_local!(pub static HEADERS_OUT: RefCell<HeaderMap<HeaderValue>> = RefCell::new(HeaderMap::new()));
+pub struct RequestHeaders {
+    pub headers_in: HeaderMap<HeaderValue>,
+    pub headers_out: HeaderMap<HeaderValue>,
+}
+
+impl RequestHeaders {
+    pub fn new() -> RefCell<Self> {
+        RefCell::new(Self {
+            headers_in: HeaderMap::new(),
+            headers_out: HeaderMap::new(),
+        })
+    }
+}
+
+task_local! {
+    pub static REQUEST_HEADERS: RefCell<RequestHeaders>;
+}
 
 // Wrapper for the Hyper client (Hyper service) that uses thread local storage to pass specific HTTP headers back and forth
 #[derive(Clone)]
 pub struct HyperClientWrapper<S> {
+    uri_override: Option<Uri>,
     inner: S,
 }
 
@@ -157,10 +195,25 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
+        // Override the URL host and schema if needed
+        // This is used to create Unix socket URL
+        if let Some(v) = &self.uri_override {
+            let uri = Uri::builder()
+                .scheme(v.scheme().unwrap().clone())
+                .authority(v.authority().unwrap().clone())
+                .path_and_query(req.uri().path_and_query().unwrap().clone())
+                .build()
+                .unwrap();
+
+            *req.uri_mut() = uri;
+        }
+
         Box::pin(async move {
             // Add selected headers to the request
-            HEADERS_OUT.with(|f| {
-                for (k, v) in (*f.borrow()).iter() {
+            // Check if the task local variable is set, do nothing otherwise since
+            // Agent can call the client outside task local variable context
+            let _ = REQUEST_HEADERS.try_with(|x| {
+                for (k, v) in x.borrow().headers_out.iter() {
                     #[allow(clippy::borrow_interior_mutable_const)]
                     if HEADERS_PASS_OUT.contains(k) {
                         req.headers_mut().append(k, v.clone());
@@ -168,18 +221,26 @@ where
                 }
             });
 
+            let is_read_state = req.uri().to_string().ends_with("/read_state");
+
+            // Execute the request
             let res = inner.call(req).await;
+
+            // Do not pass headers for the read_state calls
+            if is_read_state {
+                return res;
+            }
 
             // If the request was a success - extract headers from it
             if let Ok(v) = &res {
-                HEADERS_IN.with(|f| {
-                    let mut m = f.borrow_mut();
-                    m.clear();
+                let _ = REQUEST_HEADERS.try_with(|x| {
+                    let mut m = x.borrow_mut();
+                    m.headers_in.clear();
 
                     for (k, v) in v.headers() {
                         #[allow(clippy::borrow_interior_mutable_const)]
                         if HEADERS_PASS_IN.contains(k) {
-                            m.append(k, v.clone());
+                            m.headers_in.append(k, v.clone());
                         }
                     }
                 });
@@ -316,9 +377,6 @@ pub fn setup(opts: HttpClientOpts) -> Result<impl HyperService<Body>, Error> {
             .with_no_client_auth()
     };
 
-    // Advertise support for HTTP/2
-    //tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
     let domain_addrs: HashMap<Uncased, SocketAddr> = replicas
         .iter()
         .filter_map(|v| Some((v.domain.host()?, v.addr?)))
@@ -349,7 +407,18 @@ pub fn setup(opts: HttpClientOpts) -> Result<impl HyperService<Body>, Error> {
         .wrap_connector(connector);
 
     let client: Client<_, Body> = Client::builder().build(connector);
-    Ok(HyperClientWrapper { inner: client })
+    Ok(HyperClientWrapper {
+        uri_override: None,
+        inner: client,
+    })
+}
+
+pub fn setup_unix_socket(uri: Uri) -> Result<impl HyperService<Body>, Error> {
+    let client: Client<_, Body> = Client::unix();
+    Ok(HyperClientWrapper {
+        uri_override: Some(uri),
+        inner: client,
+    })
 }
 
 #[derive(Clone, Debug, Eq)]

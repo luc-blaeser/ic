@@ -31,7 +31,7 @@ use ic_https_outcalls_consensus::{
     pool_manager::CanisterHttpPoolManagerImpl,
 };
 use ic_icos_sev::Sev;
-use ic_ingress_manager::IngressManager;
+use ic_ingress_manager::{CustomRandomState, IngressManager};
 use ic_interfaces::{
     batch_payload::BatchPayloadBuilder,
     execution_environment::IngressHistoryReader,
@@ -45,14 +45,13 @@ use ic_interfaces::{
 use ic_interfaces_adapter_client::NonBlockingChannel;
 use ic_interfaces_registry::{LocalStoreCertifiedTimeReader, RegistryClient};
 use ic_interfaces_state_manager::{StateManager, StateReader};
-use ic_interfaces_transport::Transport;
 use ic_logger::{info, replica_logger::ReplicaLogger};
 use ic_metrics::MetricsRegistry;
 use ic_p2p::{start_p2p, MAX_ADVERT_BUFFER};
 use ic_quic_transport::DummyUdpSocket;
 use ic_registry_client_helpers::subnet::SubnetRegistry;
 use ic_replicated_state::ReplicatedState;
-use ic_transport::transport::create_transport;
+use ic_state_manager::state_sync::types::StateSyncMessage;
 use ic_types::{
     artifact::{ArtifactKind, ArtifactTag, UnvalidatedArtifactMutation},
     artifact_kind::{
@@ -73,14 +72,14 @@ use std::{
     str::FromStr,
     sync::{Arc, Mutex, RwLock},
 };
-use tokio::sync::mpsc::Sender as TokioSender;
+use tokio::sync::mpsc::{Sender as TokioSender, UnboundedSender};
 
 const ENABLE_NEW_P2P_CONSENSUS: bool = false;
 const ENABLE_NEW_P2P_CERTIFICATION: bool = false;
 const ENABLE_NEW_P2P_DKG: bool = false;
 const ENABLE_NEW_P2P_INGRESS: bool = false;
-const ENABLE_NEW_P2P_ECDSA: bool = false;
-const ENABLE_NEW_P2P_HTTPS_OUTCALLS: bool = false;
+const ENABLE_NEW_P2P_ECDSA: bool = true;
+const ENABLE_NEW_P2P_HTTPS_OUTCALLS: bool = true;
 
 struct P2PSenders {
     consensus: Channel<ConsensusArtifact>,
@@ -138,16 +137,13 @@ pub fn setup_consensus_and_p2p(
     malicious_flags: MaliciousFlags,
     node_id: NodeId,
     subnet_id: SubnetId,
-    // For testing purposes the caller can pass a transport object instead. Otherwise, the callee
-    // constructs it from the 'transport_config'.
-    transport: Option<Arc<dyn Transport>>,
     tls_config: Arc<dyn TlsConfig + Send + Sync>,
     tls_handshake: Arc<dyn TlsHandshake + Send + Sync>,
     state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
     state_reader: Arc<dyn StateReader<State = ReplicatedState>>,
     consensus_pool: Arc<RwLock<ConsensusPoolImpl>>,
     catch_up_package: CatchUpPackage,
-    state_sync_client: Arc<dyn StateSyncClient>,
+    state_sync_client: Arc<dyn StateSyncClient<Message = StateSyncMessage>>,
     xnet_payload_builder: Arc<dyn XNetPayloadBuilder>,
     self_validating_payload_builder: Arc<dyn SelfValidatingPayloadBuilder>,
     query_stats_payload_builder: Box<dyn BatchPayloadBuilder>,
@@ -163,7 +159,7 @@ pub fn setup_consensus_and_p2p(
     registry_poll_delay_duration_ms: u64,
 ) -> (
     Arc<RwLock<IngressPoolImpl>>,
-    Sender<UnvalidatedArtifactMutation<IngressArtifact>>,
+    UnboundedSender<UnvalidatedArtifactMutation<IngressArtifact>>,
     Vec<Box<dyn JoinGuard>>,
 ) {
     let time_source = Arc::new(SysTimeSource::new());
@@ -206,7 +202,7 @@ pub fn setup_consensus_and_p2p(
     let mut new_p2p_consensus = ic_consensus_manager::ConsensusManagerBuilder::new(
         log.clone(),
         rt_handle.clone(),
-        metrics_registry,
+        metrics_registry.clone(),
     );
 
     let mut p2p_router = None;
@@ -390,7 +386,7 @@ pub fn setup_consensus_and_p2p(
     ));
 
     let _state_sync_manager = ic_state_sync_manager::start_state_sync_manager(
-        log.clone(),
+        log,
         metrics_registry,
         rt_handle,
         quic_transport.clone(),
@@ -398,42 +394,34 @@ pub fn setup_consensus_and_p2p(
         state_sync_manager_rx,
     );
 
-    new_p2p_consensus.run(quic_transport, topology_watcher);
+    let _cancellation_token = new_p2p_consensus.run(quic_transport, topology_watcher);
 
-    // Tcp transport
-    let oldest_registry_version_in_use = consensus_pool_cache.get_oldest_registry_version_in_use();
-    let transport = transport.unwrap_or_else(|| {
-        create_transport(
+    if !(ENABLE_NEW_P2P_CONSENSUS
+        && ENABLE_NEW_P2P_CERTIFICATION
+        && ENABLE_NEW_P2P_DKG
+        && ENABLE_NEW_P2P_INGRESS
+        && ENABLE_NEW_P2P_ECDSA
+        && ENABLE_NEW_P2P_HTTPS_OUTCALLS)
+    {
+        let artifact_manager = Arc::new(
+            manager::ArtifactManagerImpl::new_with_default_priority_fn(backends),
+        );
+
+        join_handles.push(start_p2p(
+            log,
+            metrics_registry,
+            rt_handle,
             node_id,
-            transport_config.clone(),
-            registry_client.get_latest_version(),
-            oldest_registry_version_in_use,
-            metrics_registry.clone(),
+            subnet_id,
+            transport_config,
+            registry_client,
+            consensus_pool_cache,
+            artifact_manager,
+            advert_rx,
             tls_handshake,
             sev_handshake,
-            rt_handle.clone(),
-            log.clone(),
-            false,
-        )
-    });
-
-    let artifact_manager = Arc::new(manager::ArtifactManagerImpl::new_with_default_priority_fn(
-        backends,
-    ));
-
-    join_handles.push(start_p2p(
-        log,
-        metrics_registry,
-        rt_handle,
-        node_id,
-        subnet_id,
-        transport_config,
-        registry_client,
-        transport,
-        consensus_pool_cache,
-        artifact_manager,
-        advert_rx,
-    ));
+        ));
+    }
     (ingress_pool, ingress_sender, join_handles)
 }
 
@@ -499,9 +487,10 @@ fn start_consensus(
         metrics_registry.clone(),
         subnet_id,
         log.clone(),
-        Arc::clone(&state_reader) as Arc<_>,
+        Arc::clone(&state_reader),
         cycles_account_manager,
         malicious_flags.clone(),
+        CustomRandomState::default(),
     ));
 
     let canister_http_payload_builder = Arc::new(CanisterHttpPayloadBuilderImpl::new(
@@ -791,6 +780,7 @@ fn start_consensus(
         let ecdsa_gossip = Arc::new(ecdsa::EcdsaGossipImpl::new(
             subnet_id,
             Arc::clone(&consensus_block_cache),
+            Arc::clone(&state_reader),
             metrics_registry.clone(),
         ));
 
@@ -800,6 +790,7 @@ fn start_consensus(
                 node_id,
                 Arc::clone(&consensus_block_cache),
                 Arc::clone(&consensus_crypto),
+                Arc::clone(&state_reader),
                 metrics_registry.clone(),
                 log.clone(),
                 malicious_flags,
@@ -900,7 +891,7 @@ fn init_artifact_pools(
         log.clone(),
     )));
 
-    let mut ecdsa_pool = EcdsaPoolImpl::new_with_stats(
+    let mut ecdsa_pool = EcdsaPoolImpl::new(
         config.clone(),
         log.clone(),
         registry.clone(),

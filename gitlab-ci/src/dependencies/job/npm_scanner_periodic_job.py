@@ -10,21 +10,10 @@ from scanner.dependency_scanner import DependencyScanner
 from scanner.manager.npm_dependency_manager import NPMDependencyManager
 from scanner.scanner_job_type import ScannerJobType
 
-DEFAULT_NODE_VERSION = "19"
+# node version used by default
+DEFAULT_NODE_VERSION = "20"
 
 REPOS_TO_SCAN = [
-    Repository(
-        "ic",
-        "https://gitlab.com/dfinity-lab/public/ic",
-        [
-            Project(
-                name="service-worker",
-                path="ic/typescript/service-worker",
-                owner=Team.TRUST_TEAM,
-            )
-        ],
-        "18.17.1",
-    ),
     Repository(
         "nns-dapp",
         "https://github.com/dfinity/nns-dapp",
@@ -119,7 +108,19 @@ REPOS_TO_SCAN = [
                 owner=Team.GIX_TEAM,
             )
         ],
-        DEFAULT_NODE_VERSION,
+        "18.17.1",
+    ),
+    Repository(
+        "oisy-wallet",
+        "https://github.com/dfinity/oisy-wallet",
+        [
+            Project(
+                name="oisy-wallet",
+                path="oisy-wallet",
+                owner=Team.GIX_TEAM,
+            )
+        ],
+        "18.17.1",
     ),
     # Removing ic-docutrack temporarily since it supports
     # only pnpm and not npm

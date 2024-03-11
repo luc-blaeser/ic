@@ -1,4 +1,5 @@
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_test_suite")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("//bazel:defs.bzl", "rust_ic_test_suite")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -8,17 +9,14 @@ DEPENDENCIES = [
     "//rs/bitcoin/types/internal",
     "//rs/canister_client/sender",
     "//rs/config",
-    "//rs/crypto",
     "//rs/execution_environment",
     "//rs/interfaces",
     "//rs/interfaces/registry",
     "//rs/interfaces/state_manager",
-    "//rs/monitoring/logger",
     "//rs/monitoring/metrics",
     "//rs/prep",
     "//rs/protobuf",
     "//rs/registry/fake",
-    "//rs/registry/helpers",
     "//rs/registry/keys",
     "//rs/registry/proto_data_provider",
     "//rs/registry/provisional_whitelist",
@@ -26,19 +24,15 @@ DEPENDENCIES = [
     "//rs/replica:replica_lib",
     "//rs/replicated_state",
     "//rs/state_machine_tests",
-    "//rs/state_manager",
     "//rs/test_utilities",
     "//rs/test_utilities/logger",
-    "//rs/test_utilities/registry",
     "//rs/types/base_types",
     "//rs/types/error_types",
-    "//rs/types/ic00_types",
+    "//rs/types/management_canister_types",
     "//rs/types/types",
     "//rs/utils",
     "@crate_index//:crossbeam-channel",
-    "@crate_index//:futures",
     "@crate_index//:ic-btc-interface",
-    "@crate_index//:prometheus",
     "@crate_index//:prost",
     "@crate_index//:rand",
     "@crate_index//:slog",
@@ -46,6 +40,7 @@ DEPENDENCIES = [
     "@crate_index//:tempfile",
     "@crate_index//:tokio",
     "@crate_index//:tonic",
+    "@crate_index//:tower",
     "@crate_index//:wat",
 ]
 
@@ -58,7 +53,6 @@ DEV_DEPENDENCIES = [
     "@crate_index//:assert_matches",
     "@crate_index//:candid",
     "@crate_index//:maplit",
-    "@crate_index//:predicates",
 ]
 
 MACRO_DEV_DEPENDENCIES = []
@@ -66,16 +60,12 @@ MACRO_DEV_DEPENDENCIES = []
 DEV_DATA = [
     # Keep sorted.
     ":replica_tests",
-    "//rs/canister_sandbox",
-    "//rs/canister_sandbox/sandbox_launcher",
 ]
 
 ALIASES = {}
 
 DEV_ENV = {
     # Keep sorted.
-    "LAUNCHER_BINARY": "$(rootpath //rs/canister_sandbox/sandbox_launcher)",
-    "SANDBOX_BINARY": "$(rootpath //rs/canister_sandbox)",
 }
 
 rust_library(
@@ -97,7 +87,7 @@ rust_test(
     deps = DEPENDENCIES + DEV_DEPENDENCIES,
 )
 
-rust_test_suite(
+rust_ic_test_suite(
     name = "replica_tests_integration",
     timeout = "long",
     srcs = glob(["tests/**/*.rs"]),

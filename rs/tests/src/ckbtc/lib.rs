@@ -8,9 +8,7 @@ use crate::{
     },
     icrc1_agent_test::install_icrc1_ledger,
     nns::vote_and_execute_proposal,
-    tecdsa::tecdsa_signature_test::{
-        get_public_key_with_logger, get_signature_with_logger, make_key, verify_signature,
-    },
+    tecdsa::{get_public_key_with_logger, get_signature_with_logger, make_key, verify_signature},
     util::{assert_create_agent, runtime_from_url, MessageCanister},
 };
 use candid::{Encode, Principal};
@@ -29,17 +27,19 @@ use ic_config::{
     execution_environment::{BITCOIN_MAINNET_CANISTER_ID, BITCOIN_TESTNET_CANISTER_ID},
     subnet_config::ECDSA_SIGNATURE_FEE,
 };
-use ic_ic00_types::CanisterIdRecord;
-use ic_ic00_types::ProvisionalCreateCanisterWithCyclesArgs;
 use ic_icrc1_ledger::{InitArgsBuilder, LedgerArgument};
+use ic_management_canister_types::CanisterIdRecord;
+use ic_management_canister_types::ProvisionalCreateCanisterWithCyclesArgs;
 use ic_nervous_system_common_test_keys::TEST_NEURON_1_OWNER_KEYPAIR;
 use ic_nns_common::types::{NeuronId, ProposalId};
 use ic_nns_constants::GOVERNANCE_CANISTER_ID;
 use ic_nns_constants::ROOT_CANISTER_ID;
-use ic_nns_governance::pb::v1::{NnsFunction, ProposalStatus};
+use ic_nns_governance::{
+    init::TEST_NEURON_1_ID,
+    pb::v1::{NnsFunction, ProposalStatus},
+};
 use ic_nns_test_utils::{
-    governance::submit_external_update_proposal, ids::TEST_NEURON_1_ID,
-    itest_helpers::install_rust_canister_from_path,
+    governance::submit_external_update_proposal, itest_helpers::install_rust_canister_from_path,
 };
 use ic_registry_subnet_features::{EcdsaConfig, DEFAULT_ECDSA_MAX_QUEUE_SIZE};
 use ic_registry_subnet_type::SubnetType;
@@ -230,7 +230,7 @@ pub(crate) async fn create_canister_at_id(
     let canister_id_record: CanisterIdRecord = runtime
         .get_management_canister()
         .update_(
-            ic_ic00_types::Method::ProvisionalCreateCanisterWithCycles.to_string(),
+            ic_management_canister_types::Method::ProvisionalCreateCanisterWithCycles.to_string(),
             candid,
             (ProvisionalCreateCanisterWithCyclesArgs::new(
                 None,
@@ -270,6 +270,7 @@ pub(crate) async fn install_ledger(
                 node_max_memory_size_bytes: None,
                 max_message_size_bytes: None,
                 controller_id: minting_user,
+                more_controller_ids: None,
                 cycles_for_archive_creation: None,
                 max_transactions_per_response: None,
             })

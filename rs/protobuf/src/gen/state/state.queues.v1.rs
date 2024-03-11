@@ -16,6 +16,12 @@ pub struct Funds {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StreamFlags {
+    #[prost(bool, tag = "1")]
+    pub responses_only: bool,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Stream {
     #[prost(uint64, tag = "1")]
     pub messages_begin: u64,
@@ -25,6 +31,8 @@ pub struct Stream {
     pub signals_end: u64,
     #[prost(uint64, repeated, tag = "6")]
     pub reject_signals: ::prost::alloc::vec::Vec<u64>,
+    #[prost(message, optional, tag = "7")]
+    pub reverse_stream_flags: ::core::option::Option<StreamFlags>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -41,6 +49,13 @@ pub struct RequestMetadata {
     pub call_tree_depth: ::core::option::Option<u64>,
     #[prost(uint64, optional, tag = "2")]
     pub call_tree_start_time_nanos: ::core::option::Option<u64>,
+    /// A point in the future vs. `call_tree_start_time` at which a request would ideally have concluded
+    /// its lifecycle on the IC. Unlike `call_tree_depth` and `call_tree_start_time`, the deadline
+    /// does not have to be a constant for the whole call tree. Rather it's valid only for the subtree of
+    /// downstream calls at any point in the tree, i.e. it is allowed and desirable for a subtree to have
+    /// a tighter deadline than the tree as whole.
+    ///
+    /// Reserved for future use (guaranteed replies won't be affected).
     #[prost(uint64, optional, tag = "3")]
     pub call_subtree_deadline_nanos: ::core::option::Option<u64>,
 }
@@ -63,6 +78,9 @@ pub struct Request {
     pub cycles_payment: ::core::option::Option<Cycles>,
     #[prost(message, optional, tag = "8")]
     pub metadata: ::core::option::Option<RequestMetadata>,
+    /// If non-zero, this is a best-effort call.
+    #[prost(uint32, tag = "9")]
+    pub deadline_seconds: u32,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -87,6 +105,9 @@ pub struct Response {
     pub refund: ::core::option::Option<Funds>,
     #[prost(message, optional, tag = "7")]
     pub cycles_refund: ::core::option::Option<Cycles>,
+    /// If non-zero, this is a best-effort call.
+    #[prost(uint32, tag = "8")]
+    pub deadline_seconds: u32,
     #[prost(oneof = "response::ResponsePayload", tags = "5, 6")]
     pub response_payload: ::core::option::Option<response::ResponsePayload>,
 }
