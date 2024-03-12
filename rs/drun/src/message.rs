@@ -3,7 +3,7 @@ use super::CanisterId;
 use hex::decode;
 use ic_execution_environment::execution::install_code::ENHANCED_ORTHOGONAL_PERSISTENCE_SECTION;
 use ic_management_canister_types::{
-    self as ic00, CanisterInstallModeV2, CanisterUpgradeOptions, Payload,
+    self as ic00, CanisterInstallModeV2, CanisterUpgradeOptions, Payload, WasmMemoryPersistence,
 };
 use ic_types::{
     messages::{SignedIngress, UserQuery},
@@ -256,17 +256,17 @@ fn parse_install(
         "install" => CanisterInstallModeV2::Install,
         "reinstall" => CanisterInstallModeV2::Reinstall,
         "upgrade" => {
-            let keep_main_memory = if contains_icp_private_custom_section(
+            let wasm_memory_persistence = if contains_icp_private_custom_section(
                 wasm_data.as_ref(),
                 ENHANCED_ORTHOGONAL_PERSISTENCE_SECTION,
             )? {
-                Some(true)
+                Some(WasmMemoryPersistence::Keep)
             } else {
                 None
             };
             CanisterInstallModeV2::Upgrade(Some(CanisterUpgradeOptions {
                 skip_pre_upgrade: None,
-                keep_main_memory,
+                wasm_memory_persistence,
             }))
         }
         _ => {

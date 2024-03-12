@@ -28,6 +28,7 @@ use ic_management_canister_types::{
     CanisterStatusResultV2, CanisterStatusType, CanisterUpgradeOptions, ChunkHash,
     ClearChunkStoreArgs, CreateCanisterArgs, EmptyBlob, InstallCodeArgsV2, Method, Payload,
     StoredChunksArgs, StoredChunksReply, UpdateSettingsArgs, UploadChunkArgs, UploadChunkReply,
+    WasmMemoryPersistence,
 };
 use ic_metrics::MetricsRegistry;
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
@@ -4395,7 +4396,7 @@ fn test_enhanced_orthogonal_persistence_upgrade_preserves_main_memory() {
         version2_wasm,
         CanisterUpgradeOptions {
             skip_pre_upgrade: None,
-            keep_main_memory: Some(true),
+            wasm_memory_persistence: Some(WasmMemoryPersistence::Keep),
         },
     )
     .unwrap();
@@ -4428,12 +4429,12 @@ fn fails_with_missing_main_memory_option_for_enhanced_orthogonal_persistence() {
             version2_wasm,
             CanisterUpgradeOptions {
                 skip_pre_upgrade: None,
-                keep_main_memory: None,
+                wasm_memory_persistence: None,
             },
         )
         .unwrap_err();
     assert_eq!(error.code(), ErrorCode::CanisterContractViolation);
-    assert_eq!(error.description(), "Missing upgrade option: Enhanced orthogonal persistence requires the `keep_main_memory` upgrade option.");
+    assert_eq!(error.description(), "Missing upgrade option: Enhanced orthogonal persistence requires the `wasm_memory_persistence` upgrade option.");
 }
 
 fn create_canisters(test: &mut ExecutionTest, canisters: usize) {
@@ -6393,7 +6394,7 @@ fn test_upgrade_with_skip_pre_upgrade_preserves_stable_memory() {
         UNIVERSAL_CANISTER_WASM.to_vec(),
         CanisterUpgradeOptions {
             skip_pre_upgrade: Some(true),
-            keep_main_memory: None,
+            wasm_memory_persistence: None,
         },
     )
     .unwrap();
@@ -6413,7 +6414,7 @@ fn test_upgrade_with_skip_pre_upgrade_preserves_stable_memory() {
             UNIVERSAL_CANISTER_WASM.to_vec(),
             CanisterUpgradeOptions {
                 skip_pre_upgrade: None,
-                keep_main_memory: None,
+                wasm_memory_persistence: None,
             },
         )
         .unwrap_err();

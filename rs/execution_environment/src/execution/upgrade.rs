@@ -19,7 +19,7 @@ use ic_base_types::PrincipalId;
 use ic_embedders::wasm_executor::{CanisterStateChanges, PausedWasmExecution, WasmExecutionResult};
 use ic_interfaces::execution_environment::{HypervisorError, WasmExecutionOutput};
 use ic_logger::{info, warn, ReplicaLogger};
-use ic_management_canister_types::CanisterInstallModeV2;
+use ic_management_canister_types::{CanisterInstallModeV2, WasmMemoryPersistence};
 use ic_replicated_state::page_map::PageAllocatorFileDescriptor;
 use ic_replicated_state::{
     metadata_state::subnet_call_context_manager::InstallCodeCallId, CanisterState, SystemState,
@@ -289,14 +289,15 @@ fn upgrade_stage_2_and_3a_create_execution_state_and_call_start(
 
     let main_memory_handling = match context.mode {
         CanisterInstallModeV2::Upgrade(Some(upgrade_options)) => {
-            match upgrade_options.keep_main_memory {
-                Some(true) => MemoryHandling::Keep,
-                Some(false) => MemoryHandling::Replace,
+            match upgrade_options.wasm_memory_persistence {
+                Some(WasmMemoryPersistence::Keep) => MemoryHandling::Keep,
+                Some(WasmMemoryPersistence::Drop) => MemoryHandling::Replace,
                 None => {
-                    // Safety guard checking that the `keep_main_memory` upgrade option has not been omitted in error.
+                    // Safety guard checking that the `wasm_memory_persistence` upgrade option has not been omitted in error.
                     if helper.expects_orthogonal_persistence() {
                         let instructions_left = helper.instructions_left();
-                        let error = CanisterManagerError::MissingUpgradeOptionError { message: "Enhanced orthogonal persistence requires the `keep_main_memory` upgrade option.".to_string() };
+                        let message = "Enhanced orthogonal persistence requires the `wasm_memory_persistence` upgrade option.".to_string();
+                        let error = CanisterManagerError::MissingUpgradeOptionError { message };
                         return finish_err(
                             clean_canister,
                             instructions_left,
