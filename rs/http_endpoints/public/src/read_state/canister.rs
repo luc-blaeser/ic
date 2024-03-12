@@ -292,6 +292,9 @@ fn verify_paths(
                     state,
                 )?
             }
+            [b"api_boundary_nodes"] => {}
+            [b"api_boundary_nodes", _node_id]
+            | [b"api_boundary_nodes", _node_id, b"domain" | b"ipv4_address" | b"ipv6_address"] => {}
             [b"subnet"] => {}
             [b"subnet", _subnet_id]
             | [b"subnet", _subnet_id, b"public_key" | b"canister_ranges" | b"node"] => {}
@@ -413,10 +416,8 @@ mod test {
     use ic_replicated_state::{
         canister_snapshots::CanisterSnapshots, CanisterQueues, ReplicatedState, SystemMetadata,
     };
-    use ic_test_utilities::{
-        state::insert_dummy_canister,
-        types::ids::{canister_test_id, subnet_test_id, user_test_id},
-    };
+    use ic_test_utilities::state::insert_dummy_canister;
+    use ic_test_utilities_types::ids::{canister_test_id, subnet_test_id, user_test_id};
     use ic_types::{batch::RawQueryStats, time::UNIX_EPOCH};
     use ic_validator::CanisterIdSet;
     use std::collections::BTreeMap;

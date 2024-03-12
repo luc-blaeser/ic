@@ -6,16 +6,14 @@ use super::{
 use crate::{CanisterState, SchedulerState, SystemState};
 use assert_matches::assert_matches;
 use ic_base_types::NumSeconds;
-use ic_test_utilities::{
-    state::arb_num_receivers,
-    types::{
-        arbitrary,
-        ids::{canister_test_id, message_test_id, user_test_id},
-        messages::{IngressBuilder, RequestBuilder, ResponseBuilder},
-    },
+use ic_test_utilities::state::arb_num_receivers;
+use ic_test_utilities_types::{
+    arbitrary,
+    ids::{canister_test_id, message_test_id, user_test_id},
+    messages::{IngressBuilder, RequestBuilder, ResponseBuilder},
 };
 use ic_types::{
-    messages::{CallbackId, CanisterMessage},
+    messages::{CallbackId, CanisterMessage, NO_DEADLINE},
     time::expiry_time_from_now,
     time::UNIX_EPOCH,
 };
@@ -1811,6 +1809,7 @@ fn time_out_requests_pushes_correct_reject_responses() {
                     method_name: "No-Op".to_string(),
                     method_payload: vec![],
                     metadata: None,
+                    deadline: NO_DEADLINE,
                 }),
                 deadline,
             )
@@ -1866,7 +1865,8 @@ fn time_out_requests_pushes_correct_reject_responses() {
                     RejectCode::SysTransient,
                     "Request timed out.",
                     MR_SYNTHETIC_REJECT_MESSAGE_MAX_LEN
-                ))
+                )),
+                deadline: NO_DEADLINE,
             }),
             *reject_response,
         );

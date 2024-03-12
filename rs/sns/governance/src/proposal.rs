@@ -36,10 +36,10 @@ use ic_nervous_system_common::{
     SECONDS_PER_DAY,
 };
 use ic_nervous_system_proto::pb::v1::Percentage;
+use ic_sns_governance_proposals_amount_total_limit::transfer_sns_treasury_funds_7_day_total_upper_bound_tokens;
 use ic_sns_governance_token_valuation::{
     try_get_icp_balance_valuation, try_get_sns_token_balance_valuation, Valuation,
 };
-use ic_sns_governance_treasury_transfer_limit::TreasuryTransferTotalUpperBound;
 use icp_ledger::DEFAULT_TRANSFER_FEE as NNS_DEFAULT_TRANSFER_FEE;
 use icrc_ledger_types::icrc1::account::Account;
 use rust_decimal::Decimal;
@@ -52,7 +52,7 @@ use std::{
 /// The maximum number of bytes in an SNS proposal's title.
 pub const PROPOSAL_TITLE_BYTES_MAX: usize = 256;
 /// The maximum number of bytes in an SNS proposal's summary.
-pub const PROPOSAL_SUMMARY_BYTES_MAX: usize = 15000;
+pub const PROPOSAL_SUMMARY_BYTES_MAX: usize = 30000;
 /// The maximum number of bytes in an SNS proposal's URL.
 pub const PROPOSAL_URL_CHAR_MAX: usize = 2048;
 /// The maximum number of bytes in an SNS motion proposal's motion_text.
@@ -82,6 +82,10 @@ pub const MAX_NUMBER_OF_BALLOTS_IN_LIST_PROPOSALS_RESPONSE: usize = 100;
 /// total_treasury_transfer_amount_e8s to construct the min_executed_timestamp_seconds argument).
 pub const EXECUTED_TRANSFER_SNS_TREASURY_FUNDS_PROPOSAL_RETENTION_DURATION_SECONDS: u64 =
     7 * SECONDS_PER_DAY;
+
+/// Analogous to the previous constant; this one is for MintSnsTokens proposals. The value here is
+/// the same, but we keep separate constants, because we consider this to be a coincidence.
+pub const EXECUTED_MINT_SNS_TOKENS_PROPOSAL_RETENTION_DURATION_SECONDS: u64 = 7 * SECONDS_PER_DAY;
 
 impl Proposal {
     /// Returns whether a proposal is allowed to be submitted when
@@ -647,7 +651,7 @@ async fn check_transfer_sns_treasury_funds_amount_is_within_limits_or_err(
     .map_err(|valuation_error| format!("Unable to validate amount: {:?}", valuation_error,))?;
 
     // From valuation, determine limit on the total from the past 7 days.
-    let max_tokens = TreasuryTransferTotalUpperBound::in_tokens(&valuation)
+    let max_tokens = transfer_sns_treasury_funds_7_day_total_upper_bound_tokens(&valuation)
         // Err is most likely a bug.
         .map_err(|treasury_limit_error| {
             format!("Unable to validate amount: {:?}", treasury_limit_error,)
@@ -1764,7 +1768,7 @@ impl ProposalData {
         }
     }
 
-    /// Return true if the proposal can be purged from storage, e.g.,
+    /// Return whether the proposal can be purged from storage, e.g.,
     /// if it is allowed to be garbage collected.
     pub(crate) fn can_be_purged(&self, now_seconds: u64) -> bool {
         // Retain proposals that have not gone through the full lifecycle.
@@ -1776,27 +1780,28 @@ impl ProposalData {
         }
 
         // At this point, we can let go of most proposals. The only special case is
-        // TransferSnsTreasuryFunds. We want to hang onto those for at least 7 days after they have
-        // been successfully executed. This is because they are still needed for the purposes of
-        // limiting the total amount that is transferred out of the treasury in that time window.
-
+        // TransferSnsTreasuryFunds and MintSnsTokens (the common thread between these is that these
+        // affect the value of the treasury). We want to hang onto those for at least 7 days after
+        // they have been successfully executed. This is because they are still needed for the
+        // purposes of limiting amounts.
         let Some(proposal) = &self.proposal else {
             log!(ERROR, "Proposal {:?} missing `proposal` field", self.id);
             return true;
         };
-        match &proposal.action {
-            Some(Action::TransferSnsTreasuryFunds(_)) => (),
+        let retention_duration_seconds = match &proposal.action {
+            Some(Action::TransferSnsTreasuryFunds(_)) => {
+                EXECUTED_TRANSFER_SNS_TREASURY_FUNDS_PROPOSAL_RETENTION_DURATION_SECONDS
+            }
+            Some(Action::MintSnsTokens(_)) => {
+                EXECUTED_MINT_SNS_TOKENS_PROPOSAL_RETENTION_DURATION_SECONDS
+            }
             _ => return true,
         };
 
-        // No need to hang onto proposals that did not execute successfully.
-        if self.executed_timestamp_seconds == 0 {
-            return true;
-        }
-
-        // Only hang onto TransferSnsTreasuryFunds that were executed recently enough.
+        // Only hang onto proposals that were executed recently enough. In other words, let older
+        // proposals age out.
         let earliest_unpurgeable_executed_timestamp_seconds =
-            now_seconds - EXECUTED_TRANSFER_SNS_TREASURY_FUNDS_PROPOSAL_RETENTION_DURATION_SECONDS;
+            now_seconds - retention_duration_seconds;
         self.executed_timestamp_seconds < earliest_unpurgeable_executed_timestamp_seconds
     }
 
@@ -1875,21 +1880,19 @@ pub(crate) fn transfer_sns_treasury_funds_amount_is_small_enough_at_execution_ti
     proposals: impl Iterator<Item = &'a ProposalData>,
     now_timestamp_seconds: u64,
 ) -> Result<(), GovernanceError> {
-    let allowance_tokens = match TreasuryTransferTotalUpperBound::in_tokens(valuation) {
-        Ok(ok) => ok,
-        // This should not be possible, because valuation was already used the same way during
-        // proposal submission/creation/validation.
-        Err(err) => {
-            return Err(GovernanceError::new_with_message(
+    let allowance_tokens = transfer_sns_treasury_funds_7_day_total_upper_bound_tokens(valuation)
+        .map_err(|err| {
+            // This should not be possible, because valuation was already used the same way during
+            // proposal submission/creation/validation.
+            GovernanceError::new_with_message(
                 ErrorType::InconsistentInternalData,
                 format!(
                     "Unable to determined upper bound on the amount of \
                      TransferSnsTreasuryFunds proposals: {:?}\nvaluation:{:?}",
                     err, valuation,
                 ),
-            ));
-        }
-    };
+            )
+        })?;
 
     // The total calculated here _could_ be different from what was calculated at proposal
     // submission/creation time. A difference would result from the execution of (another)
@@ -1952,6 +1955,65 @@ fn total_treasury_transfer_amount_tokens<'a>(
     filter_from_treasury: TransferFrom,
     min_executed_timestamp_seconds: u64,
 ) -> Result<Decimal, String> {
+    let filter_proposal_action_amount_e8s = |action: &Action| {
+        let transfer = match action {
+            Action::TransferSnsTreasuryFunds(ok) => ok,
+            // Skip other types of proposals.
+            _ => return None,
+        };
+
+        let is_proposal_token_relevant =
+            // Very confusingly, the from_treasury field specifies which token
+            // the proposal is about.
+            TransferFrom::try_from(transfer.from_treasury) == Ok(filter_from_treasury);
+        if !is_proposal_token_relevant {
+            return None;
+        }
+
+        Some(transfer.amount_e8s)
+    };
+
+    total_proposal_amounts_tokens(
+        proposals,
+        &format!("{:?} transfer", filter_from_treasury),
+        filter_proposal_action_amount_e8s,
+        min_executed_timestamp_seconds,
+    )
+}
+
+/// Analogous to total_treasury_transfer_amount_tokens. Of course, this considers MintSnsTokens
+/// proposals instead of TransferSnsTreasuryFunds proposals.
+#[allow(unused)] // TODO(NNS1-2910): Delete this.
+fn total_minting_amount_tokens<'a>(
+    proposals: impl Iterator<Item = &'a ProposalData>,
+    min_executed_timestamp_seconds: u64,
+) -> Result<Decimal, String> {
+    let filter_proposal_action_amount_e8s = |action: &Action| {
+        let mint = match action {
+            Action::MintSnsTokens(ok) => ok,
+            // Skip other types of proposals.
+            _ => return None,
+        };
+
+        mint.amount_e8s
+    };
+
+    total_proposal_amounts_tokens(
+        proposals,
+        "MintSnsTokens",
+        filter_proposal_action_amount_e8s,
+        min_executed_timestamp_seconds,
+    )
+}
+
+/// Where most of the implementation for other total_*_amount_tokens functions lives. The only
+/// difference among those functions is which actions are relevant.
+fn total_proposal_amounts_tokens<'a>(
+    proposals: impl Iterator<Item = &'a ProposalData>,
+    proposal_type_description: &str,
+    filter_proposal_action_amount_e8s: impl Fn(&Action) -> Option<u64>,
+    min_executed_timestamp_seconds: u64,
+) -> Result<Decimal, String> {
     let mut total_tokens = Decimal::from(0);
 
     for proposal in proposals {
@@ -1961,40 +2023,33 @@ fn total_treasury_transfer_amount_tokens<'a>(
             continue;
         }
 
-        // Skip non-TransferSnsTreasuryFunds proposals.
         let proposal_id = proposal.id;
+
+        // Filter based on action.
         let Some(proposal) = &proposal.proposal else {
             return Err(format!(
                 "ProposalData {:?} is invalid, because its `proposal` field is empty!",
                 proposal_id,
             ));
         };
-        let transfer_sns_treasury_funds = match &proposal.action {
-            Some(Action::TransferSnsTreasuryFunds(ok)) => ok,
-            _ => continue,
+        let Some(proposal_amount_e8s) = proposal
+            .action
+            .as_ref()
+            .and_then(&filter_proposal_action_amount_e8s)
+        else {
+            continue;
         };
 
-        // Skip proposals that do not deal with the type of token that the caller asked for.
-        let observed_from_treasury =
-            TransferFrom::try_from(transfer_sns_treasury_funds.from_treasury);
-        if observed_from_treasury != Ok(filter_from_treasury) {
-            continue;
-        }
-
-        // At this point, the proposal was executed recently, and deals with the type of token that
-        // the caller is interested in. Therefore, increment result by the amount in the proposal.
-
-        // Convert proposal amount from e8s (u64) to tokens (Decimal).
-        let proposal_amount_tokens =
-            denominations_to_tokens(transfer_sns_treasury_funds.amount_e8s, E8)
-                // This Err is impossible, because we are dividing a u64 by a positive number.
-                .ok_or_else(|| {
-                    format!(
-                        "Failed to total amount in recent TransferSnsTreasuryFunds proposals: \
-                         Unable to convert amount {} e8s to whole tokens in proposal {:?}.",
-                        transfer_sns_treasury_funds.amount_e8s, proposal_id,
-                    )
-                })?;
+        // Convert from e8s (u64) to tokens (Decimal).
+        let proposal_amount_tokens = denominations_to_tokens(proposal_amount_e8s, E8)
+            // This Err is impossible, because we are dividing a u64 by a positive number.
+            .ok_or_else(|| {
+                format!(
+                    "Failed to total amount in recent {} proposals: \
+                     Unable to convert amount {} e8s to whole tokens in proposal {:?}.",
+                    proposal_type_description, proposal_amount_e8s, proposal_id,
+                )
+            })?;
 
         total_tokens = total_tokens
             .checked_add(proposal_amount_tokens)
@@ -2015,6 +2070,9 @@ fn total_treasury_transfer_amount_tokens<'a>(
 
 #[cfg(test)]
 mod treasury_tests;
+
+#[cfg(test)]
+mod minting_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2041,7 +2099,7 @@ mod tests {
     use ic_nervous_system_common_test_keys::TEST_USER1_PRINCIPAL;
     use ic_nns_constants::SNS_WASM_CANISTER_ID;
     use ic_protobuf::types::v1::CanisterInstallMode as CanisterInstallModeProto;
-    use ic_test_utilities::types::ids::canister_test_id;
+    use ic_test_utilities_types::ids::canister_test_id;
     use lazy_static::lazy_static;
     use maplit::{btreemap, hashset};
     use std::convert::TryFrom;

@@ -19,6 +19,8 @@ def image_deps(mode, malicious = False):
     """
 
     deps = {
+        "base_dockerfile": "//ic-os/guestos:rootfs/Dockerfile.base",
+
         # Define rootfs and bootfs
         "bootfs": {
             # base layer
@@ -39,7 +41,7 @@ def image_deps(mode, malicious = False):
             "//publish/binaries:ic-regedit": "/opt/ic/bin/ic-regedit:0755",
             "//publish/binaries:ic-recovery": "/opt/ic/bin/ic-recovery:0755",
             "//publish/binaries:orchestrator": "/opt/ic/bin/orchestrator:0755",
-            "//publish/binaries:ic-boundary": "/opt/ic/bin/ic-boundary:0755",
+            "//publish/binaries:ic-boundary-tls": "/opt/ic/bin/ic-boundary:0755",
             ("//publish/malicious:replica" if malicious else "//publish/binaries:replica"): "/opt/ic/bin/replica:0755",  # Install the malicious replica if set
             "//publish/binaries:metrics-proxy": "/opt/ic/bin/metrics-proxy:0755",
             "//publish/binaries:sandbox_launcher": "/opt/ic/bin/sandbox_launcher:0755",
@@ -75,8 +77,16 @@ def image_deps(mode, malicious = False):
         "dev": {
             "build_container_filesystem_config_file": "//ic-os/guestos/envs/dev:build_container_filesystem_config.txt",
         },
+        "local-base-dev": {
+            # Use the non-local-base file
+            "build_container_filesystem_config_file": "//ic-os/guestos/envs/dev:build_container_filesystem_config.txt",
+        },
         "dev-malicious": {
             "build_container_filesystem_config_file": "//ic-os/guestos/envs/dev-malicious:build_container_filesystem_config.txt",
+        },
+        "local-base-prod": {
+            # Use the non-local-base file
+            "build_container_filesystem_config_file": "//ic-os/guestos/envs/prod:build_container_filesystem_config.txt",
         },
         "prod": {
             "build_container_filesystem_config_file": "//ic-os/guestos/envs/prod:build_container_filesystem_config.txt",
@@ -88,6 +98,9 @@ def image_deps(mode, malicious = False):
     # Add extra files depending on image variant
     extra_rootfs_deps = {
         "dev": {
+            "//ic-os/guestos:rootfs/allow_console_root": "/etc/allow_console_root:0644",
+        },
+        "local-base-dev": {
             "//ic-os/guestos:rootfs/allow_console_root": "/etc/allow_console_root:0644",
         },
     }

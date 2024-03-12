@@ -18,7 +18,7 @@ use ic_interfaces::{
     messaging::XNetPayloadBuilder,
     p2p::consensus::{ChangeSetProducer, PriorityFnAndFilterProducer},
     self_validating_payload::SelfValidatingPayloadBuilder,
-    time_source::{MonotonicTimeSource, TimeSource},
+    time_source::TimeSource,
 };
 use ic_interfaces_certified_stream_store::CertifiedStreamStore;
 use ic_interfaces_registry::RegistryClient;
@@ -28,13 +28,11 @@ use ic_metrics::MetricsRegistry;
 use ic_replicated_state::ReplicatedState;
 use ic_test_artifact_pool::ingress_pool::TestIngressPool;
 use ic_test_utilities::{
-    consensus::{batch::MockBatchPayloadBuilder, EcdsaStatsNoOp},
-    ingress_selector::FakeIngressSelector,
-    message_routing::FakeMessageRouting,
+    ingress_selector::FakeIngressSelector, message_routing::FakeMessageRouting,
     self_validating_payload_builder::FakeSelfValidatingPayloadBuilder,
-    state_manager::FakeStateManager,
-    xnet_payload_builder::FakeXNetPayloadBuilder,
+    state_manager::FakeStateManager, xnet_payload_builder::FakeXNetPayloadBuilder,
 };
+use ic_test_utilities_consensus::{batch::MockBatchPayloadBuilder, EcdsaStatsNoOp};
 use ic_types::{
     artifact::{ArtifactKind, Priority, PriorityFn},
     artifact_kind::ConsensusArtifact,
@@ -190,7 +188,7 @@ impl ConsensusDependencies {
         pool_config: ArtifactPoolConfig,
         registry_client: Arc<dyn RegistryClient>,
         cup: CatchUpPackage,
-        time_source: Arc<dyn MonotonicTimeSource>,
+        time_source: Arc<dyn TimeSource>,
     ) -> ConsensusDependencies {
         let state_manager = FakeStateManager::new();
         let state_manager = Arc::new(state_manager);

@@ -50,7 +50,7 @@ use ic_interfaces::{
     messaging::{MessageRouting, XNetPayloadBuilder},
     p2p::consensus::{ChangeSetProducer, PriorityFnAndFilterProducer},
     self_validating_payload::SelfValidatingPayloadBuilder,
-    time_source::MonotonicTimeSource,
+    time_source::TimeSource,
 };
 use ic_interfaces_registry::{LocalStoreCertifiedTimeReader, RegistryClient, POLLING_PERIOD};
 use ic_interfaces_state_manager::StateManager;
@@ -132,7 +132,7 @@ pub struct ConsensusImpl {
     aggregator: ShareAggregator,
     purger: Purger,
     metrics: ConsensusMetrics,
-    time_source: Arc<dyn MonotonicTimeSource>,
+    time_source: Arc<dyn TimeSource>,
     registry_client: Arc<dyn RegistryClient>,
     state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
     dkg_key_manager: Arc<Mutex<DkgKeyManager>>,
@@ -164,7 +164,7 @@ impl ConsensusImpl {
         dkg_key_manager: Arc<Mutex<DkgKeyManager>>,
         message_routing: Arc<dyn MessageRouting>,
         state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
-        time_source: Arc<dyn MonotonicTimeSource>,
+        time_source: Arc<dyn TimeSource>,
         stable_registry_version_age: Duration,
         malicious_flags: MaliciousFlags,
         metrics_registry: MetricsRegistry,
@@ -684,7 +684,7 @@ pub fn setup(
     dkg_key_manager: Arc<Mutex<DkgKeyManager>>,
     message_routing: Arc<dyn MessageRouting>,
     state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
-    time_source: Arc<dyn MonotonicTimeSource>,
+    time_source: Arc<dyn TimeSource>,
     malicious_flags: MaliciousFlags,
     metrics_registry: MetricsRegistry,
     logger: ReplicaLogger,
@@ -742,15 +742,14 @@ mod tests {
     use ic_registry_subnet_type::SubnetType;
     use ic_test_artifact_pool::consensus_pool::TestConsensusPool;
     use ic_test_utilities::{
-        consensus::batch::MockBatchPayloadBuilder,
-        ingress_selector::FakeIngressSelector,
-        message_routing::FakeMessageRouting,
+        ingress_selector::FakeIngressSelector, message_routing::FakeMessageRouting,
         self_validating_payload_builder::FakeSelfValidatingPayloadBuilder,
-        types::ids::{node_test_id, subnet_test_id},
         xnet_payload_builder::FakeXNetPayloadBuilder,
     };
+    use ic_test_utilities_consensus::batch::MockBatchPayloadBuilder;
     use ic_test_utilities_registry::{FakeLocalStoreCertifiedTimeReader, SubnetRecordBuilder};
     use ic_test_utilities_time::FastForwardTimeSource;
+    use ic_test_utilities_types::ids::{node_test_id, subnet_test_id};
     use ic_types::{crypto::CryptoHash, CryptoHashOfState, SubnetId};
     use std::{sync::Arc, time::Duration};
 

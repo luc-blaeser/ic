@@ -17,17 +17,15 @@ use ic_replicated_state::{
     testing::ReplicatedStateTesting,
     CanisterState, ReplicatedState, Stream,
 };
-use ic_test_utilities::{
-    state::{new_canister_state, register_callback},
-    types::ids::{user_test_id, SUBNET_12, SUBNET_23, SUBNET_27},
-    types::messages::{RequestBuilder, ResponseBuilder},
-    types::xnet::{StreamHeaderBuilder, StreamSliceBuilder},
-};
+use ic_test_utilities::state::{new_canister_state, register_callback};
 use ic_test_utilities_logger::with_test_replica_logger;
 use ic_test_utilities_metrics::{
     fetch_histogram_stats, fetch_histogram_vec_count, fetch_int_counter, fetch_int_counter_vec,
     fetch_int_gauge_vec, metric_vec, nonzero_values, HistogramStats, MetricVec,
 };
+use ic_test_utilities_types::ids::{user_test_id, SUBNET_12, SUBNET_23, SUBNET_27};
+use ic_test_utilities_types::messages::{RequestBuilder, ResponseBuilder};
+use ic_test_utilities_types::xnet::{StreamHeaderBuilder, StreamSliceBuilder};
 use ic_types::{
     messages::{CallbackId, Payload, Request, MAX_RESPONSE_COUNT_BYTES},
     time::UNIX_EPOCH,
@@ -1397,6 +1395,7 @@ fn generate_reject_response_queue_full() {
             originator_reply_callback: msg.sender_reply_callback,
             refund: msg.payment,
             response_payload: Payload::Reject(RejectContext::new(RejectCode::SysTransient, &err)),
+            deadline: msg.deadline,
         }
         .into(),
     );
@@ -1437,6 +1436,7 @@ fn generate_reject_response_canister_not_found() {
                 RejectCode::DestinationInvalid,
                 &err,
             )),
+            deadline: msg.deadline,
         }
         .into(),
     );
@@ -3096,6 +3096,7 @@ fn make_input_queue_reservations(canister: &mut CanisterState, count: usize, rem
             msg.sender,
             msg.receiver,
             msg.sender_reply_callback,
+            msg.deadline,
         );
         canister
             .push_output_request(msg.into(), UNIX_EPOCH)

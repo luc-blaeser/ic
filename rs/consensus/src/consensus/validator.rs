@@ -25,7 +25,7 @@ use ic_interfaces::{
     consensus_pool::*,
     dkg::DkgPool,
     messaging::MessageRouting,
-    time_source::MonotonicTimeSource,
+    time_source::TimeSource,
     validation::{ValidationError, ValidationResult},
 };
 use ic_interfaces_registry::RegistryClient;
@@ -581,7 +581,7 @@ pub struct Validator {
     log: ReplicaLogger,
     metrics: ValidatorMetrics,
     schedule: RoundRobin,
-    time_source: Arc<dyn MonotonicTimeSource>,
+    time_source: Arc<dyn TimeSource>,
     /// Earliest monotonic measurement available for the validator, used for fallback
     /// during out-of-sync validation. Should ideally represent a time close to the
     /// start of the replica process.
@@ -602,7 +602,7 @@ impl Validator {
         dkg_pool: Arc<RwLock<dyn DkgPool>>,
         log: ReplicaLogger,
         metrics: ValidatorMetrics,
-        time_source: Arc<dyn MonotonicTimeSource>,
+        time_source: Arc<dyn TimeSource>,
     ) -> Validator {
         Validator {
             replica_config,
@@ -616,7 +616,7 @@ impl Validator {
             log,
             metrics,
             schedule: RoundRobin::default(),
-            origin_instant: time_source.get_monotonic_time(),
+            origin_instant: time_source.get_instant(),
             time_source,
         }
     }
@@ -1033,7 +1033,7 @@ impl Validator {
             .unwrap_or(self.origin_instant);
         let duration_since_received_parent = self
             .time_source
-            .get_monotonic_time()
+            .get_instant()
             .saturating_duration_since(parent_block_instant);
 
         // Check that our locally available validation context is sufficient for
@@ -1656,16 +1656,11 @@ pub mod test {
     use ic_registry_client_helpers::subnet::SubnetRegistry;
     use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
     use ic_test_artifact_pool::consensus_pool::TestConsensusPool;
-    use ic_test_utilities::{
-        assert_changeset_matches_pattern,
-        consensus::fake::*,
-        crypto::CryptoReturningOk,
-        matches_pattern,
-        state_manager::RefMockStateManager,
-        types::ids::{node_test_id, subnet_test_id},
-    };
+    use ic_test_utilities::{crypto::CryptoReturningOk, state_manager::RefMockStateManager};
+    use ic_test_utilities_consensus::{assert_changeset_matches_pattern, fake::*, matches_pattern};
     use ic_test_utilities_registry::{add_subnet_record, SubnetRecordBuilder};
     use ic_test_utilities_time::FastForwardTimeSource;
+    use ic_test_utilities_types::ids::{node_test_id, subnet_test_id};
     use ic_types::{
         consensus::{
             ecdsa::QuadrupleId, BlockPayload, CatchUpPackageShare, Finalization, FinalizationShare,

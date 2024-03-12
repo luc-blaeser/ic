@@ -36,9 +36,9 @@ use ic_logger::{error, info, warn, ReplicaLogger};
 use ic_management_canister_types::{
     CanisterChangeOrigin, CanisterHttpRequestArgs, CanisterIdRecord, CanisterInfoRequest,
     CanisterInfoResponse, CanisterSettingsArgs, CanisterStatusType, ClearChunkStoreArgs,
-    ComputeInitialEcdsaDealingsArgs, CreateCanisterArgs, ECDSAPublicKeyArgs,
-    ECDSAPublicKeyResponse, EcdsaKeyId, EmptyBlob, InstallChunkedCodeArgs, InstallCodeArgsV2,
-    Method as Ic00Method, NodeMetricsHistoryArgs, Payload as Ic00Payload,
+    ComputeInitialEcdsaDealingsArgs, CreateCanisterArgs, DeleteCanisterSnapshotArgs,
+    ECDSAPublicKeyArgs, ECDSAPublicKeyResponse, EcdsaKeyId, EmptyBlob, InstallChunkedCodeArgs,
+    InstallCodeArgsV2, Method as Ic00Method, NodeMetricsHistoryArgs, Payload as Ic00Payload,
     ProvisionalCreateCanisterWithCyclesArgs, ProvisionalTopUpCanisterArgs, SetupInitialDKGArgs,
     SignWithECDSAArgs, StoredChunksArgs, TakeCanisterSnapshotArgs, UninstallCodeArgs,
     UpdateSettingsArgs, UploadChunkArgs, IC_00,
@@ -47,6 +47,7 @@ use ic_metrics::MetricsRegistry;
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::{
+    canister_snapshots::SnapshotId,
     canister_state::system_state::PausedExecutionId,
     canister_state::{system_state::CyclesUseCase, NextExecution},
     metadata_state::subnet_call_context_manager::{
@@ -500,6 +501,7 @@ impl ExecutionEnvironment {
                                 originator_reply_callback: request.sender_reply_callback,
                                 refund: request.payment,
                                 response_payload: response.response_payload.clone(),
+                                deadline: request.deadline,
                             }
                             .into(),
                         );
@@ -582,6 +584,7 @@ impl ExecutionEnvironment {
                                         "An empty message cannot be signed",
                                     ),
                                 ),
+                                deadline: request.deadline,
                             }
                             .into(),
                         );
@@ -1230,44 +1233,28 @@ impl ExecutionEnvironment {
                 }
             }
 
-            Ok(Ic00Method::FetchCanisterLogs) => match self.config.canister_logging {
-                FlagStatus::Enabled => ExecuteSubnetMessageResult::Finished {
-                    response: Err(UserError::new(
-                        ErrorCode::CanisterRejectedMessage,
-                        format!(
-                            "{} API is only accessible in non-replicated mode",
-                            Ic00Method::FetchCanisterLogs
-                        ),
-                    )),
-                    refund: msg.take_cycles(),
-                },
-                FlagStatus::Disabled => {
-                    let err = Err(UserError::new(
-                        ErrorCode::CanisterContractViolation,
-                        format!(
-                            "{} API is not enabled on this subnet",
-                            Ic00Method::FetchCanisterLogs
-                        ),
-                    ));
-                    ExecuteSubnetMessageResult::Finished {
-                        response: err,
-                        refund: msg.take_cycles(),
-                    }
-                }
+            Ok(Ic00Method::FetchCanisterLogs) => ExecuteSubnetMessageResult::Finished {
+                response: Err(UserError::new(
+                    ErrorCode::CanisterRejectedMessage,
+                    format!(
+                        "{} API is only accessible in non-replicated mode",
+                        Ic00Method::FetchCanisterLogs
+                    ),
+                )),
+                refund: msg.take_cycles(),
             },
 
             Ok(Ic00Method::TakeCanisterSnapshot) => match self.config.canister_snapshots {
                 FlagStatus::Enabled => {
-                    let res = match TakeCanisterSnapshotArgs::decode(payload) {
-                        Err(err) => Err(err),
-                        Ok(_) => {
-                            // TODO(EXC-1529): Implement take_canister_snapshot.
-                            Err(UserError::new(
-                                ErrorCode::CanisterRejectedMessage,
-                                "Canister snapshotting API is not yet implemented.",
-                            ))
-                        }
-                    };
+                    let res = TakeCanisterSnapshotArgs::decode(payload).and_then(|args| {
+                        self.take_canister_snapshot(
+                            *msg.sender(),
+                            &mut state,
+                            args,
+                            registry_settings.subnet_size,
+                            round_limits,
+                        )
+                    });
                     ExecuteSubnetMessageResult::Finished {
                         response: res,
                         refund: msg.take_cycles(),
@@ -1333,12 +1320,18 @@ impl ExecutionEnvironment {
 
             Ok(Ic00Method::DeleteCanisterSnapshot) => match self.config.canister_snapshots {
                 FlagStatus::Enabled => {
-                    // TODO(EXC-1532): Implement delete_canister_snapshot.
+                    let res = match DeleteCanisterSnapshotArgs::decode(payload) {
+                        Err(err) => Err(err),
+                        Ok(_) => {
+                            // TODO(EXC-1532): Implement delete_canister_snapshot.
+                            Err(UserError::new(
+                                ErrorCode::CanisterRejectedMessage,
+                                "Canister snapshotting API is not yet implemented.",
+                            ))
+                        }
+                    };
                     ExecuteSubnetMessageResult::Finished {
-                        response: Err(UserError::new(
-                            ErrorCode::CanisterRejectedMessage,
-                            "Canister snapshotting API is not yet implemented.",
-                        )),
+                        response: res,
                         refund: msg.take_cycles(),
                     }
                 }
@@ -1891,6 +1884,51 @@ impl ExecutionEnvironment {
             .map_err(|err| err.into())
     }
 
+    /// Creates a new canister snapshot and inserts it into `ReplicatedState`.
+    fn take_canister_snapshot(
+        &self,
+        sender: PrincipalId,
+        state: &mut ReplicatedState,
+        args: TakeCanisterSnapshotArgs,
+        subnet_size: usize,
+        round_limits: &mut RoundLimits,
+    ) -> Result<Vec<u8>, UserError> {
+        let canister_id = args.get_canister_id();
+        // Take canister out.
+        let mut canister = match state.take_canister_state(&canister_id) {
+            None => {
+                return Err(UserError::new(
+                    ErrorCode::CanisterNotFound,
+                    format!("Canister {} not found.", &canister_id),
+                ))
+            }
+            Some(canister) => canister,
+        };
+
+        let resource_saturation =
+            self.subnet_memory_saturation(&round_limits.subnet_available_memory);
+        let replace_snapshot = args.replace_snapshot().map(SnapshotId::new);
+        let result = self
+            .canister_manager
+            .take_canister_snapshot(
+                subnet_size,
+                sender,
+                &mut canister,
+                replace_snapshot,
+                state,
+                round_limits,
+                &resource_saturation,
+            )
+            .map(|response| {
+                state.metadata.heap_delta_estimate += NumBytes::from(response.total_size());
+                response.encode()
+            })
+            .map_err(|err| err.into());
+        // Put canister back.
+        state.put_canister_state(canister);
+        result
+    }
+
     fn node_metrics_history(
         &self,
         state: &ReplicatedState,
@@ -2043,7 +2081,6 @@ impl ExecutionEnvironment {
                 provisional_whitelist,
                 ingress,
                 effective_canister_id,
-                self.config.canister_logging,
             );
         }
 
@@ -2196,6 +2233,7 @@ impl ExecutionEnvironment {
                         originator_reply_callback: req.sender_reply_callback,
                         refund,
                         response_payload: payload,
+                        deadline: req.deadline,
                     };
 
                     state.push_subnet_output_response(response.into());
@@ -2290,6 +2328,7 @@ impl ExecutionEnvironment {
                     reply_callback,
                     call_id,
                     cycles,
+                    deadline,
                 } => {
                     // Rejecting a stop_canister request from a canister.
                     let subnet_id_as_canister_id = CanisterId::from(self.own_subnet_id);
@@ -2304,6 +2343,7 @@ impl ExecutionEnvironment {
                             RejectCode::CanisterError,
                             format!("Canister {}'s stop request cancelled", canister_id),
                         )),
+                        deadline,
                     };
                     state.push_subnet_output_response(response.into());
                 }
@@ -3069,6 +3109,7 @@ impl ExecutionEnvironment {
                 sender,
                 reply_callback,
                 cycles,
+                deadline,
                 ..
             } => {
                 // Responding to stop_canister request from a canister.
@@ -3086,6 +3127,7 @@ impl ExecutionEnvironment {
                     originator_reply_callback: *reply_callback,
                     refund: *cycles,
                     response_payload,
+                    deadline: *deadline,
                 };
                 state.push_subnet_output_response(response.into());
             }

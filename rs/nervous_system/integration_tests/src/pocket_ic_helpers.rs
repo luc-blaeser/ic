@@ -7,15 +7,17 @@ use ic_nervous_system_common_test_keys::TEST_NEURON_1_OWNER_PRINCIPAL;
 use ic_nervous_system_root::change_canister::ChangeCanisterRequest;
 use ic_nns_common::pb::v1::{NeuronId, ProposalId};
 use ic_nns_constants::{
-    self, GOVERNANCE_CANISTER_ID, LEDGER_CANISTER_ID, LIFELINE_CANISTER_ID, ROOT_CANISTER_ID,
-    SNS_WASM_CANISTER_ID,
+    self, ALL_NNS_CANISTER_IDS, GOVERNANCE_CANISTER_ID, LEDGER_CANISTER_ID, LIFELINE_CANISTER_ID,
+    ROOT_CANISTER_ID, SNS_WASM_CANISTER_ID,
 };
-use ic_nns_governance::init::TEST_NEURON_1_ID;
-use ic_nns_governance::pb::v1::{
-    manage_neuron, manage_neuron_response, proposal, CreateServiceNervousSystem,
-    ExecuteNnsFunction, GetNeuronsFundAuditInfoRequest, GetNeuronsFundAuditInfoResponse,
-    ListNeurons, ListNeuronsResponse, ManageNeuron, ManageNeuronResponse, NnsFunction, Proposal,
-    ProposalInfo,
+use ic_nns_governance::{
+    init::TEST_NEURON_1_ID,
+    pb::v1::{
+        manage_neuron, manage_neuron_response, proposal, CreateServiceNervousSystem,
+        ExecuteNnsFunction, GetNeuronsFundAuditInfoRequest, GetNeuronsFundAuditInfoResponse,
+        ListNeurons, ListNeuronsResponse, ManageNeuron, ManageNeuronResponse, NetworkEconomics,
+        NnsFunction, Proposal, ProposalInfo, Topic,
+    },
 };
 use ic_nns_test_utils::{
     common::{
@@ -29,7 +31,7 @@ use ic_nns_test_utils::{
         build_ledger_sns_wasm, build_mainnet_archive_sns_wasm, build_mainnet_governance_sns_wasm,
         build_mainnet_index_ng_sns_wasm, build_mainnet_ledger_sns_wasm,
         build_mainnet_root_sns_wasm, build_mainnet_swap_sns_wasm, build_root_sns_wasm,
-        build_swap_sns_wasm,
+        build_swap_sns_wasm, ensure_sns_wasm_gzipped,
     },
 };
 use ic_sns_governance::pb::v1::{self as sns_pb, governance::Version};
@@ -52,7 +54,7 @@ use icrc_ledger_types::icrc1::{
     transfer::{TransferArg, TransferError},
 };
 use maplit::btreemap;
-use pocket_ic::{PocketIc, WasmResult};
+use pocket_ic::{CanisterSettings, PocketIc, WasmResult};
 use prost::Message;
 use rust_decimal::prelude::ToPrimitive;
 use std::{collections::BTreeMap, fmt::Write, time::Duration};
@@ -86,14 +88,24 @@ pub fn extract_sns_canister_version(
 pub fn install_canister(
     pocket_ic: &PocketIc,
     name: &str,
-    id: CanisterId,
+    canister_id: CanisterId,
     arg: Vec<u8>,
     wasm: Wasm,
     controller: Option<PrincipalId>,
 ) {
     let controller_principal = controller.map(|c| c.0);
+    let memory_allocation = if ALL_NNS_CANISTER_IDS.contains(&&canister_id) {
+        let memory_allocation_bytes = ic_nns_constants::memory_allocation_of(canister_id);
+        Some(Nat::from(memory_allocation_bytes))
+    } else {
+        None
+    };
+    let settings = Some(CanisterSettings {
+        memory_allocation,
+        ..Default::default()
+    });
     let canister_id = pocket_ic
-        .create_canister_with_id(controller_principal, None, id.into())
+        .create_canister_with_id(controller_principal, settings, canister_id.into())
         .unwrap();
     pocket_ic.install_canister(canister_id, wasm.bytes(), arg, controller_principal);
     pocket_ic.add_cycles(canister_id, STARTING_CYCLES_PER_CANISTER);
@@ -126,6 +138,19 @@ pub fn add_wasm_via_nns_proposal(
     nns::governance::propose_and_wait(pocket_ic, proposal)
 }
 
+pub fn propose_to_set_network_economics_and_wait(
+    pocket_ic: &PocketIc,
+    network_economics: NetworkEconomics,
+) -> Result<ProposalInfo, String> {
+    let proposal = Proposal {
+        title: Some("Set NetworkEconomics.neurons_fund_economics {}".to_string()),
+        summary: "summary".to_string(),
+        url: "".to_string(),
+        action: Some(proposal::Action::ManageNetworkEconomics(network_economics)),
+    };
+    nns::governance::propose_and_wait(pocket_ic, proposal)
+}
+
 pub fn add_wasms_to_sns_wasm(
     pocket_ic: &PocketIc,
     with_mainnet_ledger_wasms: bool,
@@ -133,21 +158,21 @@ pub fn add_wasms_to_sns_wasm(
     let (root_wasm, governance_wasm, swap_wasm, index_wasm, ledger_wasm, archive_wasm) =
         if with_mainnet_ledger_wasms {
             (
-                build_mainnet_root_sns_wasm(),
-                build_mainnet_governance_sns_wasm(),
-                build_mainnet_swap_sns_wasm(),
-                build_mainnet_index_ng_sns_wasm(),
-                build_mainnet_ledger_sns_wasm(),
-                build_mainnet_archive_sns_wasm(),
+                ensure_sns_wasm_gzipped(build_mainnet_root_sns_wasm()),
+                ensure_sns_wasm_gzipped(build_mainnet_governance_sns_wasm()),
+                ensure_sns_wasm_gzipped(build_mainnet_swap_sns_wasm()),
+                ensure_sns_wasm_gzipped(build_mainnet_index_ng_sns_wasm()),
+                ensure_sns_wasm_gzipped(build_mainnet_ledger_sns_wasm()),
+                ensure_sns_wasm_gzipped(build_mainnet_archive_sns_wasm()),
             )
         } else {
             (
-                build_root_sns_wasm(),
-                build_governance_sns_wasm(),
-                build_swap_sns_wasm(),
-                build_index_ng_sns_wasm(),
-                build_ledger_sns_wasm(),
-                build_archive_sns_wasm(),
+                ensure_sns_wasm_gzipped(build_root_sns_wasm()),
+                ensure_sns_wasm_gzipped(build_governance_sns_wasm()),
+                ensure_sns_wasm_gzipped(build_swap_sns_wasm()),
+                ensure_sns_wasm_gzipped(build_index_ng_sns_wasm()),
+                ensure_sns_wasm_gzipped(build_ledger_sns_wasm()),
+                ensure_sns_wasm_gzipped(build_archive_sns_wasm()),
             )
         };
 
@@ -208,6 +233,9 @@ pub fn install_nns_canisters(
             test_user_icp_ledger_initial_balance,
         );
     }
+
+    let nns_init_payload = nns_init_payload_builder.build();
+
     let (ledger_wasm, root_wasm, governance_wasm, sns_wasm_wasm) =
         if with_mainnet_nns_canister_versions {
             (
@@ -224,7 +252,7 @@ pub fn install_nns_canisters(
                 build_sns_wasms_wasm(),
             )
         };
-    let nns_init_payload = nns_init_payload_builder.build();
+
     install_canister(
         pocket_ic,
         "ICP Ledger",
@@ -300,9 +328,14 @@ pub fn upgrade_root_controlled_nns_canister_to_tip_of_master_or_panic(
         .module_hash
         .unwrap();
 
-    let request = ChangeCanisterRequest::new(false, CanisterInstallMode::Upgrade, canister_id)
-        .with_memory_allocation(ic_nns_constants::memory_allocation_of(canister_id))
-        .with_wasm(wasm.bytes());
+    let stop_before_installing = true;
+    let request = ChangeCanisterRequest::new(
+        stop_before_installing,
+        CanisterInstallMode::Upgrade,
+        canister_id,
+    )
+    .with_memory_allocation(ic_nns_constants::memory_allocation_of(canister_id))
+    .with_wasm(wasm.bytes());
     let proposal_info = nns::governance::propose_and_wait(
         pocket_ic,
         Proposal {
@@ -348,6 +381,7 @@ pub mod nns {
     use super::*;
     pub mod governance {
         use super::*;
+        use pocket_ic::{ErrorCode, UserError};
 
         pub fn list_neurons(pocket_ic: &PocketIc, sender: PrincipalId) -> ListNeuronsResponse {
             let result = pocket_ic
@@ -367,7 +401,7 @@ pub mod nns {
                 WasmResult::Reply(reply) => reply,
                 WasmResult::Reject(reject) => {
                     panic!(
-                        "list_neurons was rejected by the SNS governance canister: {:#?}",
+                        "list_neurons was rejected by the NNS governance canister: {:#?}",
                         reject
                     )
                 }
@@ -437,26 +471,25 @@ pub mod nns {
             pocket_ic: &PocketIc,
             proposal_id: u64,
             sender: PrincipalId,
-        ) -> ProposalInfo {
-            let result = pocket_ic
+        ) -> Result<ProposalInfo, UserError> {
+            pocket_ic
                 .query_call(
                     GOVERNANCE_CANISTER_ID.into(),
                     Principal::from(sender),
                     "get_proposal_info",
                     Encode!(&proposal_id).unwrap(),
                 )
-                .unwrap();
-
-            let result = match result {
-                WasmResult::Reply(reply) => reply,
-                WasmResult::Reject(reject) => {
-                    panic!(
-                        "get_proposal_info was rejected by the NNS governance canister: {:#?}",
-                        reject
-                    )
-                }
-            };
-            Decode!(&result, Option<ProposalInfo>).unwrap().unwrap()
+                .map(|result| match result {
+                    WasmResult::Reply(reply) => {
+                        Decode!(&reply, Option<ProposalInfo>).unwrap().unwrap()
+                    }
+                    WasmResult::Reject(reject) => {
+                        panic!(
+                            "get_proposal_info was rejected by the NNS governance canister: {:#?}",
+                            reject
+                        )
+                    }
+                })
         }
 
         pub fn wait_for_proposal_execution(
@@ -468,14 +501,40 @@ pub mod nns {
             for _attempt_count in 1..=100 {
                 pocket_ic.tick();
                 pocket_ic.advance_time(Duration::from_secs(1));
-                let proposal_info =
+
+                let proposal_info_result =
                     nns_get_proposal_info(pocket_ic, proposal_id, PrincipalId::new_anonymous());
+
+                let proposal_info = match proposal_info_result {
+                    Ok(proposal_info) => proposal_info,
+                    Err(user_error) => {
+                        // Upgrading NNS Governance results in the proposal info temporarily not
+                        // being available due to the canister being stopped. This requires
+                        // more attempts to get the proposal info to find out if the proposal
+                        // actually got executed.
+                        let is_benign = [ErrorCode::CanisterStopped, ErrorCode::CanisterStopping]
+                            .contains(&user_error.code);
+                        if is_benign {
+                            continue;
+                        } else {
+                            return Err(format!("Error getting proposal info: {:#?}", user_error));
+                        }
+                    }
+                };
+
                 if proposal_info.executed_timestamp_seconds > 0 {
                     return Ok(proposal_info);
                 }
                 assert_eq!(
-                    proposal_info.failure_reason, None,
-                    "Proposal execution failed: {:#?}",
+                    proposal_info.failure_reason,
+                    None,
+                    "Execution failed for {:?} proposal '{}': {:#?}",
+                    Topic::try_from(proposal_info.topic).unwrap(),
+                    proposal_info
+                        .proposal
+                        .unwrap()
+                        .title
+                        .unwrap_or("<no-title>".to_string()),
                     proposal_info.failure_reason
                 );
                 last_proposal_info = Some(proposal_info);
@@ -538,6 +597,28 @@ pub mod nns {
                 );
             };
             (deployed_sns, nns_proposal_id)
+        }
+
+        pub fn get_network_economics_parameters(pocket_ic: &PocketIc) -> NetworkEconomics {
+            let result = pocket_ic
+                .query_call(
+                    GOVERNANCE_CANISTER_ID.into(),
+                    Principal::anonymous(),
+                    "get_network_economics_parameters",
+                    Encode!().unwrap(),
+                )
+                .unwrap();
+            let result = match result {
+                WasmResult::Reply(reply) => reply,
+                WasmResult::Reject(reject) => {
+                    panic!(
+                        "get_network_economics_parameters was rejected by the NNS governance \
+                        canister: {:#?}",
+                        reject
+                    )
+                }
+            };
+            Decode!(&result, NetworkEconomics).unwrap()
         }
     }
 

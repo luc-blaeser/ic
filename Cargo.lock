@@ -441,12 +441,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96d30a06541fbafbc7f82ed10c06164cfbd2c401138f6addd8404629c4b16711"
 
 [[package]]
-name = "ascii"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d92bec98840b8f03a5ff5413de5293bfcd8bf96467cf5452609f939ec6f5de16"
-
-[[package]]
 name = "ascii-canvas"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1331,13 +1325,13 @@ version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum 0.6.20",
+ "axum 0.7.4",
  "candid",
  "clap 3.2.25",
  "futures",
  "glob",
  "humantime",
- "hyper 0.14.26",
+ "hyper 1.2.0",
  "ic-agent",
  "ic-utils 0.33.0",
  "indoc",
@@ -1676,9 +1670,9 @@ dependencies = [
 
 [[package]]
 name = "candid"
-version = "0.10.2"
+version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39be580be172631a35cac2fc6c765f365709de459edb88121b3e7a80cce6c1ec"
+checksum = "088c2e3d22a0fb1ada78b968946b0f7b96027ac8669973fe7c0815a98e8d13ef"
 dependencies = [
  "anyhow",
  "binread",
@@ -1699,9 +1693,9 @@ dependencies = [
 
 [[package]]
 name = "candid_derive"
-version = "0.6.5"
+version = "0.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "970c220da8aa2fa6f7ef5dbbf3ea5b620a59eb3ac107cfb95ae8c6eebdfb7a08"
+checksum = "3de398570c386726e7a59d9887b68763c481477f9a043fb998a2e09d428df1a9"
 dependencies = [
  "lazy_static",
  "proc-macro2 1.0.75",
@@ -1903,7 +1897,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "x509-parser 0.15.1",
+ "x509-parser",
 ]
 
 [[package]]
@@ -2003,12 +1997,6 @@ dependencies = [
  "wasm-bindgen",
  "windows-targets 0.48.0",
 ]
-
-[[package]]
-name = "chunked_transfer"
-version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cca491388666e04d7248af3f60f0c40cfb0991c72205595d7c396e3510207d1a"
 
 [[package]]
 name = "ciborium"
@@ -3799,6 +3787,7 @@ dependencies = [
  "ic-test-utilities",
  "ic-test-utilities-execution-environment",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-wasm-types",
  "lazy_static",
@@ -5132,9 +5121,11 @@ dependencies = [
  "ic-sys",
  "ic-test-artifact-pool",
  "ic-test-utilities",
+ "ic-test-utilities-consensus",
  "ic-test-utilities-logger",
  "ic-test-utilities-registry",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "lmdb-rkv",
  "lmdb-rkv-sys",
@@ -5247,7 +5238,6 @@ dependencies = [
  "ic-base-types-protobuf-generator",
  "ic-crypto-sha2",
  "ic-protobuf",
- "ic-stable-structures",
  "ic-test-utilities-compare-dirs",
  "phantom_newtype",
  "proptest",
@@ -5336,8 +5326,8 @@ dependencies = [
  "ic-registry-replicator",
  "ic-registry-routing-table",
  "ic-registry-subnet-type",
- "ic-test-utilities",
  "ic-test-utilities-registry",
+ "ic-test-utilities-types",
  "ic-types",
  "instant-acme",
  "jemalloc-ctl",
@@ -5373,7 +5363,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "wiremock",
- "x509-parser 0.15.1",
+ "x509-parser",
 ]
 
 [[package]]
@@ -5473,6 +5463,7 @@ dependencies = [
  "ic-test-utilities",
  "ic-test-utilities-logger",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "mockall",
  "prometheus",
@@ -5550,6 +5541,7 @@ dependencies = [
  "ic-management-canister-types",
  "ic-protobuf",
  "ic-test-utilities",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-validator",
  "itertools 0.12.0",
@@ -5623,7 +5615,7 @@ dependencies = [
  "ic-replicated-state",
  "ic-sys",
  "ic-system-api",
- "ic-test-utilities",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-utils 0.9.0",
  "ic-wasm-types",
@@ -5692,6 +5684,7 @@ dependencies = [
  "ic-sys",
  "ic-test-utilities",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-utils 0.9.0",
  "ic-wasm-types",
@@ -5751,9 +5744,9 @@ dependencies = [
 
 [[package]]
 name = "ic-cdk"
-version = "0.12.1"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f3d204af0b11c45715169c997858edb58fa8407d08f4fae78a6b415dd39a362"
+checksum = "c63a6fceb94127bda86bd6d05f859a0e2a67d128a8ffb5ddab17e1f15ac8f555"
 dependencies = [
  "candid",
  "ic-cdk-macros",
@@ -5764,9 +5757,9 @@ dependencies = [
 
 [[package]]
 name = "ic-cdk-macros"
-version = "0.8.4"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5a618e4020cea88e933d8d2f8c7f86d570ec06213506a80d4f2c520a9bba512"
+checksum = "2fde5ca6ef1e69825c68916ff1bf7256b8f7ed69ac5ea3f1756f6e57f1503e27"
 dependencies = [
  "candid",
  "proc-macro2 1.0.75",
@@ -5778,9 +5771,9 @@ dependencies = [
 
 [[package]]
 name = "ic-cdk-timers"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c43b9706fef3ad10c4192a14801d16bd9539068239f0f06f257857441364329"
+checksum = "054727a3a1c486528b96349817d54290ff70df6addf417def456ea708a16f7fb"
 dependencies = [
  "futures",
  "ic-cdk",
@@ -6021,6 +6014,7 @@ dependencies = [
 name = "ic-cketh-test-utils"
 version = "0.9.0"
 dependencies = [
+ "assert_matches",
  "candid",
  "ethers-core",
  "hex",
@@ -6107,9 +6101,11 @@ dependencies = [
  "ic-sys",
  "ic-test-artifact-pool",
  "ic-test-utilities",
+ "ic-test-utilities-consensus",
  "ic-test-utilities-logger",
  "ic-test-utilities-registry",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "phantom_newtype",
  "prometheus",
@@ -6172,8 +6168,10 @@ dependencies = [
  "ic-registry-proto-data-provider",
  "ic-test-artifact-pool",
  "ic-test-utilities",
+ "ic-test-utilities-consensus",
  "ic-test-utilities-registry",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "mockall",
  "slog",
@@ -6198,6 +6196,7 @@ dependencies = [
  "ic-test-utilities",
  "ic-test-utilities-registry",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "rand 0.8.5",
  "slog",
@@ -6271,7 +6270,6 @@ dependencies = [
  "ic-crypto-tls-interfaces",
  "ic-crypto-tree-hash",
  "ic-crypto-utils-basic-sig",
- "ic-crypto-utils-time",
  "ic-crypto-utils-tls",
  "ic-interfaces",
  "ic-interfaces-registry",
@@ -6348,9 +6346,11 @@ dependencies = [
 name = "ic-crypto-ed25519"
 version = "0.9.0"
 dependencies = [
+ "curve25519-dalek 3.2.0",
  "ed25519-dalek",
  "hex",
  "hex-literal",
+ "pem 1.1.1",
  "rand 0.8.5",
  "wycheproof",
  "zeroize",
@@ -6634,7 +6634,6 @@ dependencies = [
  "ic-crypto-test-utils-reproducible-rng",
  "ic-crypto-tls-interfaces",
  "ic-crypto-utils-basic-sig",
- "ic-crypto-utils-time",
  "ic-interfaces",
  "ic-logger",
  "ic-metrics",
@@ -6673,7 +6672,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "x509-parser 0.15.1",
+ "x509-parser",
  "zeroize",
 ]
 
@@ -6886,7 +6885,7 @@ dependencies = [
  "serde",
  "serde_cbor",
  "time",
- "x509-parser 0.15.1",
+ "x509-parser",
  "zeroize",
 ]
 
@@ -7052,7 +7051,6 @@ dependencies = [
  "ic-crypto-test-utils-reproducible-rng",
  "ic-crypto-tls-interfaces",
  "ic-crypto-utils-basic-sig",
- "ic-crypto-utils-time",
  "ic-interfaces",
  "ic-interfaces-registry",
  "ic-logger",
@@ -7286,7 +7284,7 @@ dependencies = [
  "ic-protobuf",
  "ic-types",
  "serde",
- "x509-parser 0.14.0",
+ "x509-parser",
 ]
 
 [[package]]
@@ -7305,7 +7303,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
- "x509-parser 0.15.1",
+ "x509-parser",
 ]
 
 [[package]]
@@ -7317,6 +7315,7 @@ dependencies = [
  "ic-crypto-tls-interfaces",
  "mockall",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
@@ -7409,23 +7408,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "ic-crypto-utils-time"
-version = "0.9.0"
-dependencies = [
- "ic-interfaces",
- "ic-logger",
- "ic-types",
- "slog",
-]
-
-[[package]]
 name = "ic-crypto-utils-tls"
 version = "0.9.0"
 dependencies = [
  "ic-base-types",
  "ic-crypto-tls-interfaces",
  "tokio-rustls",
- "x509-parser 0.15.1",
+ "x509-parser",
 ]
 
 [[package]]
@@ -7459,6 +7448,7 @@ dependencies = [
  "ic-replicated-state",
  "ic-test-utilities",
  "ic-test-utilities-logger",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-wasm-types",
  "prometheus",
@@ -7494,8 +7484,9 @@ dependencies = [
  "ic-registry-routing-table",
  "ic-registry-subnet-type",
  "ic-state-manager",
- "ic-test-utilities",
+ "ic-test-utilities-consensus",
  "ic-test-utilities-registry",
+ "ic-test-utilities-types",
  "ic-types",
  "slog",
  "tokio",
@@ -7530,8 +7521,9 @@ dependencies = [
  "ic-registry-subnet-type",
  "ic-state-machine-tests",
  "ic-state-manager",
- "ic-test-utilities",
+ "ic-test-utilities-consensus",
  "ic-test-utilities-registry",
+ "ic-test-utilities-types",
  "ic-types",
  "rand 0.8.5",
  "slog",
@@ -7565,6 +7557,7 @@ dependencies = [
  "ic-test-utilities-execution-environment",
  "ic-test-utilities-logger",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-utils 0.9.0",
  "ic-utils-lru-cache",
@@ -7665,6 +7658,7 @@ dependencies = [
  "ic-test-utilities-logger",
  "ic-test-utilities-metrics",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-types-test-utils",
  "ic-universal-canister",
@@ -7793,6 +7787,7 @@ dependencies = [
  "ic-replicated-state",
  "ic-test-utilities",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-validator",
  "maplit",
@@ -7802,15 +7797,18 @@ dependencies = [
  "proptest",
  "prost",
  "rand 0.8.5",
+ "reqwest",
  "serde",
  "serde_bytes",
  "serde_cbor",
  "slog",
  "strum 0.25.0",
  "tempfile",
+ "thiserror",
  "threadpool",
  "tokio",
  "tokio-io-timeout",
+ "tokio-rustls",
  "tower",
  "tower-http 0.5.1",
  "tower-test",
@@ -7886,8 +7884,8 @@ dependencies = [
  "ic-management-canister-types",
  "ic-metrics",
  "ic-registry-subnet-type",
- "ic-test-utilities",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "prometheus",
  "slog",
@@ -7920,6 +7918,7 @@ dependencies = [
  "ic-test-utilities-logger",
  "ic-test-utilities-registry",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "mockall",
  "prometheus",
@@ -8058,13 +8057,20 @@ name = "ic-icrc-rosetta-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "candid",
+ "clap 4.4.6",
  "ed25519-consensus",
  "hex",
+ "ic-agent",
+ "ic-crypto-ecdsa-secp256k1",
+ "ic-crypto-ed25519",
  "ic-icrc-rosetta",
  "ic-rosetta-api",
+ "icrc-ledger-types",
  "reqwest",
  "rosetta-core",
  "serde",
+ "tokio",
  "url",
 ]
 
@@ -8072,7 +8078,9 @@ dependencies = [
 name = "ic-icrc-rosetta-runner"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "candid",
+ "icrc-ledger-types",
  "tempfile",
  "tokio",
 ]
@@ -8428,6 +8436,7 @@ dependencies = [
  "ic-test-utilities-logger",
  "ic-test-utilities-registry",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-validator",
  "prometheus",
@@ -8847,6 +8856,7 @@ dependencies = [
  "ic-test-utilities-metrics",
  "ic-test-utilities-registry",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-utils 0.9.0",
  "lazy_static",
@@ -8998,6 +9008,7 @@ version = "0.0.1"
 dependencies = [
  "ic-base-types",
  "ic-stable-structures",
+ "ic_principal",
  "maplit",
  "num-traits",
 ]
@@ -9557,6 +9568,7 @@ dependencies = [
  "dfn_http",
  "dfn_json",
  "dfn_protobuf",
+ "flate2",
  "futures",
  "ic-base-types",
  "ic-btc-interface",
@@ -9592,6 +9604,7 @@ dependencies = [
  "ic-sns-wasm",
  "ic-state-machine-tests",
  "ic-test-utilities",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-utils 0.9.0",
  "icp-ledger",
@@ -9625,6 +9638,7 @@ dependencies = [
  "ic-artifact-manager",
  "ic-artifact-pool",
  "ic-config",
+ "ic-crypto-tls-interfaces",
  "ic-cycles-account-manager",
  "ic-execution-environment",
  "ic-https-outcalls-adapter-client",
@@ -9643,8 +9657,11 @@ dependencies = [
  "ic-registry-subnet-type",
  "ic-replica-setup-ic-network",
  "ic-test-utilities",
+ "ic-test-utilities-consensus",
  "ic-test-utilities-metrics",
  "ic-test-utilities-registry",
+ "ic-test-utilities-types",
+ "ic-transport",
  "ic-types",
  "linked-hash-map",
  "lru",
@@ -9693,6 +9710,7 @@ dependencies = [
  "ic-state-sync-manager",
  "ic-test-utilities",
  "ic-test-utilities-registry",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-types-test-utils",
  "mockall",
@@ -9896,8 +9914,9 @@ dependencies = [
  "ic-registry-subnet-features",
  "ic-replay",
  "ic-state-manager",
- "ic-test-utilities",
+ "ic-test-utilities-consensus",
  "ic-test-utilities-tmpdir",
+ "ic-test-utilities-types",
  "ic-types",
  "prost",
  "reqwest",
@@ -10146,7 +10165,7 @@ dependencies = [
  "candid",
  "ic-base-types",
  "ic-protobuf",
- "ic-test-utilities",
+ "ic-test-utilities-types",
  "serde",
 ]
 
@@ -10209,6 +10228,7 @@ dependencies = [
  "ic-consensus",
  "ic-consensus-utils",
  "ic-crypto-for-verification-only",
+ "ic-crypto-test-utils-ni-dkg",
  "ic-cycles-account-manager",
  "ic-execution-environment",
  "ic-interfaces",
@@ -10232,16 +10252,19 @@ dependencies = [
  "ic-registry-transport",
  "ic-replicated-state",
  "ic-state-manager",
- "ic-test-utilities",
+ "ic-test-utilities-consensus",
+ "ic-test-utilities-types",
  "ic-types",
  "icp-ledger",
  "prost",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "slog",
  "slog-async",
  "tempfile",
  "tokio",
+ "tower",
  "url",
 ]
 
@@ -10273,6 +10296,7 @@ dependencies = [
  "ic-interfaces-certified-stream-store",
  "ic-interfaces-registry",
  "ic-interfaces-registry-mocks",
+ "ic-interfaces-state-manager",
  "ic-logger",
  "ic-management-canister-types",
  "ic-messaging",
@@ -10339,7 +10363,6 @@ dependencies = [
  "ic-replicated-state",
  "ic-state-manager",
  "ic-state-sync-manager",
- "ic-transport",
  "ic-types",
  "slog",
  "tokio",
@@ -10381,6 +10404,7 @@ dependencies = [
  "ic-sys",
  "ic-test-utilities",
  "ic-test-utilities-logger",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-utils 0.9.0",
  "maplit",
@@ -10427,6 +10451,7 @@ dependencies = [
  "ic-test-utilities",
  "ic-test-utilities-metrics",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-utils 0.9.0",
  "ic-wasm-types",
@@ -10691,12 +10716,12 @@ dependencies = [
  "ic-protobuf",
  "ic-sns-governance",
  "ic-sns-governance-proposal-criticality",
+ "ic-sns-governance-proposals-amount-total-limit",
  "ic-sns-governance-protobuf-generator",
  "ic-sns-governance-token-valuation",
- "ic-sns-governance-treasury-transfer-limit",
  "ic-sns-test-utils",
- "ic-test-utilities",
  "ic-test-utilities-compare-dirs",
+ "ic-test-utilities-types",
  "ic-types",
  "icp-ledger",
  "icrc-ledger-client",
@@ -10728,6 +10753,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ic-sns-governance-proposals-amount-total-limit"
+version = "0.0.1"
+dependencies = [
+ "candid",
+ "ic-base-types",
+ "ic-sns-governance-token-valuation",
+ "icrc-ledger-types",
+ "lazy_static",
+ "num-traits",
+ "rust_decimal",
+ "rust_decimal_macros",
+]
+
+[[package]]
 name = "ic-sns-governance-protobuf-generator"
 version = "0.9.0"
 dependencies = [
@@ -10756,20 +10795,6 @@ dependencies = [
  "mockall",
  "rust_decimal",
  "tokio",
-]
-
-[[package]]
-name = "ic-sns-governance-treasury-transfer-limit"
-version = "0.0.1"
-dependencies = [
- "candid",
- "ic-base-types",
- "ic-sns-governance-token-valuation",
- "icrc-ledger-types",
- "lazy_static",
- "num-traits",
- "rust_decimal",
- "rust_decimal_macros",
 ]
 
 [[package]]
@@ -10951,6 +10976,7 @@ dependencies = [
  "proptest",
  "prost",
  "rust_decimal",
+ "rust_decimal_macros",
  "serde",
  "tempfile",
  "tokio",
@@ -11062,6 +11088,7 @@ dependencies = [
  "ic-state-machine-tests",
  "ic-test-utilities",
  "ic-test-utilities-compare-dirs",
+ "ic-test-utilities-types",
  "ic-types",
  "icp-ledger",
  "icrc-ledger-types",
@@ -11138,10 +11165,10 @@ dependencies = [
  "ic-protobuf",
  "ic-replicated-state",
  "ic-sys",
- "ic-test-utilities",
  "ic-test-utilities-logger",
  "ic-test-utilities-time",
  "ic-test-utilities-tmpdir",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-utils 0.9.0",
  "ic-wasm-types",
@@ -11205,6 +11232,7 @@ dependencies = [
  "ic-test-utilities-metrics",
  "ic-test-utilities-registry",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-universal-canister",
  "ic-xnet-payload-builder",
@@ -11256,10 +11284,12 @@ dependencies = [
  "ic-state-machine-tests",
  "ic-sys",
  "ic-test-utilities",
+ "ic-test-utilities-consensus",
  "ic-test-utilities-logger",
  "ic-test-utilities-metrics",
  "ic-test-utilities-time",
  "ic-test-utilities-tmpdir",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-utils 0.9.0",
  "ic-wasm-types",
@@ -11409,6 +11439,7 @@ dependencies = [
  "ic-sys",
  "ic-test-utilities",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-utils 0.9.0",
  "ic-wasm-types",
@@ -11435,7 +11466,9 @@ dependencies = [
  "ic-registry-client-helpers",
  "ic-replicated-state",
  "ic-test-utilities",
+ "ic-test-utilities-consensus",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
 ]
 
@@ -11468,17 +11501,13 @@ dependencies = [
 name = "ic-test-utilities"
 version = "0.9.0"
 dependencies = [
- "assert_matches",
  "async-trait",
- "bincode",
- "ed25519-consensus",
  "hex-literal",
  "ic-artifact-pool",
  "ic-base-types",
  "ic-btc-types-internal",
  "ic-canister-client-sender",
  "ic-config",
- "ic-consensus",
  "ic-crypto-interfaces-sig-verification",
  "ic-crypto-internal-types",
  "ic-crypto-sha2",
@@ -11501,7 +11530,6 @@ dependencies = [
  "ic-metrics",
  "ic-protobuf",
  "ic-registry-client-fake",
- "ic-registry-client-helpers",
  "ic-registry-keys",
  "ic-registry-proto-data-provider",
  "ic-registry-routing-table",
@@ -11512,6 +11540,7 @@ dependencies = [
  "ic-test-utilities-logger",
  "ic-test-utilities-registry",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-types-test-utils",
  "ic-universal-canister",
@@ -11520,9 +11549,7 @@ dependencies = [
  "mockall",
  "nix 0.24.3",
  "parking_lot 0.12.1",
- "phantom_newtype",
  "proptest",
- "prost",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rusty-fork",
@@ -11541,6 +11568,27 @@ dependencies = [
 [[package]]
 name = "ic-test-utilities-compare-dirs"
 version = "0.9.0"
+
+[[package]]
+name = "ic-test-utilities-consensus"
+version = "0.9.0"
+dependencies = [
+ "bincode",
+ "ic-base-types",
+ "ic-consensus",
+ "ic-interfaces",
+ "ic-interfaces-registry",
+ "ic-protobuf",
+ "ic-registry-client-helpers",
+ "ic-test-utilities",
+ "ic-test-utilities-registry",
+ "ic-test-utilities-types",
+ "ic-types",
+ "mockall",
+ "phantom_newtype",
+ "prost",
+ "serde",
+]
 
 [[package]]
 name = "ic-test-utilities-execution-environment"
@@ -11567,6 +11615,7 @@ dependencies = [
  "ic-system-api",
  "ic-test-utilities",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-types-test-utils",
  "ic-universal-canister",
@@ -11656,6 +11705,20 @@ name = "ic-test-utilities-tmpdir"
 version = "0.9.0"
 dependencies = [
  "tempfile",
+]
+
+[[package]]
+name = "ic-test-utilities-types"
+version = "0.9.0"
+dependencies = [
+ "assert_matches",
+ "bincode",
+ "ed25519-consensus",
+ "ic-canister-client-sender",
+ "ic-types",
+ "ic-types-test-utils",
+ "rand 0.8.5",
+ "serde_cbor",
 ]
 
 [[package]]
@@ -11891,6 +11954,7 @@ dependencies = [
  "ic-crypto-test-utils-root-of-trust",
  "ic-crypto-tree-hash",
  "ic-test-utilities",
+ "ic-test-utilities-types",
  "ic-types",
  "mockall",
  "rand 0.8.5",
@@ -12071,6 +12135,7 @@ dependencies = [
  "ic-test-utilities",
  "ic-test-utilities-logger",
  "ic-test-utilities-metrics",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-xnet-hyper",
  "maplit",
@@ -12103,6 +12168,7 @@ version = "0.9.0"
 dependencies = [
  "assert_matches",
  "async-trait",
+ "axum 0.7.4",
  "hyper 0.14.26",
  "ic-async-utils",
  "ic-base-types",
@@ -12128,10 +12194,12 @@ dependencies = [
  "ic-replicated-state",
  "ic-state-manager",
  "ic-test-utilities",
+ "ic-test-utilities-consensus",
  "ic-test-utilities-logger",
  "ic-test-utilities-metrics",
  "ic-test-utilities-registry",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-xnet-hyper",
  "ic-xnet-uri",
@@ -12144,7 +12212,6 @@ dependencies = [
  "reqwest",
  "slog",
  "tempfile",
- "tiny_http",
  "tokio",
  "url",
 ]
@@ -14440,10 +14507,11 @@ dependencies = [
  "ic-registry-proto-data-provider",
  "ic-registry-replicator",
  "ic-sys",
- "ic-test-utilities",
+ "ic-test-utilities-consensus",
  "ic-test-utilities-in-memory-logger",
  "ic-test-utilities-logger",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "indoc",
  "mockall",
@@ -15051,8 +15119,8 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_cbor",
+ "spec-compliance",
  "tempfile",
- "tests",
  "time",
  "tokio",
  "tower",
@@ -16065,6 +16133,7 @@ dependencies = [
  "ic-replica-tests",
  "ic-test-utilities",
  "ic-test-utilities-compare-dirs",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-types-test-utils",
  "ipnet",
@@ -16572,9 +16641,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-pki-types"
-version = "1.3.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "048a63e5b3ac996d78d402940b5fa47973d2d080c6c6fffa1d0f19c4445310b7"
+checksum = "9e9d979b3ce68192e42760c7810125eb6cf2ea10efae545a156063e61f314e2a"
 
 [[package]]
 name = "rustls-webpki"
@@ -17489,6 +17558,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "spec-compliance"
+version = "0.9.0"
+dependencies = [
+ "hyper 0.14.26",
+ "hyper-rustls",
+ "ic-registry-routing-table",
+ "ic-registry-subnet-features",
+ "ic-registry-subnet-type",
+ "ic-types",
+ "slog",
+ "tests",
+]
+
+[[package]]
 name = "spin"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17996,6 +18079,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "testing-verifcation-tests"
+version = "0.9.0"
+dependencies = [
+ "anyhow",
+ "ic-registry-subnet-type",
+ "spec-compliance",
+ "tests",
+]
+
+[[package]]
 name = "testnets"
 version = "0.9.0"
 dependencies = [
@@ -18113,6 +18206,7 @@ dependencies = [
  "ic-test-identity",
  "ic-test-utilities",
  "ic-test-utilities-time",
+ "ic-test-utilities-types",
  "ic-types",
  "ic-types-test-utils",
  "ic-universal-canister",
@@ -18290,19 +18384,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c9d3793400a45f954c52e73d068316d76b6f4e36977e3fcebb13a2721e80237"
 dependencies = [
  "crunchy",
-]
-
-[[package]]
-name = "tiny_http"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5f8734c6d6943ad6df6b588d228a87b4af184998bcffa268ceddf05c2055a8c"
-dependencies = [
- "ascii",
- "chunked_transfer",
- "log",
- "time",
- "url",
 ]
 
 [[package]]
@@ -20108,24 +20189,6 @@ dependencies = [
 
 [[package]]
 name = "x509-parser"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0ecbeb7b67ce215e40e3cc7f2ff902f94a223acf44995934763467e7b1febc8"
-dependencies = [
- "asn1-rs",
- "base64 0.13.1",
- "data-encoding",
- "der-parser",
- "lazy_static",
- "nom",
- "oid-registry",
- "rusticata-macros",
- "thiserror",
- "time",
-]
-
-[[package]]
-name = "x509-parser"
 version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7069fba5b66b9193bd2c5d3d4ff12b839118f6bcbef5328efafafb5395cf63da"
@@ -20136,7 +20199,6 @@ dependencies = [
  "lazy_static",
  "nom",
  "oid-registry",
- "ring 0.16.20",
  "rusticata-macros",
  "thiserror",
  "time",

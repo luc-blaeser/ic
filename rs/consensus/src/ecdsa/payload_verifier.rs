@@ -611,7 +611,8 @@ mod test {
     use ic_crypto_test_utils_reproducible_rng::reproducible_rng;
     use ic_logger::replica_logger::no_op_logger;
     use ic_management_canister_types::{EcdsaKeyId, Payload, SignWithECDSAReply};
-    use ic_test_utilities::{crypto::CryptoReturningOk, types::ids::subnet_test_id};
+    use ic_test_utilities::crypto::CryptoReturningOk;
+    use ic_test_utilities_types::ids::subnet_test_id;
     use ic_types::{
         consensus::ecdsa::{CompletedSignature, TranscriptAttributes},
         crypto::AlgorithmId,
@@ -1219,6 +1220,7 @@ mod test {
             response_payload: ic_types::messages::Payload::Data(
                 SignWithECDSAReply { signature: vec![] }.encode(),
             ),
+            deadline: fake_context.request.deadline,
         });
 
         // Insert agreement for incomplete context

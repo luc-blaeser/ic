@@ -23,15 +23,12 @@ use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::page_map::TestPageAllocatorFileDescriptorImpl;
 use ic_replicated_state::{CallOrigin, CanisterState, NetworkTopology, ReplicatedState};
 use ic_system_api::{ExecutionParameters, InstructionLimits};
-use ic_test_utilities::types::ids::subnet_test_id;
-use ic_test_utilities::{
-    state::canister_from_exec_state,
-    types::ids::{canister_test_id, user_test_id},
-    types::messages::IngressBuilder,
-};
+use ic_test_utilities::state::canister_from_exec_state;
 use ic_test_utilities_execution_environment::generate_network_topology;
+use ic_test_utilities_types::ids::{canister_test_id, subnet_test_id, user_test_id};
+use ic_test_utilities_types::messages::IngressBuilder;
 use ic_types::{
-    messages::{CallbackId, CanisterMessage, Payload, RejectContext, RequestMetadata},
+    messages::{CallbackId, CanisterMessage, Payload, RejectContext, RequestMetadata, NO_DEADLINE},
     methods::{Callback, WasmClosure},
     time::UNIX_EPOCH,
     Cycles, MemoryAllocation, NumBytes, NumInstructions, Time,
@@ -107,8 +104,11 @@ where
     canister_state.system_state.freeze_threshold = 0.into();
 
     // Create call context and callback
-    let call_origin =
-        CallOrigin::CanisterUpdate(canister_test_id(REMOTE_CANISTER_ID), CallbackId::new(0));
+    let call_origin = CallOrigin::CanisterUpdate(
+        canister_test_id(REMOTE_CANISTER_ID),
+        CallbackId::new(0),
+        NO_DEADLINE,
+    );
     let call_context_id = canister_state
         .system_state
         .call_context_manager_mut()
@@ -129,6 +129,7 @@ where
         WasmClosure::new(0, 1),
         WasmClosure::new(0, 1),
         None,
+        NO_DEADLINE,
     );
 
     // Create an Ingress message

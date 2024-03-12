@@ -22,10 +22,11 @@ use ic_management_canister_types::EcdsaKeyId;
 use ic_metrics::MetricsRegistry;
 use ic_replicated_state::metadata_state::subnet_call_context_manager::SignWithEcdsaContext;
 use ic_replicated_state::ReplicatedState;
-use ic_test_utilities::consensus::{fake::*, EcdsaStatsNoOp};
+use ic_test_artifact_pool::consensus_pool::TestConsensusPool;
 use ic_test_utilities::state::ReplicatedStateBuilder;
-use ic_test_utilities::types::ids::{node_test_id, NODE_1, NODE_2};
-use ic_test_utilities::types::messages::RequestBuilder;
+use ic_test_utilities_consensus::{fake::*, EcdsaStatsNoOp};
+use ic_test_utilities_types::ids::{node_test_id, NODE_1, NODE_2};
+use ic_test_utilities_types::messages::RequestBuilder;
 use ic_types::artifact::EcdsaMessageId;
 use ic_types::consensus::certification::Certification;
 use ic_types::consensus::ecdsa::{
@@ -47,11 +48,10 @@ use ic_types::crypto::canister_threshold_sig::{
     ThresholdEcdsaSigShare,
 };
 use ic_types::crypto::AlgorithmId;
-use ic_types::messages::CallbackId;
-use ic_types::{signature::*, Time};
-use ic_types::{
-    time::UNIX_EPOCH, Height, NodeId, PrincipalId, Randomness, RegistryVersion, SubnetId,
-};
+use ic_types::messages::{CallbackId, NO_DEADLINE};
+use ic_types::signature::*;
+use ic_types::time::UNIX_EPOCH;
+use ic_types::{Height, NodeId, PrincipalId, Randomness, RegistryVersion, SubnetId, Time};
 use rand::{CryptoRng, Rng};
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryFrom;
@@ -70,6 +70,7 @@ pub(crate) fn empty_response() -> ic_types::messages::Response {
         // be refunded to the canister.
         refund: ic_types::Cycles::new(0),
         response_payload: ic_types::messages::Payload::Data(vec![]),
+        deadline: NO_DEADLINE,
     }
 }
 
@@ -656,6 +657,26 @@ pub(crate) fn create_pre_signer_dependencies_with_crypto(
 }
 
 // Sets up the dependencies and creates the pre signer
+pub(crate) fn create_pre_signer_dependencies_and_pool(
+    pool_config: ArtifactPoolConfig,
+    logger: ReplicaLogger,
+) -> (EcdsaPoolImpl, EcdsaPreSignerImpl, TestConsensusPool) {
+    let metrics_registry = MetricsRegistry::new();
+    let Dependencies { pool, crypto, .. } = dependencies(pool_config.clone(), 1);
+
+    let pre_signer = EcdsaPreSignerImpl::new(
+        NODE_1,
+        pool.get_block_cache(),
+        crypto,
+        metrics_registry.clone(),
+        logger.clone(),
+    );
+    let ecdsa_pool = create_ecdsa_pool(pool_config, logger, metrics_registry);
+
+    (ecdsa_pool, pre_signer, pool)
+}
+
+// Sets up the dependencies and creates the pre signer
 pub(crate) fn create_pre_signer_dependencies(
     pool_config: ArtifactPoolConfig,
     logger: ReplicaLogger,
@@ -762,6 +783,26 @@ pub(crate) fn create_complaint_dependencies_with_crypto_and_node_id(
     let ecdsa_pool = create_ecdsa_pool(pool_config, logger, metrics_registry);
 
     (ecdsa_pool, complaint_handler)
+}
+
+// Sets up the dependencies and creates the complaint handler
+pub(crate) fn create_complaint_dependencies_and_pool(
+    pool_config: ArtifactPoolConfig,
+    logger: ReplicaLogger,
+) -> (EcdsaPoolImpl, EcdsaComplaintHandlerImpl, TestConsensusPool) {
+    let metrics_registry = MetricsRegistry::new();
+    let Dependencies { pool, crypto, .. } = dependencies(pool_config.clone(), 1);
+
+    let complaint_handler = EcdsaComplaintHandlerImpl::new(
+        NODE_1,
+        pool.get_block_cache(),
+        crypto,
+        metrics_registry.clone(),
+        logger.clone(),
+    );
+    let ecdsa_pool = create_ecdsa_pool(pool_config, logger, metrics_registry);
+
+    (ecdsa_pool, complaint_handler, pool)
 }
 
 pub(crate) fn create_complaint_dependencies(

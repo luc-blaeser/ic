@@ -30,6 +30,7 @@ use ic_types::crypto::canister_threshold_sig::{ExtendedDerivationPath, MasterEcd
 use ic_types::registry::RegistryClientError;
 use ic_types::{Height, RegistryVersion, SubnetId};
 use phantom_newtype::Id;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryInto;
 use std::sync::Arc;
@@ -504,6 +505,13 @@ fn get_ecdsa_subnet_public_key_(
     }
 }
 
+/// Updates the latest purge height, and returns true if
+/// it increased. Otherwise returns false.
+pub(crate) fn update_purge_height(cell: &RefCell<Height>, new_height: Height) -> bool {
+    let prev_purge_height = cell.replace(new_height);
+    new_height > prev_purge_height
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -522,11 +530,9 @@ mod tests {
     use ic_registry_client_fake::FakeRegistryClient;
     use ic_registry_keys::make_ecdsa_signing_subnet_list_key;
     use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
-    use ic_test_utilities::{
-        consensus::fake::Fake,
-        types::ids::{node_test_id, subnet_test_id},
-    };
+    use ic_test_utilities_consensus::fake::Fake;
     use ic_test_utilities_registry::{add_subnet_record, SubnetRecordBuilder};
+    use ic_test_utilities_types::ids::{node_test_id, subnet_test_id};
     use ic_types::{
         batch::ValidationContext,
         consensus::{

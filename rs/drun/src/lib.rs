@@ -31,7 +31,7 @@ use ic_registry_routing_table::{routing_table_insert_subnet, RoutingTable};
 use ic_registry_subnet_type::SubnetType;
 use ic_state_machine_tests::certify_latest_state_helper;
 use ic_state_manager::StateManagerImpl;
-use ic_test_utilities::consensus::fake::FakeVerifier;
+use ic_test_utilities_consensus::fake::FakeVerifier;
 use ic_test_utilities_registry::{
     add_subnet_record, insert_initial_dkg_transcript, SubnetRecordBuilder,
 };
@@ -225,7 +225,7 @@ pub async fn run_drun(uo: DrunOptions) -> Result<(), String> {
         None,
         ic_types::malicious_flags::MaliciousFlags::default(),
     ));
-    let (_, ingress_history_writer, ingress_hist_reader, _, query_handler, _, scheduler) =
+    let (_, ingress_history_writer, ingress_hist_reader, query_handler, _, scheduler) =
         ExecutionServices::setup_execution(
             log.clone().into(),
             &metrics_registry,

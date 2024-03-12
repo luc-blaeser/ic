@@ -10,15 +10,16 @@ use ic_interfaces::{
     crypto::{MultiSigner, ThresholdSigner},
     dkg::DkgPool,
     p2p::consensus::{ChangeResult, MutablePool},
-    time_source::MonotonicTimeSource,
+    time_source::TimeSource,
 };
 use ic_interfaces_registry::RegistryClient;
 use ic_interfaces_state_manager::StateManager;
 use ic_logger::replica_logger::no_op_logger;
 use ic_registry_client_helpers::subnet::SubnetRegistry;
 use ic_replicated_state::ReplicatedState;
-use ic_test_utilities::types::ids::{node_test_id, subnet_test_id};
-use ic_test_utilities::{consensus::fake::*, crypto::CryptoReturningOk};
+use ic_test_utilities::crypto::CryptoReturningOk;
+use ic_test_utilities_consensus::fake::*;
+use ic_test_utilities_types::ids::{node_test_id, subnet_test_id};
 use ic_types::signature::*;
 use ic_types::{artifact::ConsensusMessageId, batch::ValidationContext};
 use ic_types::{
@@ -36,7 +37,7 @@ pub struct TestConsensusPool {
     subnet_id: SubnetId,
     registry_client: Arc<dyn RegistryClient>,
     pool: ConsensusPoolImpl,
-    time_source: Arc<dyn MonotonicTimeSource>,
+    time_source: Arc<dyn TimeSource>,
     dkg_payload_builder:
         Box<dyn Fn(&dyn ConsensusPool, Block, &ValidationContext) -> consensus::dkg::Payload>,
 }
@@ -166,7 +167,7 @@ impl TestConsensusPool {
         node_id: NodeId,
         subnet_id: SubnetId,
         pool_config: ArtifactPoolConfig,
-        time_source: Arc<dyn MonotonicTimeSource>,
+        time_source: Arc<dyn TimeSource>,
         registry_client: Arc<dyn RegistryClient>,
         crypto: Arc<CryptoReturningOk>,
         state_manager: Arc<dyn StateManager<State = ReplicatedState>>,
@@ -190,7 +191,7 @@ impl TestConsensusPool {
         let pool = ConsensusPoolImpl::new(
             node_id,
             subnet_id,
-            (&ic_test_utilities::consensus::make_genesis(summary)).into(),
+            (&ic_test_utilities_consensus::make_genesis(summary)).into(),
             pool_config,
             ic_metrics::MetricsRegistry::new(),
             no_op_logger(),

@@ -1012,8 +1012,7 @@ fn serialize_canister_to_tip(
                 .clone(),
             total_query_stats: canister_state.scheduler_state.total_query_stats.clone(),
             log_visibility: canister_state.system_state.log_visibility,
-            canister_log_records: canister_state.system_state.canister_log_records.clone(),
-            next_canister_log_record_idx: canister_state.system_state.next_canister_log_record_idx,
+            canister_log: canister_state.system_state.canister_log.clone(),
         }
         .into(),
     )?;
@@ -1269,9 +1268,9 @@ mod test {
     use super::*;
     use ic_config::state_manager::lsmt_config_default;
     use ic_metrics::MetricsRegistry;
-    use ic_test_utilities::types::ids::canister_test_id;
     use ic_test_utilities_logger::with_test_replica_logger;
     use ic_test_utilities_tmpdir::tmpdir;
+    use ic_test_utilities_types::ids::canister_test_id;
 
     #[test]
     fn dont_crash_or_hang() {

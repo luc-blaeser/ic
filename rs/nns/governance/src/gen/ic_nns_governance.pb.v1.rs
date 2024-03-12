@@ -533,7 +533,7 @@ pub struct Proposal {
     #[prost(string, optional, tag = "20")]
     pub title: ::core::option::Option<::prost::alloc::string::String>,
     /// Text providing a short description of the proposal, composed
-    /// using a maximum of 15000 bytes of characters.
+    /// using a maximum of 30000 bytes of characters.
     #[prost(string, tag = "1")]
     pub summary: ::prost::alloc::string::String,
     /// The Web address of additional content required to evaluate the
@@ -1875,7 +1875,7 @@ pub struct NetworkEconomics {
     #[prost(message, optional, tag = "11")]
     pub neurons_fund_economics: ::core::option::Option<NeuronsFundEconomics>,
 }
-/// The thresholds specify the shape of the matching function used by the Neurons' Fund to
+/// The thresholds specify the shape of the ideal matching function used by the Neurons' Fund to
 /// determine how much to contribute for a given direct participation amount. Note that the actual
 /// swap participation is in ICP, whereas these thresholds are specifid in XDR; the conversion rate
 /// is determined at the time of execution of the CreateServiceNervousSystem proposal.
@@ -1887,12 +1887,17 @@ pub struct NeuronsFundMatchedFundingCurveCoefficients {
     #[prost(message, optional, tag = "1")]
     pub contribution_threshold_xdr:
         ::core::option::Option<::ic_nervous_system_proto::pb::v1::Decimal>,
-    /// At this amount of direct participation, the Neurons' Fund contributes 50% of that amount.
+    /// Say the direct participation amount is `x_icp`. When `x_icp` equals the equavalent of
+    /// `one_third_participation_milestone_xdr` in ICP (we use ICP/XDR conversion data from the CMC),
+    /// the Neurons' Fund contributes 50% on top of that amount, so the overall contributions would
+    /// be `1.5 * x_icp` of which 1/3 comes from the Neurons' Fund.
     #[prost(message, optional, tag = "2")]
     pub one_third_participation_milestone_xdr:
         ::core::option::Option<::ic_nervous_system_proto::pb::v1::Decimal>,
-    /// At this amount of direct participation, the Neurons' Fund contributes 100% of that amount.
-    /// This is the maximum participation rate of the Neurons' Fund.
+    /// Say the direct participation amount is `x_icp`. When `x_icp` equals the equavalent of
+    /// `full_participation_milestone_xdr` in ICP (we use ICP/XDR conversion data from the CMC),
+    /// the Neurons' Fund contributes 100% on top of that amount, so the overall contributions would
+    /// be `2.0 * x_icp` of which a half comes from the Neurons' Fund.
     #[prost(message, optional, tag = "3")]
     pub full_participation_milestone_xdr:
         ::core::option::Option<::ic_nervous_system_proto::pb::v1::Decimal>,
@@ -1919,6 +1924,14 @@ pub struct NeuronsFundEconomics {
     #[prost(message, optional, tag = "2")]
     pub neurons_fund_matched_funding_curve_coefficients:
         ::core::option::Option<NeuronsFundMatchedFundingCurveCoefficients>,
+    /// The minimum value of the ICP/XDR conversion rate used by the Neurons' Fund for converting
+    /// XDR values into ICP.
+    #[prost(message, optional, tag = "3")]
+    pub minimum_icp_xdr_rate: ::core::option::Option<::ic_nervous_system_proto::pb::v1::Percentage>,
+    /// The maximum value of the ICP/XDR conversion rate used by the Neurons' Fund for converting
+    /// XDR values into ICP.
+    #[prost(message, optional, tag = "4")]
+    pub maximum_icp_xdr_rate: ::core::option::Option<::ic_nervous_system_proto::pb::v1::Percentage>,
 }
 /// A reward event is an event at which neuron maturity is increased
 #[derive(candid::CandidType, candid::Deserialize, serde::Serialize, comparable::Comparable)]
@@ -2372,6 +2385,9 @@ pub struct Governance {
     /// This is the inverse of what is stored in a Neuron (its followees).
     #[prost(map = "int32, message", tag = "22")]
     pub topic_followee_index: ::std::collections::HashMap<i32, governance::FollowersMap>,
+    /// Local cache for XDR-related conversion rates (the source of truth is in the CMC canister).
+    #[prost(message, optional, tag = "26")]
+    pub xdr_conversion_rate: ::core::option::Option<XdrConversionRate>,
 }
 /// Nested message and enum types in `Governance`.
 pub mod governance {
@@ -2650,6 +2666,17 @@ pub mod governance {
             pub followers: ::prost::alloc::vec::Vec<::ic_nns_common::pb::v1::NeuronId>,
         }
     }
+}
+#[derive(candid::CandidType, candid::Deserialize, serde::Serialize, comparable::Comparable)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct XdrConversionRate {
+    /// / Time at which this rate has been fetched.
+    #[prost(uint64, optional, tag = "1")]
+    pub timestamp_seconds: ::core::option::Option<u64>,
+    /// / One ICP is worth this number of 1/10,000ths parts of an XDR.
+    #[prost(uint64, optional, tag = "2")]
+    pub xdr_permyriad_per_icp: ::core::option::Option<u64>,
 }
 /// Proposals with restricted voting are not included unless the caller
 /// is allowed to vote on them.

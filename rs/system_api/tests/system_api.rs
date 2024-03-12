@@ -9,26 +9,26 @@ use ic_interfaces::execution_environment::{
     SubnetAvailableMemory, SystemApi, TrapCode,
 };
 use ic_logger::replica_logger::no_op_logger;
-use ic_management_canister_types::DataSize;
+use ic_management_canister_types::{DataSize, MAX_ALLOWED_CANISTER_LOG_BUFFER_SIZE};
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::{
     testing::CanisterQueuesTesting, CallOrigin, Memory, NetworkTopology, SystemState,
 };
 use ic_system_api::{
-    sandbox_safe_system_state::{SandboxSafeSystemState, MAX_ALLOWED_CANISTER_LOG_BUFFER_SIZE},
-    ApiType, DefaultOutOfInstructionsHandler, NonReplicatedQueryKind, SystemApiImpl,
+    sandbox_safe_system_state::SandboxSafeSystemState, ApiType, DefaultOutOfInstructionsHandler,
+    NonReplicatedQueryKind, SystemApiImpl,
 };
 use ic_test_utilities::{
-    cycles_account_manager::CyclesAccountManagerBuilder,
-    state::SystemStateBuilder,
-    types::{
-        ids::{call_context_test_id, canister_test_id, subnet_test_id, user_test_id},
-        messages::RequestBuilder,
-    },
+    cycles_account_manager::CyclesAccountManagerBuilder, state::SystemStateBuilder,
+};
+use ic_test_utilities_types::{
+    ids::{call_context_test_id, canister_test_id, subnet_test_id, user_test_id},
+    messages::RequestBuilder,
 };
 use ic_types::{
     messages::{
         CallContextId, CallbackId, RejectContext, RequestMetadata, MAX_RESPONSE_COUNT_BYTES,
+        NO_DEADLINE,
     },
     methods::{Callback, WasmClosure},
     time,
@@ -1168,7 +1168,7 @@ fn test_canister_balance() {
         .call_context_manager_mut()
         .unwrap()
         .new_call_context(
-            CallOrigin::CanisterUpdate(canister_test_id(33), CallbackId::from(5)),
+            CallOrigin::CanisterUpdate(canister_test_id(33), CallbackId::from(5), NO_DEADLINE),
             Cycles::new(50),
             Time::from_nanos_since_unix_epoch(0),
             RequestMetadata::new(0, UNIX_EPOCH),
@@ -1197,7 +1197,7 @@ fn test_canister_cycle_balance() {
         .call_context_manager_mut()
         .unwrap()
         .new_call_context(
-            CallOrigin::CanisterUpdate(canister_test_id(33), CallbackId::from(5)),
+            CallOrigin::CanisterUpdate(canister_test_id(33), CallbackId::from(5), NO_DEADLINE),
             Cycles::new(50),
             Time::from_nanos_since_unix_epoch(0),
             RequestMetadata::new(0, UNIX_EPOCH),
@@ -1232,7 +1232,7 @@ fn test_msg_cycles_available_traps() {
         .call_context_manager_mut()
         .unwrap()
         .new_call_context(
-            CallOrigin::CanisterUpdate(canister_test_id(33), CallbackId::from(5)),
+            CallOrigin::CanisterUpdate(canister_test_id(33), CallbackId::from(5), NO_DEADLINE),
             available_cycles,
             Time::from_nanos_since_unix_epoch(0),
             RequestMetadata::new(0, UNIX_EPOCH),
@@ -1394,7 +1394,7 @@ fn msg_cycles_accept_all_cycles_in_call_context() {
         .call_context_manager_mut()
         .unwrap()
         .new_call_context(
-            CallOrigin::CanisterUpdate(canister_test_id(33), CallbackId::from(5)),
+            CallOrigin::CanisterUpdate(canister_test_id(33), CallbackId::from(5), NO_DEADLINE),
             Cycles::from(amount),
             Time::from_nanos_since_unix_epoch(0),
             RequestMetadata::new(0, UNIX_EPOCH),
@@ -1418,7 +1418,7 @@ fn msg_cycles_accept_all_cycles_in_call_context_when_more_asked() {
         .call_context_manager_mut()
         .unwrap()
         .new_call_context(
-            CallOrigin::CanisterUpdate(canister_test_id(33), CallbackId::from(5)),
+            CallOrigin::CanisterUpdate(canister_test_id(33), CallbackId::from(5), NO_DEADLINE),
             Cycles::new(40),
             Time::from_nanos_since_unix_epoch(0),
             RequestMetadata::new(0, UNIX_EPOCH),
@@ -1451,7 +1451,7 @@ fn call_perform_not_enough_cycles_does_not_trap() {
         .call_context_manager_mut()
         .unwrap()
         .new_call_context(
-            CallOrigin::CanisterUpdate(canister_test_id(33), CallbackId::from(5)),
+            CallOrigin::CanisterUpdate(canister_test_id(33), CallbackId::from(5), NO_DEADLINE),
             Cycles::new(40),
             Time::from_nanos_since_unix_epoch(0),
             RequestMetadata::new(0, UNIX_EPOCH),
@@ -1578,6 +1578,7 @@ fn push_output_request_respects_memory_limits() {
             WasmClosure::new(0, 0),
             WasmClosure::new(0, 0),
             None,
+            NO_DEADLINE,
         ))
         .unwrap();
     let mut api = SystemApiImpl::new(
@@ -1686,6 +1687,7 @@ fn push_output_request_oversized_request_memory_limits() {
             WasmClosure::new(0, 0),
             WasmClosure::new(0, 0),
             None,
+            NO_DEADLINE,
         ))
         .unwrap();
     let mut api = SystemApiImpl::new(
@@ -1885,12 +1887,12 @@ fn test_save_log_message_adds_canister_log_records() {
         &SystemStateBuilder::default().build(),
         CyclesAccountManagerBuilder::new().build(),
     );
-    let initial_records_number = api.canister_log_records().len();
+    let initial_records_number = api.canister_log().records().len();
     // Save several log messages.
     for message in &messages {
         api.save_log_message(0, message.len() as u32, message);
     }
-    let records = api.canister_log_records();
+    let records = api.canister_log().records();
     // Expect increased number of log records and the content to match the messages.
     assert_eq!(records.len(), initial_records_number + messages.len());
     for (i, message) in messages.into_iter().enumerate() {
@@ -1908,11 +1910,11 @@ fn test_save_log_message_invalid_message_size() {
         &SystemStateBuilder::default().build(),
         CyclesAccountManagerBuilder::new().build(),
     );
-    let initial_records_number = api.canister_log_records().len();
+    let initial_records_number = api.canister_log().records().len();
     // Save a log message.
     api.save_log_message(0, invalid_size, message);
     // Expect added log record with an error message.
-    let records = api.canister_log_records();
+    let records = api.canister_log().records();
     assert_eq!(records.len(), initial_records_number + 1);
     assert_eq!(
         String::from_utf8(records.back().unwrap().content.clone()).unwrap(),
@@ -1929,11 +1931,11 @@ fn test_save_log_message_invalid_message_offset() {
         &SystemStateBuilder::default().build(),
         CyclesAccountManagerBuilder::new().build(),
     );
-    let initial_records_number = api.canister_log_records().len();
+    let initial_records_number = api.canister_log().records().len();
     // Save a log message.
     api.save_log_message(invalid_src, message.len() as u32, message);
     // Expect added log record with an error message.
-    let records = api.canister_log_records();
+    let records = api.canister_log().records();
     assert_eq!(records.len(), initial_records_number + 1);
     assert_eq!(
         String::from_utf8(records.back().unwrap().content.clone()).unwrap(),
@@ -1949,12 +1951,12 @@ fn test_save_log_message_trims_long_message() {
         &SystemStateBuilder::default().build(),
         CyclesAccountManagerBuilder::new().build(),
     );
-    let initial_records_number = api.canister_log_records().len();
+    let initial_records_number = api.canister_log().records().len();
     // Save a long log message.
     let bytes = vec![b'x'; long_message_size];
     api.save_log_message(0, bytes.len() as u32, &bytes);
     // Expect added log record with the content trimmed to the allowed size.
-    let records = api.canister_log_records();
+    let records = api.canister_log().records();
     assert_eq!(records.len(), initial_records_number + 1);
     assert!(records.back().unwrap().content.len() <= MAX_ALLOWED_CANISTER_LOG_BUFFER_SIZE);
 }
@@ -1968,14 +1970,14 @@ fn test_save_log_message_keeps_total_log_size_limited() {
         &SystemStateBuilder::default().build(),
         CyclesAccountManagerBuilder::new().build(),
     );
-    let initial_records_number = api.canister_log_records().len();
+    let initial_records_number = api.canister_log().records().len();
     // Save several long messages.
     for _ in 0..messages_number {
         let bytes = vec![b'x'; long_message_size];
         api.save_log_message(0, bytes.len() as u32, &bytes);
     }
     // Expect only one log record to be kept, with the total size kept within the limit.
-    let records = api.canister_log_records();
+    let records = api.canister_log().records();
     assert_eq!(records.len(), initial_records_number + 1);
     assert!(records.data_size() <= MAX_ALLOWED_CANISTER_LOG_BUFFER_SIZE);
 }

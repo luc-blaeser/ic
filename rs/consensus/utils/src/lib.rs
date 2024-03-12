@@ -3,7 +3,7 @@ use crate::{crypto::Aggregate, membership::Membership, pool_reader::PoolReader};
 use ic_interfaces::{
     consensus::{PayloadTransientError, PayloadValidationError},
     consensus_pool::ConsensusPoolCache,
-    time_source::MonotonicTimeSource,
+    time_source::TimeSource,
     validation::ValidationError,
 };
 use ic_interfaces_registry::RegistryClient;
@@ -119,7 +119,7 @@ pub fn is_time_to_make_block(
     pool: &PoolReader<'_>,
     height: Height,
     rank: Rank,
-    time_source: &dyn MonotonicTimeSource,
+    time_source: &dyn TimeSource,
 ) -> bool {
     let registry_version = match pool.registry_version(height) {
         Some(rv) => rv,
@@ -581,14 +581,12 @@ mod tests {
     use ic_consensus_mocks::{dependencies_with_subnet_params, Dependencies};
     use ic_management_canister_types::EcdsaKeyId;
     use ic_replicated_state::metadata_state::subnet_call_context_manager::SignWithEcdsaContext;
-    use ic_test_utilities::{
-        state::ReplicatedStateBuilder,
-        types::{
-            ids::{node_test_id, subnet_test_id},
-            messages::RequestBuilder,
-        },
-    };
+    use ic_test_utilities::state::ReplicatedStateBuilder;
     use ic_test_utilities_registry::SubnetRecordBuilder;
+    use ic_test_utilities_types::{
+        ids::{node_test_id, subnet_test_id},
+        messages::RequestBuilder,
+    };
     use ic_types::{
         consensus::ecdsa::{
             EcdsaKeyTranscript, EcdsaUIDGenerator, KeyTranscriptCreation, MaskedTranscript,

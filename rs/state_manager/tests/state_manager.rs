@@ -12,7 +12,7 @@ use ic_crypto_tree_hash::{
     Path as LabelPath,
 };
 use ic_interfaces::certification::Verifier;
-use ic_interfaces::p2p::state_sync::{ChunkId, StateSyncArtifactId, StateSyncClient};
+use ic_interfaces::p2p::state_sync::{ChunkId, Chunkable, StateSyncArtifactId, StateSyncClient};
 use ic_interfaces_certified_stream_store::{CertifiedStreamStore, EncodeStreamError};
 use ic_interfaces_state_manager::*;
 use ic_logger::replica_logger::no_op_logger;
@@ -25,29 +25,32 @@ use ic_replicated_state::{
     metadata_state::ApiBoundaryNodeEntry, page_map::PageIndex, testing::ReplicatedStateTesting,
     Memory, NetworkTopology, NumWasmPages, PageMap, ReplicatedState, Stream, SubnetTopology,
 };
-use ic_state_layout::{CheckpointLayout, ReadOnly, StateLayout, SYSTEM_METADATA_FILE};
+use ic_state_layout::{CheckpointLayout, ReadOnly, StateLayout, SYSTEM_METADATA_FILE, WASM_FILE};
 use ic_state_machine_tests::{StateMachine, StateMachineBuilder};
 use ic_state_manager::manifest::{build_meta_manifest, manifest_from_path, validate_manifest};
 use ic_state_manager::{
-    state_sync::types::{
-        DEFAULT_CHUNK_SIZE, FILE_GROUP_CHUNK_ID_OFFSET, MANIFEST_CHUNK_ID_OFFSET,
-        META_MANIFEST_CHUNK,
+    state_sync::{
+        types::{
+            StateSyncMessage, DEFAULT_CHUNK_SIZE, FILE_GROUP_CHUNK_ID_OFFSET,
+            MANIFEST_CHUNK_ID_OFFSET, META_MANIFEST_CHUNK,
+        },
+        StateSync,
     },
     DirtyPageMap, PageMapType, StateManagerImpl,
 };
 use ic_sys::PAGE_SIZE;
 use ic_test_utilities::{
-    consensus::fake::FakeVerifier,
     io::{make_mutable, make_readonly, write_all_at},
-    state::{arb_stream, arb_stream_slice, canister_ids},
-    types::{
-        ids::{canister_test_id, message_test_id, node_test_id, subnet_test_id, user_test_id},
-        messages::RequestBuilder,
-    },
+    state::{arb_stream, arb_stream_slice, arb_stream_with_config, canister_ids},
 };
+use ic_test_utilities_consensus::fake::FakeVerifier;
 use ic_test_utilities_logger::with_test_replica_logger;
 use ic_test_utilities_metrics::{fetch_int_counter_vec, fetch_int_gauge, Labels};
 use ic_test_utilities_tmpdir::tmpdir;
+use ic_test_utilities_types::{
+    ids::{canister_test_id, message_test_id, node_test_id, subnet_test_id, user_test_id},
+    messages::RequestBuilder,
+};
 use ic_types::batch::{
     CanisterQueryStats, QueryStats, QueryStatsPayload, RawQueryStats, TotalQueryStats,
 };
@@ -469,8 +472,8 @@ fn rejoining_node_doesnt_accumulate_states() {
                 let msg = src_state_sync
                     .get_validated_by_identifier(&id)
                     .expect("failed to get state sync messages");
-
-                let chunkable = dst_state_sync.create_chunkable_state(&id);
+                let chunkable =
+                    set_fetch_state_and_start_start_sync(&dst_state_manager, &dst_state_sync, &id);
                 let dst_msg = pipe_state_sync(msg.clone(), chunkable);
                 dst_state_sync.deliver_state_sync(dst_msg);
                 assert_eq!(
@@ -2109,6 +2112,27 @@ fn assert_no_remaining_chunks(metrics: &MetricsRegistry) {
     );
 }
 
+// This is a helper function only for testing purpose.
+// It first sets the `fetch_state` in the state manager with the height and hash
+// from a state sync artifact ID and then starts the state sync with the same ID.
+// It should only be called when the state manager does not have the state at the height
+// and there is no ongoing state sync.
+// For more complex testing scenarios, use `fetch_state` and `start_state_sync` separately with proper arguments.
+fn set_fetch_state_and_start_start_sync(
+    state_manager: &Arc<StateManagerImpl>,
+    state_sync: &StateSync,
+    id: &StateSyncArtifactId,
+) -> Box<dyn Chunkable<StateSyncMessage> + Send> {
+    state_manager.fetch_state(
+        id.height,
+        CryptoHashOfState::from(id.hash.clone()),
+        Height::new(499),
+    );
+    state_sync
+        .start_state_sync(id)
+        .expect("failed to start state sync")
+}
+
 #[test]
 fn can_do_simple_state_sync_transfer() {
     state_manager_test_with_state_sync(|src_metrics, src_state_manager, src_state_sync| {
@@ -2131,7 +2155,8 @@ fn can_do_simple_state_sync_transfer() {
         assert_error_counters(src_metrics);
 
         state_manager_test_with_state_sync(|dst_metrics, dst_state_manager, dst_state_sync| {
-            let chunkable = dst_state_sync.create_chunkable_state(&id);
+            let chunkable =
+                set_fetch_state_and_start_start_sync(&dst_state_manager, &dst_state_sync, &id);
 
             let dst_msg = pipe_state_sync(msg, chunkable);
             dst_state_sync.deliver_state_sync(dst_msg);
@@ -2231,14 +2256,12 @@ fn test_start_and_cancel_state_sync() {
                 .start_state_sync(&id2)
                 .expect("failed to start state sync");
 
-            // TODO: (MR-537) Currently, this line of code will panic where we start a state sync at the same height as the ongoing one.
-            // The caller of `start_state_sync` (i.e. the state sync manager) currently ensures that the improper use of the API won't happen.
-            // We will improve this case by returning `None` instead of panicking.
-            // dst_state_sync.start_state_sync(&id2);
+            // a new state sync won't be started if there is already an ongoing one no matter whether they are in the same height or not.
+            assert!(dst_state_sync.start_state_sync(&id2).is_none());
 
             // Request fetching of state @3.
             dst_state_manager.fetch_state(height(3), hash3, Height::new(499));
-            // a new start state sync won't be started if there is already an ongoing one.
+            // a new state sync won't be started if there is already an ongoing one no matter whether they are in the same height or not.
             assert!(dst_state_sync.start_state_sync(&id3).is_none());
 
             // When `EXTRA_CHECKPOINTS_TO_KEEP` is set as 0, we should cancel an ongoing state sync if requested to fetch a newer state.
@@ -2371,17 +2394,29 @@ fn can_state_sync_from_cache() {
             .update(&[(PageIndex::new(0), &[2u8; PAGE_SIZE])]);
 
         src_state_manager.commit_and_certify(state, height(1), CertificationScope::Full);
-        let hash = wait_for_checkpoint(&*src_state_manager, height(1));
-        let id = StateSyncArtifactId {
+        let hash1 = wait_for_checkpoint(&*src_state_manager, height(1));
+        let id1 = StateSyncArtifactId {
             height: height(1),
-            hash: hash.get_ref().clone(),
+            hash: hash1.get_ref().clone(),
         };
 
-        let state = src_state_manager.get_latest_state().take();
-
-        let msg = src_state_sync
-            .get_validated_by_identifier(&id)
+        let msg1 = src_state_sync
+            .get_validated_by_identifier(&id1)
             .expect("failed to get state sync messages");
+
+        let (_height, state) = src_state_manager.take_tip();
+        src_state_manager.commit_and_certify(state, height(2), CertificationScope::Full);
+
+        let hash2 = wait_for_checkpoint(&*src_state_manager, height(2));
+        let id2 = StateSyncArtifactId {
+            height: height(2),
+            hash: hash2.get_ref().clone(),
+        };
+        let state2 = src_state_manager.get_latest_state().take();
+        let msg2 = src_state_sync
+            .get_validated_by_identifier(&id2)
+            .expect("failed to get state sync messages");
+
         assert_error_counters(src_metrics);
         state_manager_test_with_state_sync(|dst_metrics, dst_state_manager, dst_state_sync| {
             // Not all chunk ids to be omitted will work for the purpose of this test
@@ -2389,30 +2424,29 @@ fn can_state_sync_from_cache() {
             // to another chunk that is not omitted.
             //
             // Here we choose the `system_metadata.pbuf` because it is never empty and unlikely to be identical to others.
+            // `system_metadata.pbuf` is also the only file that changes between checkpoints.
             //   file idx  |  file size | chunk idx |                         path
             // ------------+------------+---------- +------------------------------------------------------
             //           0 |        259 |     0     | canister_states/00000000000000640101/canister.pbuf
-            //           1 |          0 |    N/A    | canister_states/00000000000000640101/queues.pbuf
-            //           2 |         18 |     1     | canister_states/00000000000000640101/software.wasm
-            //           3 |       4096 |     2     | canister_states/00000000000000640101/stable_memory.bin
-            //           4 |       4096 |     3     | canister_states/00000000000000640101/vmemory_0.bin
+            //           1 |         18 |     1     | canister_states/00000000000000640101/software.wasm
+            //           2 |       4096 |     2     | canister_states/00000000000000640101/stable_memory.bin
+            //           3 |       4096 |     3     | canister_states/00000000000000640101/vmemory_0.bin
+            //           4 |          0 |    N/A    | canister_states/00000000000000640101/wasm_chunk_store.bin
             //           5 |        221 |     4     | canister_states/00000000000000c80101/canister.pbuf
-            //           6 |          0 |    N/A    | canister_states/00000000000000c80101/queues.pbuf
-            //           7 |         18 |     5     | canister_states/00000000000000c80101/software.wasm
-            //           8 |          0 |    N/A    | canister_states/00000000000000c80101/stable_memory.bin
-            //           9 |          0 |    N/A    | canister_states/00000000000000c80101/vmemory_0.bin
-            //          10 |          0 |    N/A    | ingress_history.pbuf
-            //          11 |          0 |    N/A    | subnet_queues.pbuf
-            //          12 |         86 |     6     | system_metadata.pbuf
+            //           6 |         18 |     5     | canister_states/00000000000000c80101/software.wasm
+            //           7 |          0 |    N/A    | canister_states/00000000000000c80101/stable_memory.bin
+            //           8 |          0 |    N/A    | canister_states/00000000000000c80101/vmemory_0.bin
+            //           9 |          0 |    N/A    | canister_states/00000000000000c80101/wasm_chunk_store.bin
+            //          10 |         86 |     6     | system_metadata.pbuf
             //
             // Given the current state layout, the chunk for `system_metadata.pbuf` is the last one in the chunk table.
             // If there are changes to the state layout and it changes the position of `system_metadata.pbuf` in the chunk table,
             // the assertion below will panic and we need to adjust the selected chunk id accordingly for this test.
-            let chunk_table_idx_to_omit = msg.manifest.chunk_table.len() - 1;
+            let chunk_table_idx_to_omit = msg1.manifest.chunk_table.len() - 1;
             let chunk_id_to_omit = ChunkId::new(chunk_table_idx_to_omit as u32 + 1);
             let file_table_idx_to_omit =
-                msg.manifest.chunk_table[chunk_table_idx_to_omit].file_index as usize;
-            let file_path = &msg.manifest.file_table[file_table_idx_to_omit].relative_path;
+                msg1.manifest.chunk_table[chunk_table_idx_to_omit].file_index as usize;
+            let file_path = &msg1.manifest.file_table[file_table_idx_to_omit].relative_path;
             // Make sure the chunk to omit is from file `system_metadata.pbuf`.
             assert!(file_path.ends_with(SYSTEM_METADATA_FILE));
 
@@ -2421,11 +2455,12 @@ fn can_state_sync_from_cache() {
 
             // First state sync is destroyed before completion
             {
-                let mut chunkable = dst_state_sync.create_chunkable_state(&id);
+                let mut chunkable =
+                    set_fetch_state_and_start_start_sync(&dst_state_manager, &dst_state_sync, &id1);
 
                 // First fetch chunk 0 (the meta-manifest) and manifest chunks, and then ask for all chunks afterwards,
                 // but never receive the chunk for `system_metadata.pbuf` and FILE_GROUP_CHUNK_ID_OFFSET
-                let completion = pipe_partial_state_sync(&msg, &mut *chunkable, &omit, false);
+                let completion = pipe_partial_state_sync(&msg1, &mut *chunkable, &omit, false);
                 assert!(
                     matches!(completion, Err(StateSyncErrorCode::ChunksMoreNeeded)),
                     "Unexpectedly completed state sync"
@@ -2434,20 +2469,16 @@ fn can_state_sync_from_cache() {
             assert_no_remaining_chunks(dst_metrics);
             // Second state sync continues from first state and successfully finishes
             {
-                // Same state just higher height
-                let id = StateSyncArtifactId {
-                    height: height(2),
-                    hash: hash.get_ref().clone(),
-                };
+                // Compared to the checkpoint at height 1, the only different file in checkpoint at height 2 is `system_metadata.pbuf`.
+                let mut chunkable =
+                    set_fetch_state_and_start_start_sync(&dst_state_manager, &dst_state_sync, &id2);
 
-                let mut chunkable = dst_state_sync.create_chunkable_state(&id);
-
-                let result = pipe_meta_manifest(&msg, &mut *chunkable, false);
+                let result = pipe_meta_manifest(&msg2, &mut *chunkable, false);
                 assert!(matches!(result, Err(StateSyncErrorCode::ChunksMoreNeeded)));
-                let result = pipe_manifest(&msg, &mut *chunkable, false);
+                let result = pipe_manifest(&msg2, &mut *chunkable, false);
                 assert!(matches!(result, Err(StateSyncErrorCode::ChunksMoreNeeded)));
 
-                let file_group_chunks: HashSet<ChunkId> = msg
+                let file_group_chunks: HashSet<ChunkId> = msg2
                     .state_sync_file_group
                     .keys()
                     .copied()
@@ -2461,7 +2492,7 @@ fn can_state_sync_from_cache() {
                 assert_eq!(fetch_chunks, chunkable.chunks_to_download().collect());
 
                 // Download chunk 1
-                let dst_msg = pipe_state_sync(msg.clone(), chunkable);
+                let dst_msg = pipe_state_sync(msg2.clone(), chunkable);
                 dst_state_sync.deliver_state_sync(dst_msg);
 
                 let recovered_state = dst_state_manager
@@ -2470,47 +2501,108 @@ fn can_state_sync_from_cache() {
                     .take();
 
                 assert_eq!(height(2), dst_state_manager.latest_state_height());
-                assert_eq!(state, recovered_state);
+                assert_eq!(state2, recovered_state);
                 assert_eq!(
-                    *state.as_ref(),
+                    *state2.as_ref(),
                     *dst_state_manager.get_latest_state().take()
                 );
                 assert_eq!(vec![height(2)], heights_to_certify(&*dst_state_manager));
             }
             assert_no_remaining_chunks(dst_metrics);
-            // Third state sync can copy all chunks immediately
-            {
-                // Same state just higher height
-                let id = StateSyncArtifactId {
-                    height: height(3),
-                    hash: hash.get(),
-                };
+            assert_error_counters(dst_metrics);
+        })
+    })
+}
 
-                let mut chunkable = dst_state_sync.create_chunkable_state(&id);
+#[test]
+fn can_state_sync_from_cache_alone() {
+    state_manager_test_with_state_sync(|src_metrics, src_state_manager, src_state_sync| {
+        let (_height, mut state) = src_state_manager.take_tip();
+        insert_dummy_canister(&mut state, canister_test_id(100));
+        insert_dummy_canister(&mut state, canister_test_id(200));
+
+        src_state_manager.commit_and_certify(state, height(1), CertificationScope::Full);
+        let hash = wait_for_checkpoint(&*src_state_manager, height(1));
+        let id = StateSyncArtifactId {
+            height: height(1),
+            hash: hash.get_ref().clone(),
+        };
+
+        let msg = src_state_sync
+            .get_validated_by_identifier(&id)
+            .expect("failed to get state sync messages");
+
+        let state = src_state_manager.get_latest_state().take();
+        assert_error_counters(src_metrics);
+        state_manager_test_with_state_sync(|dst_metrics, dst_state_manager, dst_state_sync| {
+            // In the first state sync, we omit the `software.wasm` of the first canister, which is the same as the other one.
+            // The state sync won't complete because all the chunks have to be fetched from scratch.
+            //   file idx  |  file size | chunk idx |                         path
+            // ------------+------------+---------- +------------------------------------------------------
+            //           0 |        331 |     0     | canister_states/00000000000000640101/canister.pbuf
+            //           1 |         18 |     1     | canister_states/00000000000000640101/software.wasm
+            //           2 |          0 |    N/A    | canister_states/00000000000000640101/stable_memory.bin
+            //           3 |          0 |    N/A    | canister_states/00000000000000640101/vmemory_0.bin
+            //           4 |          0 |    N/A    | canister_states/00000000000000640101/wasm_chunk_store.bin
+            //           5 |        331 |     2     | canister_states/00000000000000c80101/canister.pbuf
+            //           6 |         18 |     3     | canister_states/00000000000000c80101/software.wasm
+            //           7 |          0 |    N/A    | canister_states/00000000000000c80101/stable_memory.bin
+            //           8 |          0 |    N/A    | canister_states/00000000000000c80101/vmemory_0.bin
+            //           9 |          0 |    N/A    | canister_states/00000000000000c80101/wasm_chunk_store.bin
+            //          10 |         97 |     4     | system_metadata.pbuf
+            // Given the current state layout, the chunk for `software.wasm` of the first canister has the index 1.
+            // If there are changes to the state layout that affect the chunk's position in the chunk table,
+            // the assertion below will panic and we need to adjust the selected chunk id accordingly for this test.
+            let chunk_table_idx_to_omit = 1;
+            let chunk_id_to_omit = ChunkId::new(chunk_table_idx_to_omit as u32 + 1);
+            let file_table_idx_to_omit =
+                msg.manifest.chunk_table[chunk_table_idx_to_omit].file_index as usize;
+            let file_path = &msg.manifest.file_table[file_table_idx_to_omit].relative_path;
+            // Make sure the chunk to omit is from file `software.wasm`.
+            assert!(file_path.ends_with(WASM_FILE));
+
+            let omit: HashSet<ChunkId> = maplit::hashset! {chunk_id_to_omit};
+
+            // First state sync is destroyed before completion
+            {
+                let mut chunkable =
+                    set_fetch_state_and_start_start_sync(&dst_state_manager, &dst_state_sync, &id);
+
+                // First fetch chunk 0 (the meta-manifest) and manifest chunks, and then ask for all chunks afterwards,
+                // but never receive the chunk for `software.wasm` of the first canister
+                let completion = pipe_partial_state_sync(&msg, &mut *chunkable, &omit, false);
+                assert!(
+                    matches!(completion, Err(StateSyncErrorCode::ChunksMoreNeeded)),
+                    "Unexpectedly completed state sync"
+                );
+            }
+            assert_no_remaining_chunks(dst_metrics);
+            // Second state sync of the same state continues from the cache and successfully finishes
+            {
+                let mut chunkable =
+                    set_fetch_state_and_start_start_sync(&dst_state_manager, &dst_state_sync, &id);
 
                 // The meta-manifest and manifest are enough to complete the sync
+                // This is because the omitted file `canister_states/00000000000000640101/software.wasm` in the first state sync
+                // is the same as the other one. As a result, it will be copied and does not need to be fetched.
                 let _res = pipe_meta_manifest(&msg, &mut *chunkable, false);
                 let dst_msg = pipe_manifest(&msg, &mut *chunkable, false).unwrap();
 
                 dst_state_sync.deliver_state_sync(dst_msg);
 
                 let recovered_state = dst_state_manager
-                    .get_state_at(height(3))
+                    .get_state_at(height(1))
                     .expect("Destination state manager didn't receive the state")
                     .take();
 
-                assert_eq!(height(3), dst_state_manager.latest_state_height());
+                assert_eq!(height(1), dst_state_manager.latest_state_height());
                 assert_eq!(state, recovered_state);
                 assert_eq!(
                     *state.as_ref(),
                     *dst_state_manager.get_latest_state().take()
                 );
-                assert_eq!(
-                    vec![height(2), height(3)],
-                    heights_to_certify(&*dst_state_manager)
-                );
+                assert_eq!(vec![height(1)], heights_to_certify(&*dst_state_manager));
             }
-
             assert_no_remaining_chunks(dst_metrics);
             assert_error_counters(dst_metrics);
         })
@@ -2556,7 +2648,8 @@ fn can_state_sync_after_aborting_in_prep_phase() {
 
             // First state sync is destroyed when fetching the manifest chunks in the Prep phase
             {
-                let mut chunkable = dst_state_sync.create_chunkable_state(&id);
+                let mut chunkable =
+                    set_fetch_state_and_start_start_sync(&dst_state_manager, &dst_state_sync, &id);
 
                 // First fetch chunk 0 (the meta-manifest) and manifest chunks but never receive chunk(MANIFEST_CHUNK_ID_OFFSET + 1).
                 let completion = pipe_partial_state_sync(&msg, &mut *chunkable, &omit, false);
@@ -2574,7 +2667,8 @@ fn can_state_sync_after_aborting_in_prep_phase() {
                     hash: hash.get_ref().clone(),
                 };
 
-                let mut chunkable = dst_state_sync.create_chunkable_state(&id);
+                let mut chunkable =
+                    set_fetch_state_and_start_start_sync(&dst_state_manager, &dst_state_sync, &id);
 
                 let result = pipe_meta_manifest(&msg, &mut *chunkable, false);
                 assert!(matches!(result, Err(StateSyncErrorCode::ChunksMoreNeeded)));
@@ -2639,7 +2733,8 @@ fn state_sync_can_reject_invalid_chunks() {
 
         state_manager_test_with_state_sync(|dst_metrics, dst_state_manager, dst_state_sync| {
             // Provide bad meta-manifest to dst
-            let mut chunkable = dst_state_sync.create_chunkable_state(&id);
+            let mut chunkable =
+                set_fetch_state_and_start_start_sync(&dst_state_manager, &dst_state_sync, &id);
             let result = pipe_meta_manifest(&msg, &mut *chunkable, true);
             assert!(matches!(
                 result,
@@ -2740,7 +2835,8 @@ fn can_state_sync_into_existing_checkpoint() {
         assert_error_counters(src_metrics);
 
         state_manager_test_with_state_sync(|dst_metrics, dst_state_manager, dst_state_sync| {
-            let chunkable = dst_state_sync.create_chunkable_state(&id);
+            let chunkable =
+                set_fetch_state_and_start_start_sync(&dst_state_manager, &dst_state_sync, &id);
 
             dst_state_manager.take_tip();
             dst_state_manager.commit_and_certify(
@@ -2808,7 +2904,8 @@ fn can_group_small_files_in_state_sync() {
         assert_error_counters(src_metrics);
 
         state_manager_test_with_state_sync(|dst_metrics, dst_state_manager, dst_state_sync| {
-            let mut chunkable = dst_state_sync.create_chunkable_state(&id);
+            let mut chunkable =
+                set_fetch_state_and_start_start_sync(&dst_state_manager, &dst_state_sync, &id);
 
             let result = pipe_meta_manifest(&msg, &mut *chunkable, false);
             assert!(matches!(result, Err(StateSyncErrorCode::ChunksMoreNeeded)));
@@ -2870,7 +2967,8 @@ fn can_commit_after_prev_state_is_gone() {
 
             let (_height, tip) = dst_state_manager.take_tip();
 
-            let chunkable = dst_state_sync.create_chunkable_state(&id);
+            let chunkable =
+                set_fetch_state_and_start_start_sync(&dst_state_manager, &dst_state_sync, &id);
             let dst_msg = pipe_state_sync(msg, chunkable);
             dst_state_sync.deliver_state_sync(dst_msg);
 
@@ -2925,7 +3023,8 @@ fn can_commit_without_prev_hash_mismatch_after_taking_tip_at_the_synced_height()
             insert_dummy_canister(&mut tip, canister_test_id(100));
             dst_state_manager.commit_and_certify(tip, height(1), CertificationScope::Metadata);
 
-            let chunkable = dst_state_sync.create_chunkable_state(&id);
+            let chunkable =
+                set_fetch_state_and_start_start_sync(&dst_state_manager, &dst_state_sync, &id);
             let dst_msg = pipe_state_sync(msg, chunkable);
             dst_state_sync.deliver_state_sync(dst_msg);
 
@@ -2969,7 +3068,8 @@ fn can_state_sync_based_on_old_checkpoint() {
 
             wait_for_checkpoint(&*dst_state_manager, height(1));
 
-            let chunkable = dst_state_sync.create_chunkable_state(&id);
+            let chunkable =
+                set_fetch_state_and_start_start_sync(&dst_state_manager, &dst_state_sync, &id);
 
             let dst_msg = pipe_state_sync(msg, chunkable);
             dst_state_sync.deliver_state_sync(dst_msg);
@@ -3172,7 +3272,8 @@ fn can_recover_from_corruption_on_state_sync() {
             std::fs::write(&canister_100_raw_pb, b"Garbage").unwrap();
             make_readonly(&canister_100_raw_pb).unwrap();
 
-            let chunkable = dst_state_sync.create_chunkable_state(&id);
+            let chunkable =
+                set_fetch_state_and_start_start_sync(&dst_state_manager, &dst_state_sync, &id);
             let dst_msg = pipe_state_sync(msg, chunkable);
             dst_state_sync.deliver_state_sync(dst_msg);
 
@@ -3217,7 +3318,8 @@ fn can_commit_below_state_sync() {
         state_manager_test_with_state_sync(|dst_metrics, dst_state_manager, dst_state_sync| {
             let (tip_height, state) = dst_state_manager.take_tip();
             assert_eq!(tip_height, height(0));
-            let chunkable = dst_state_sync.create_chunkable_state(&id);
+            let chunkable =
+                set_fetch_state_and_start_start_sync(&dst_state_manager, &dst_state_sync, &id);
             let dst_msg = pipe_state_sync(msg, chunkable);
             dst_state_sync.deliver_state_sync(dst_msg);
             // Check committing an old state doesn't panic
@@ -3257,6 +3359,10 @@ fn can_state_sync_below_commit() {
         assert_error_counters(src_metrics);
 
         state_manager_test_with_state_sync(|dst_metrics, dst_state_manager, dst_state_sync| {
+            // the state sync is started before the state manager has the state at height 1.
+            let chunkable =
+                set_fetch_state_and_start_start_sync(&dst_state_manager, &dst_state_sync, &id);
+
             let (tip_height, state) = dst_state_manager.take_tip();
             assert_eq!(tip_height, height(0));
             dst_state_manager.commit_and_certify(state, height(1), CertificationScope::Full);
@@ -3268,8 +3374,9 @@ fn can_state_sync_below_commit() {
             let (_height, state) = dst_state_manager.take_tip();
             dst_state_manager.remove_states_below(height(2));
             assert_eq!(dst_state_manager.checkpoint_heights(), vec![height(2)]);
-            let chunkable = dst_state_sync.create_chunkable_state(&id);
+
             let dst_msg = pipe_state_sync(msg, chunkable);
+            // the state sync finishes after the state manager reaches height 2.
             dst_state_sync.deliver_state_sync(dst_msg);
             assert_eq!(
                 dst_state_manager.checkpoint_heights(),
@@ -5441,8 +5548,10 @@ fn can_upgrade_to_lsmt() {
 }
 
 proptest! {
+    // TODO(MR-549) Go back to using plain `arb_stream()` once the canonical state
+    // encodes deadlines.
     #[test]
-    fn stream_store_encode_decode(stream in arb_stream(0, 10, 0, 10), size_limit in 0..20usize) {
+    fn stream_store_encode_decode(stream in arb_stream_with_config(0, 10, 0, 10, true, false), size_limit in 0..20usize) {
         encode_decode_stream_test(
             /* stream to be used */
             stream,

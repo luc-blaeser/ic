@@ -97,14 +97,18 @@
 use crossbeam_channel::{select, tick, Receiver as CrossbeamReceiver, RecvError};
 use event_handler::GossipArc;
 use ic_config::transport::TransportConfig;
+use ic_crypto_tls_interfaces::TlsHandshake;
+use ic_crypto_tls_interfaces::TlsStream;
+use ic_icos_sev::ValidateAttestedStream;
 use ic_interfaces::{
     consensus_pool::ConsensusPoolCache,
     p2p::artifact_manager::{ArtifactManager, JoinGuard},
 };
 use ic_interfaces_registry::RegistryClient;
-use ic_interfaces_transport::{Transport, TransportChannelId};
+use ic_interfaces_transport::TransportChannelId;
 use ic_logger::ReplicaLogger;
 use ic_metrics::MetricsRegistry;
+use ic_transport::transport::create_transport;
 use ic_types::{p2p::GossipAdvert, NodeId, SubnetId};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -164,16 +168,32 @@ pub(crate) mod utils {
 pub fn start_p2p(
     log: &ReplicaLogger,
     metrics_registry: &MetricsRegistry,
-    _rt_handle: &tokio::runtime::Handle,
+    rt_handle: &tokio::runtime::Handle,
     node_id: NodeId,
     subnet_id: SubnetId,
-    _transport_config: TransportConfig,
+    transport_config: TransportConfig,
     registry_client: Arc<dyn RegistryClient>,
-    transport: Arc<dyn Transport>,
     consensus_pool_cache: Arc<dyn ConsensusPoolCache>,
     artifact_manager: Arc<dyn ArtifactManager>,
     advert_receiver: CrossbeamReceiver<GossipAdvert>,
+    tls_handshake: Arc<dyn TlsHandshake + Send + Sync>,
+    sev_handshake: Arc<dyn ValidateAttestedStream<Box<dyn TlsStream>> + Send + Sync>,
 ) -> Box<dyn JoinGuard> {
+    // Tcp transport
+    let oldest_registry_version_in_use = consensus_pool_cache.get_oldest_registry_version_in_use();
+    let transport = create_transport(
+        node_id,
+        transport_config.clone(),
+        registry_client.get_latest_version(),
+        oldest_registry_version_in_use,
+        metrics_registry.clone(),
+        tls_handshake,
+        sev_handshake,
+        rt_handle.clone(),
+        log.clone(),
+        false,
+    );
+
     let p2p_transport_channels = vec![TransportChannelId::from(0)];
     let gossip = Arc::new(gossip_protocol::GossipImpl::new(
         node_id,
@@ -233,11 +253,7 @@ fn start_p2p_event_loop(
                     recv(rx) -> recv_res => {
                         match recv_res {
                             Ok(advert) => gossip.broadcast_advert(advert),
-                            // Do not break out of the event loop. During the transition
-                            // to the new P2P it is important to have this running so new
-                            // registry versions are fetched and keeping the old transport
-                            // connected to the correct peers so we don't page.
-                            Err(RecvError {}) => (),
+                            Err(RecvError {}) => break,
                         }
                     }
                     recv(ticker) -> _ => gossip.on_gossip_timer(),

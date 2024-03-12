@@ -14,12 +14,11 @@ use ic_replicated_state::testing::SystemStateTesting;
 use ic_replicated_state::{NetworkTopology, SystemState};
 use ic_system_api::sandbox_safe_system_state::SandboxSafeSystemState;
 use ic_test_utilities::{
-    cycles_account_manager::CyclesAccountManagerBuilder,
-    state::SystemStateBuilder,
-    types::{
-        ids::{canister_test_id, subnet_test_id, user_test_id},
-        messages::{RequestBuilder, ResponseBuilder},
-    },
+    cycles_account_manager::CyclesAccountManagerBuilder, state::SystemStateBuilder,
+};
+use ic_test_utilities_types::{
+    ids::{canister_test_id, subnet_test_id, user_test_id},
+    messages::{RequestBuilder, ResponseBuilder},
 };
 use ic_types::nominal_cycles::NominalCycles;
 use ic_types::{
@@ -722,7 +721,7 @@ fn wrong_method_name_ic00() {
     failing_mgmt_canister_call_ic00(
         "start",
         arg.encode(),
-        "IC0302: Management canister has no method 'start'".to_string(),
+        "IC0536: Management canister has no method 'start'".to_string(),
     );
 }
 
@@ -732,6 +731,6 @@ fn wrong_method_name_subnet_message() {
     failing_mgmt_canister_call_subnet_message(
         "start",
         arg.encode(),
-        "IC0302: Management canister has no method 'start'".to_string(),
+        "IC0536: Management canister has no method 'start'".to_string(),
     );
 }

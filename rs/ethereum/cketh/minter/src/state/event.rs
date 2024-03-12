@@ -1,9 +1,9 @@
 use crate::erc20::CkErc20Token;
-use crate::eth_logs::{EventSource, ReceivedEthEvent};
+use crate::eth_logs::{EventSource, ReceivedErc20Event, ReceivedEthEvent, ReceivedEvent};
 use crate::eth_rpc_client::responses::TransactionReceipt;
 use crate::lifecycle::{init::InitArg, upgrade::UpgradeArg};
 use crate::numeric::{BlockNumber, LedgerBurnIndex, LedgerMintIndex};
-use crate::state::transactions::{EthWithdrawalRequest, Reimbursed};
+use crate::state::transactions::{Erc20WithdrawalRequest, EthWithdrawalRequest, Reimbursed};
 use crate::tx::{Eip1559TransactionRequest, SignedEip1559TransactionRequest};
 use minicbor::{Decode, Encode};
 
@@ -97,6 +97,21 @@ pub enum EventType {
     /// Add a new ckERC20 token.
     #[n(14)]
     AddedCkErc20Token(#[n(0)] CkErc20Token),
+    /// The minter discovered a ckERC20 deposit in the helper contract logs.
+    #[n(15)]
+    AcceptedErc20Deposit(#[n(0)] ReceivedErc20Event),
+    /// The minter accepted a new ERC-20 withdrawal request.
+    #[n(16)]
+    AcceptedErc20WithdrawalRequest(#[n(0)] Erc20WithdrawalRequest),
+}
+
+impl ReceivedEvent {
+    pub fn into_deposit(self) -> EventType {
+        match self {
+            ReceivedEvent::Eth(event) => EventType::AcceptedDeposit(event),
+            ReceivedEvent::Erc20(event) => EventType::AcceptedErc20Deposit(event),
+        }
+    }
 }
 
 #[derive(Encode, Decode, Debug, PartialEq, Eq)]

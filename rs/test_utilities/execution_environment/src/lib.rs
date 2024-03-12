@@ -15,8 +15,7 @@ use ic_execution_environment::{
     RoundInstructions, RoundLimits,
 };
 use ic_interfaces::execution_environment::{
-    ExecutionMode, IngressHistoryWriter, QueryHandler, RegistryExecutionSettings,
-    SubnetAvailableMemory,
+    ExecutionMode, IngressHistoryWriter, RegistryExecutionSettings, SubnetAvailableMemory,
 };
 use ic_interfaces_state_manager::Labeled;
 use ic_logger::{replica_logger::no_op_logger, ReplicaLogger};
@@ -42,10 +41,8 @@ use ic_replicated_state::{
 };
 use ic_replicated_state::{page_map::TestPageAllocatorFileDescriptorImpl, PageMap};
 use ic_system_api::InstructionLimits;
-use ic_test_utilities::{
-    crypto::mock_random_number_generator,
-    types::messages::{IngressBuilder, RequestBuilder, SignedIngressBuilder},
-};
+use ic_test_utilities::crypto::mock_random_number_generator;
+use ic_test_utilities_types::messages::{IngressBuilder, RequestBuilder, SignedIngressBuilder};
 use ic_types::{
     batch::QueryStats,
     crypto::{canister_threshold_sig::MasterEcdsaPublicKey, AlgorithmId},

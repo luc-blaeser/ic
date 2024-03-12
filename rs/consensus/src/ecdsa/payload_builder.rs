@@ -859,6 +859,9 @@ pub(crate) fn get_signing_requests<'a>(
                         context.key_id
                     ),
                 )),
+                // Not relevant, the consensus queue is flushed every round by the
+                // scheduler, which uses only the payload and originator callback.
+                deadline: context.request.deadline,
             };
             ecdsa_payload.signature_agreements.insert(
                 context.pseudo_random_id,
@@ -915,6 +918,9 @@ pub(crate) fn get_signing_requests<'a>(
                         RejectCode::CanisterError,
                         "Signature request expired",
                     )),
+                    // Not relevant, the consensus queue is flushed every round by the
+                    // scheduler, which uses only the payload and originator callback.
+                    deadline: context.request.deadline,
                 };
                 ecdsa_payload.signature_agreements.insert(
                     context.pseudo_random_id,
@@ -1130,10 +1136,9 @@ mod tests {
     use ic_metrics::MetricsRegistry;
     use ic_protobuf::types::v1 as pb;
     use ic_test_artifact_pool::consensus_pool::TestConsensusPool;
-    use ic_test_utilities::consensus::fake::{Fake, FakeContentSigner};
-    use ic_test_utilities::types::ids::user_test_id;
-    use ic_test_utilities::types::ids::{node_test_id, subnet_test_id};
+    use ic_test_utilities_consensus::fake::{Fake, FakeContentSigner};
     use ic_test_utilities_registry::{add_subnet_record, SubnetRecordBuilder};
+    use ic_test_utilities_types::ids::{node_test_id, subnet_test_id, user_test_id};
     use ic_types::batch::BatchPayload;
     use ic_types::consensus::dkg::{Dealings, Summary};
     use ic_types::consensus::ecdsa::EcdsaPayload;

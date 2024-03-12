@@ -1,12 +1,7 @@
 use assert_matches::assert_matches;
 use candid::{Decode, Encode};
-use ic_config::flag_status::FlagStatus;
-use ic_registry_routing_table::RoutingTable;
-use ic_replicated_state::canister_state::system_state::CyclesUseCase;
-use ic_replicated_state::ReplicatedState;
-use ic_types::nominal_cycles::NominalCycles;
-
 use ic_base_types::{NumBytes, NumSeconds};
+use ic_config::flag_status::FlagStatus;
 use ic_error_types::{ErrorCode, RejectCode, UserError};
 use ic_management_canister_types::{
     self as ic00, BitcoinGetUtxosArgs, BitcoinNetwork, BoundedHttpHeaders, CanisterChange,
@@ -15,26 +10,27 @@ use ic_management_canister_types::{
     LogVisibility, Method, Payload as Ic00Payload, ProvisionalCreateCanisterWithCyclesArgs,
     ProvisionalTopUpCanisterArgs, TransformContext, TransformFunc, IC_00,
 };
-use ic_registry_routing_table::canister_id_into_u64;
-use ic_registry_routing_table::CanisterIdRange;
+use ic_registry_routing_table::{canister_id_into_u64, CanisterIdRange, RoutingTable};
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::{
+    canister_state::system_state::CyclesUseCase,
     canister_state::{DEFAULT_QUEUE_CAPACITY, WASM_PAGE_SIZE_IN_BYTES},
     testing::{CanisterQueuesTesting, SystemStateTesting},
-    CanisterStatus, SystemState,
+    CanisterStatus, ReplicatedState, SystemState,
 };
 use ic_test_utilities::assert_utils::assert_balance_equals;
 use ic_test_utilities_execution_environment::{
     assert_empty_reply, check_ingress_status, get_reply, ExecutionTest, ExecutionTestBuilder,
 };
 use ic_test_utilities_metrics::{fetch_histogram_vec_count, fetch_int_counter, metric_vec};
-use ic_types::canister_http::Transform;
 use ic_types::{
-    canister_http::CanisterHttpMethod,
+    canister_http::{CanisterHttpMethod, Transform},
     ingress::{IngressState, IngressStatus, WasmResult},
     messages::{
         CallbackId, Payload, RejectContext, RequestOrResponse, Response, MAX_RESPONSE_COUNT_BYTES,
+        NO_DEADLINE,
     },
+    nominal_cycles::NominalCycles,
     time::UNIX_EPOCH,
     CanisterId, Cycles, PrincipalId, RegistryVersion,
 };
@@ -1321,7 +1317,7 @@ fn subnet_canister_request_unknown_method() {
         .build();
     assert_eq!(
         test.ingress(canister, "update", run).unwrap(),
-        WasmResult::Reject("IC0302: Management canister has no method 'unknown'".to_string())
+        WasmResult::Reject("IC0536: Management canister has no method 'unknown'".to_string())
     );
 }
 
@@ -1502,7 +1498,8 @@ fn setup_initial_dkg_sender_not_on_nns() {
                     ic00::Method::SetupInitialDKG,
                     other_canister,
                 )
-            ))
+            )),
+            deadline: NO_DEADLINE,
         }
         .into()
     );
@@ -3227,8 +3224,8 @@ fn test_fetch_canister_logs_should_accept_ingress_message_disabled() {
     assert_eq!(
         result,
         Err(UserError::new(
-            ErrorCode::CanisterContractViolation,
-            "fetch_canister_logs API is not enabled on this subnet"
+            ErrorCode::CanisterRejectedMessage,
+            "fetch_canister_logs API is only accessible in non-replicated mode"
         ))
     );
 }

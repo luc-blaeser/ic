@@ -21,7 +21,7 @@ use ic_crypto_tree_hash::{flatmap, Label, LabeledTree, LabeledTree::SubTree};
 use ic_cycles_account_manager::CyclesAccountManager;
 use ic_error_types::{ErrorCode, UserError};
 use ic_interfaces::execution_environment::{
-    QueryExecutionError, QueryExecutionResponse, QueryExecutionService, QueryHandler,
+    QueryExecutionError, QueryExecutionResponse, QueryExecutionService,
 };
 use ic_interfaces_state_manager::{Labeled, StateReader};
 use ic_logger::ReplicaLogger;
@@ -131,7 +131,7 @@ impl HttpQueryHandlerMetrics {
 #[derive(Clone)]
 /// Struct that is responsible for handling queries sent by user.
 pub(crate) struct HttpQueryHandler {
-    internal: Arc<dyn QueryHandler<State = ReplicatedState>>,
+    internal: Arc<InternalHttpQueryHandler>,
     state_reader: Arc<dyn StateReader<State = ReplicatedState>>,
     query_scheduler: QueryScheduler,
     metrics: Arc<HttpQueryHandlerMetrics>,
@@ -187,39 +187,9 @@ impl InternalHttpQueryHandler {
     pub fn query_stats_set_epoch_for_testing(&mut self, epoch: QueryStatsEpoch) {
         self.local_query_execution_stats.set_epoch(epoch);
     }
-}
 
-fn route_bitcoin_message(
-    network: BitcoinNetwork,
-    network_topology: &NetworkTopology,
-) -> Result<CanisterId, UserError> {
-    let canister_id = match network {
-        // Route to the bitcoin canister if it exists, otherwise return the error.
-        BitcoinNetwork::Testnet
-        | BitcoinNetwork::testnet
-        | BitcoinNetwork::Regtest
-        | BitcoinNetwork::regtest => {
-            network_topology
-                .bitcoin_testnet_canister_id
-                .ok_or(UserError::new(
-                    ErrorCode::CanisterNotHostedBySubnet,
-                    "Bitcoin testnet canister is not installed.".to_string(),
-                ))?
-        }
-        BitcoinNetwork::Mainnet | BitcoinNetwork::mainnet => network_topology
-            .bitcoin_mainnet_canister_id
-            .ok_or(UserError::new(
-                ErrorCode::CanisterNotHostedBySubnet,
-                "Bitcoin mainnet canister is not installed.".to_string(),
-            ))?,
-    };
-    Ok(canister_id)
-}
-
-impl QueryHandler for InternalHttpQueryHandler {
-    type State = ReplicatedState;
-
-    fn query(
+    /// Handle a query of type `UserQuery` which was sent by an end user.
+    pub fn query(
         &self,
         mut query: UserQuery,
         state: Labeled<Arc<ReplicatedState>>,
@@ -272,7 +242,7 @@ impl QueryHandler for InternalHttpQueryHandler {
 
         // Check the query cache first (if the query caching is enabled).
         // If a valid cache entry found, the result will be immediately returned.
-        // Otherwise, the key and the env will be kept for the `push` below.
+        // Otherwise, the key will be kept for the `push` below.
         let cache_entry_key = if self.config.query_caching == FlagStatus::Enabled {
             let key = query_cache::EntryKey::from(&query);
             let state = state.get_ref().as_ref();
@@ -316,6 +286,7 @@ impl QueryHandler for InternalHttpQueryHandler {
         );
 
         let result = context.run(query, &self.metrics, &measurement_scope);
+        context.accumulate_transient_errors_from_result(result.as_ref());
         context.observe_metrics(&self.metrics);
 
         // Add the query execution result to the query cache (if the query caching is enabled).
@@ -324,12 +295,39 @@ impl QueryHandler for InternalHttpQueryHandler {
             let state = state.get_ref().as_ref();
             let counters = context.system_api_call_counters();
             let stats = context.evaluated_canister_stats();
-            let errors = context.nested_execution_errors();
+            let errors = context.transient_errors();
             self.query_cache
                 .push(key, &result, state, counters, stats, errors);
         }
         result
     }
+}
+
+fn route_bitcoin_message(
+    network: BitcoinNetwork,
+    network_topology: &NetworkTopology,
+) -> Result<CanisterId, UserError> {
+    let canister_id = match network {
+        // Route to the bitcoin canister if it exists, otherwise return the error.
+        BitcoinNetwork::Testnet
+        | BitcoinNetwork::testnet
+        | BitcoinNetwork::Regtest
+        | BitcoinNetwork::regtest => {
+            network_topology
+                .bitcoin_testnet_canister_id
+                .ok_or(UserError::new(
+                    ErrorCode::CanisterNotHostedBySubnet,
+                    "Bitcoin testnet canister is not installed.".to_string(),
+                ))?
+        }
+        BitcoinNetwork::Mainnet | BitcoinNetwork::mainnet => network_topology
+            .bitcoin_mainnet_canister_id
+            .ok_or(UserError::new(
+                ErrorCode::CanisterNotHostedBySubnet,
+                "Bitcoin mainnet canister is not installed.".to_string(),
+            ))?,
+    };
+    Ok(canister_id)
 }
 
 fn fetch_canister_logs(
@@ -359,14 +357,20 @@ fn fetch_canister_logs(
     }?;
 
     let response = FetchCanisterLogsResponse {
-        canister_log_records: canister.system_state.canister_log_records.clone(),
+        canister_log_records: canister
+            .system_state
+            .canister_log
+            .records()
+            .iter()
+            .cloned()
+            .collect(),
     };
     Ok(WasmResult::Reply(Encode!(&response).unwrap()))
 }
 
 impl HttpQueryHandler {
     pub(crate) fn new_service(
-        internal: Arc<dyn QueryHandler<State = ReplicatedState>>,
+        internal: Arc<InternalHttpQueryHandler>,
         query_scheduler: QueryScheduler,
         state_reader: Arc<dyn StateReader<State = ReplicatedState>>,
         metrics_registry: &MetricsRegistry,
@@ -377,19 +381,6 @@ impl HttpQueryHandler {
             query_scheduler,
             metrics: Arc::new(HttpQueryHandlerMetrics::new(metrics_registry)),
         })
-    }
-}
-
-impl QueryHandler for HttpQueryHandler {
-    type State = ReplicatedState;
-
-    fn query(
-        &self,
-        query: UserQuery,
-        state: Labeled<Arc<Self::State>>,
-        data_certificate: Vec<u8>,
-    ) -> Result<WasmResult, UserError> {
-        self.internal.query(query, state, data_certificate)
     }
 }
 

@@ -43,11 +43,10 @@ use candid::{
     utils::{ArgumentDecoder, ArgumentEncoder},
     CandidType, Nat, Principal,
 };
-use ic_cdk::api::management_canister::{
-    main::{
-        CanisterInstallMode, CanisterStatusResponse, InstallCodeArgument, UpdateSettingsArgument,
-    },
-    provisional::{CanisterId, CanisterIdRecord, CanisterSettings},
+pub use ic_cdk::api::management_canister::main::CanisterSettings;
+use ic_cdk::api::management_canister::main::{
+    CanisterId, CanisterIdRecord, CanisterInstallMode, CanisterStatusResponse, InstallCodeArgument,
+    UpdateSettingsArgument,
 };
 use reqwest::Url;
 use schemars::JsonSchema;
@@ -1078,22 +1077,35 @@ pub enum TryFromError {
     PartialOrd, Ord, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
 )]
 pub enum ErrorCode {
+    // 1xx -- `RejectCode::SysFatal`
     SubnetOversubscribed = 101,
     MaxNumberOfCanistersReached = 102,
+    // 2xx -- `RejectCode::SysTransient`
     CanisterQueueFull = 201,
     IngressMessageTimeout = 202,
     CanisterQueueNotEmpty = 203,
     IngressHistoryFull = 204,
     CanisterIdAlreadyExists = 205,
+    StopCanisterRequestTimeout = 206,
+    CanisterOutOfCycles = 207,
+    CertifiedStateUnavailable = 208,
+    CanisterInstallCodeRateLimited = 209,
+    // 3xx -- `RejectCode::DestinationInvalid`
     CanisterNotFound = 301,
-    CanisterMethodNotFound = 302,
-    CanisterAlreadyInstalled = 303,
-    CanisterWasmModuleNotFound = 304,
+    // 302 (previously `CanisterMethodNotFound`)
+    // 303 (previously `CanisterAlreadyInstalled`)
+    // 304 (previously `CanisterWasmModuleNotFound`)
+    // 4xx -- `RejectCode::CanisterReject`
+    // 401
     InsufficientMemoryAllocation = 402,
     InsufficientCyclesForCreateCanister = 403,
     SubnetNotFound = 404,
     CanisterNotHostedBySubnet = 405,
-    CanisterOutOfCycles = 501,
+    CanisterRejectedMessage = 406,
+    UnknownManagementMessage = 407,
+    InvalidManagementPayload = 408,
+    // 5xx -- `RejectCode::CanisterError`
+    // 501 (previously `CanisterOutOfCycles`)
     CanisterTrapped = 502,
     CanisterCalledTrap = 503,
     CanisterContractViolation = 504,
@@ -1107,15 +1119,15 @@ pub enum ErrorCode {
     CanisterInvalidController = 512,
     CanisterFunctionNotFound = 513,
     CanisterNonEmpty = 514,
-    CertifiedStateUnavailable = 515,
-    CanisterRejectedMessage = 516,
+    // 515 (previously `CertifiedStateUnavailable`)
+    // 516 (previously `CanisterRejectedMessage`)
     QueryCallGraphLoopDetected = 517,
-    UnknownManagementMessage = 518,
-    InvalidManagementPayload = 519,
+    // 518 (previously `UnknownManagementMessage`)
+    // 519 (previously `InvalidManagementPayload`)
     InsufficientCyclesInCall = 520,
     CanisterWasmEngineError = 521,
     CanisterInstructionLimitExceeded = 522,
-    CanisterInstallCodeRateLimited = 523,
+    // 523 (previously `CanisterInstallCodeRateLimited`)
     CanisterMemoryAccessLimitExceeded = 524,
     QueryCallGraphTooDeep = 525,
     QueryCallGraphTotalInstructionLimitExceeded = 526,
@@ -1128,28 +1140,44 @@ pub enum ErrorCode {
     ReservedCyclesLimitExceededInMemoryAllocation = 533,
     ReservedCyclesLimitExceededInMemoryGrow = 534,
     InsufficientCyclesInMessageMemoryGrow = 535,
+    CanisterMethodNotFound = 536,
+    CanisterWasmModuleNotFound = 537,
+    CanisterAlreadyInstalled = 538,
 }
 
 impl TryFrom<u64> for ErrorCode {
     type Error = TryFromError;
     fn try_from(err: u64) -> Result<ErrorCode, Self::Error> {
         match err {
+            // 1xx -- `RejectCode::SysFatal`
             101 => Ok(ErrorCode::SubnetOversubscribed),
             102 => Ok(ErrorCode::MaxNumberOfCanistersReached),
+            // 2xx -- `RejectCode::SysTransient`
             201 => Ok(ErrorCode::CanisterQueueFull),
             202 => Ok(ErrorCode::IngressMessageTimeout),
             203 => Ok(ErrorCode::CanisterQueueNotEmpty),
             204 => Ok(ErrorCode::IngressHistoryFull),
             205 => Ok(ErrorCode::CanisterIdAlreadyExists),
+            206 => Ok(ErrorCode::StopCanisterRequestTimeout),
+            207 => Ok(ErrorCode::CanisterOutOfCycles),
+            208 => Ok(ErrorCode::CertifiedStateUnavailable),
+            209 => Ok(ErrorCode::CanisterInstallCodeRateLimited),
+            // 3xx -- `RejectCode::DestinationInvalid`
             301 => Ok(ErrorCode::CanisterNotFound),
-            302 => Ok(ErrorCode::CanisterMethodNotFound),
-            303 => Ok(ErrorCode::CanisterAlreadyInstalled),
-            304 => Ok(ErrorCode::CanisterWasmModuleNotFound),
+            // 302 (previously `CanisterMethodNotFound`)
+            // 303 (previously `CanisterAlreadyInstalled`)
+            // 304 (previously `CanisterWasmModuleNotFound`)
+            // 4xx -- `RejectCode::CanisterReject`
+            // 401
             402 => Ok(ErrorCode::InsufficientMemoryAllocation),
             403 => Ok(ErrorCode::InsufficientCyclesForCreateCanister),
             404 => Ok(ErrorCode::SubnetNotFound),
             405 => Ok(ErrorCode::CanisterNotHostedBySubnet),
-            501 => Ok(ErrorCode::CanisterOutOfCycles),
+            406 => Ok(ErrorCode::CanisterRejectedMessage),
+            407 => Ok(ErrorCode::UnknownManagementMessage),
+            408 => Ok(ErrorCode::InvalidManagementPayload),
+            // 5xx -- `RejectCode::CanisterError`
+            // 501 (previously `CanisterOutOfCycles`)
             502 => Ok(ErrorCode::CanisterTrapped),
             503 => Ok(ErrorCode::CanisterCalledTrap),
             504 => Ok(ErrorCode::CanisterContractViolation),
@@ -1163,15 +1191,15 @@ impl TryFrom<u64> for ErrorCode {
             512 => Ok(ErrorCode::CanisterInvalidController),
             513 => Ok(ErrorCode::CanisterFunctionNotFound),
             514 => Ok(ErrorCode::CanisterNonEmpty),
-            515 => Ok(ErrorCode::CertifiedStateUnavailable),
-            516 => Ok(ErrorCode::CanisterRejectedMessage),
+            // 515 (previously `CertifiedStateUnavailable`)
+            // 516 (previously `CanisterRejectedMessage`)
             517 => Ok(ErrorCode::QueryCallGraphLoopDetected),
-            518 => Ok(ErrorCode::UnknownManagementMessage),
-            519 => Ok(ErrorCode::InvalidManagementPayload),
+            // 518 (previously `UnknownManagementMessage`)
+            // 519 (previously `InvalidManagementPayload`)
             520 => Ok(ErrorCode::InsufficientCyclesInCall),
             521 => Ok(ErrorCode::CanisterWasmEngineError),
             522 => Ok(ErrorCode::CanisterInstructionLimitExceeded),
-            523 => Ok(ErrorCode::CanisterInstallCodeRateLimited),
+            // 523 (previously `CanisterInstallCodeRateLimited`)
             524 => Ok(ErrorCode::CanisterMemoryAccessLimitExceeded),
             525 => Ok(ErrorCode::QueryCallGraphTooDeep),
             526 => Ok(ErrorCode::QueryCallGraphTotalInstructionLimitExceeded),
@@ -1184,6 +1212,9 @@ impl TryFrom<u64> for ErrorCode {
             533 => Ok(ErrorCode::ReservedCyclesLimitExceededInMemoryAllocation),
             534 => Ok(ErrorCode::ReservedCyclesLimitExceededInMemoryGrow),
             535 => Ok(ErrorCode::InsufficientCyclesInMessageMemoryGrow),
+            536 => Ok(ErrorCode::CanisterMethodNotFound),
+            537 => Ok(ErrorCode::CanisterWasmModuleNotFound),
+            538 => Ok(ErrorCode::CanisterAlreadyInstalled),
             _ => Err(TryFromError::ValueOutOfRange(err)),
         }
     }

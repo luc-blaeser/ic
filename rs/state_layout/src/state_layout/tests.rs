@@ -8,13 +8,10 @@ use ic_replicated_state::{
     canister_state::system_state::CanisterHistory,
     metadata_state::subnet_call_context_manager::InstallCodeCallId, page_map::Shard, NumWasmPages,
 };
-use ic_test_utilities::types::ids::user_test_id;
-use ic_test_utilities::types::{
-    ids::canister_test_id,
-    messages::{IngressBuilder, RequestBuilder, ResponseBuilder},
-};
 use ic_test_utilities_logger::with_test_replica_logger;
 use ic_test_utilities_tmpdir::tmpdir;
+use ic_test_utilities_types::messages::{IngressBuilder, RequestBuilder, ResponseBuilder};
+use ic_test_utilities_types::{ids::canister_test_id, ids::user_test_id};
 use ic_types::messages::{CanisterCall, CanisterMessage, CanisterMessageOrTask};
 use ic_types::time::UNIX_EPOCH;
 use itertools::Itertools;
@@ -55,8 +52,7 @@ fn default_canister_state_bits() -> CanisterStateBits {
         wasm_chunk_store_metadata: WasmChunkStoreMetadata::default(),
         total_query_stats: TotalQueryStats::default(),
         log_visibility: LogVisibility::default(),
-        canister_log_records: Vec::new(),
-        next_canister_log_record_idx: 0,
+        canister_log: Default::default(),
     }
 }
 

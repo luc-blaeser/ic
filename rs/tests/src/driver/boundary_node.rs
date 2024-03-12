@@ -312,9 +312,14 @@ impl BoundaryNodeWithVm {
             let tnet_node = tnet.nodes.last().expect("no nodes");
             block_on(upload_image(
                 compressed_img_path,
-                &tnet_node.config_url.clone().expect("missing config url"),
+                &format!(
+                    "{}/{}",
+                    tnet_node.config_url.clone().expect("missing config url"),
+                    &mk_compressed_img_path()
+                ),
             ))?;
-            block_on(tnet_node.deploy_config_image()).expect("deploying config image failed");
+            block_on(tnet_node.deploy_config_image(&mk_compressed_img_path()))
+                .expect("deploying config image failed");
             block_on(tnet_node.start()).expect("starting vm failed");
         }
 
@@ -453,12 +458,15 @@ impl BoundaryNode {
                 let mut tnet = TNet::read_attribute(env);
                 block_on(tnet.deploy_boundary_image(boundary_node_img_url))
                     .expect("failed to deploy guestos image");
-                let vm_res = block_on(tnet.vm_create(CreateVmRequest {
-                    primary_image: ImageLocation::PersistentVolumeClaim {
-                        name: format!("{}-image-boundaryos", tnet.owner.name_any()),
+                let vm_res = block_on(tnet.vm_create(
+                    CreateVmRequest {
+                        primary_image: ImageLocation::PersistentVolumeClaim {
+                            name: format!("{}-image-boundaryos", tnet.owner.name_any()),
+                        },
+                        ..create_vm_req
                     },
-                    ..create_vm_req
-                }))
+                    ImageType::IcOsImage,
+                ))
                 .expect("failed to create vm");
                 tnet.write_attribute(env);
                 vm_res

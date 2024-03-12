@@ -14,12 +14,15 @@ use ic_icrc1_test_utils::{
     minter_identity, valid_transactions_strategy, ArgWithCaller, LedgerEndpointArg,
     DEFAULT_TRANSFER_FEE,
 };
-use ic_icrc_rosetta::common::types::Error;
-use ic_icrc_rosetta::common::types::TransferMetadata;
+use ic_icrc_rosetta::common::constants::*;
+use ic_icrc_rosetta::common::types::FeeSetter;
+use ic_icrc_rosetta::common::types::{Error, FeeMetadata};
 use ic_icrc_rosetta::common::utils::utils::icrc1_rosetta_block_to_rosetta_core_block;
 use ic_icrc_rosetta::common::utils::utils::icrc1_rosetta_block_to_rosetta_core_transaction;
 use ic_icrc_rosetta::construction_api::types::ConstructionMetadataRequestOptions;
 use ic_icrc_rosetta_client::RosettaClient;
+use ic_icrc_rosetta_runner::make_transaction_with_rosetta_client_binary;
+use ic_icrc_rosetta_runner::RosettaClientArgs;
 use ic_icrc_rosetta_runner::{
     start_rosetta, RosettaContext, RosettaOptions, DEFAULT_DECIMAL_PLACES,
 };
@@ -71,6 +74,10 @@ fn path_from_env(var: &str) -> PathBuf {
 
 fn rosetta_bin() -> PathBuf {
     path_from_env("ROSETTA_BIN_PATH")
+}
+
+fn rosetta_client_bin() -> PathBuf {
+    path_from_env("ROSETTA_CLIENT_BIN_PATH")
 }
 
 pub struct RosettaTestingEnvironment {
@@ -766,12 +773,15 @@ async fn test_construction_submit() {
         .build()
         .await;
 
-    let operation = rosetta_core::objects::Operation {
+    let to_operation = rosetta_core::objects::Operation {
         operation_identifier: OperationIdentifier {
-            index: 0,
+            index: TRANSFER_TO_OPERATION_IDENTIFIER,
             network_index: None,
         },
-        related_operations: None,
+        related_operations: Some(vec![
+            OperationIdentifier::new(TRANSFER_FROM_OPERATION_IDENTIFIER),
+            OperationIdentifier::new(FEE_OPERATION_IDENTIFIER),
+        ]),
         type_: "TRANSFER".to_owned(),
         status: None,
         account: Some(AccountIdentifier {
@@ -796,21 +806,92 @@ async fn test_construction_submit() {
             metadata: None,
         }),
         coin_change: None,
+        metadata: None,
+    };
+
+    let from_operation = rosetta_core::objects::Operation {
+        operation_identifier: OperationIdentifier {
+            index: TRANSFER_FROM_OPERATION_IDENTIFIER,
+            network_index: None,
+        },
+        related_operations: Some(vec![
+            OperationIdentifier::new(TRANSFER_TO_OPERATION_IDENTIFIER),
+            OperationIdentifier::new(FEE_OPERATION_IDENTIFIER),
+        ]),
+        type_: "TRANSFER".to_owned(),
+        status: None,
+        account: Some(AccountIdentifier {
+            address: sender_keypair
+                .generate_principal_id()
+                .unwrap()
+                .0
+                .to_string(),
+            sub_account: None,
+            metadata: None,
+        }),
+        amount: Some(rosetta_core::objects::Amount {
+            value: "-0".to_owned(),
+            currency: Currency {
+                symbol: env.icrc1_ledger_init_args.token_symbol.clone(),
+                decimals: env
+                    .icrc1_ledger_init_args
+                    .decimals
+                    .unwrap_or(DEFAULT_DECIMAL_PLACES) as u32,
+                metadata: None,
+            },
+            metadata: None,
+        }),
+        coin_change: None,
+        metadata: None,
+    };
+
+    let fee_operation = rosetta_core::objects::Operation {
+        operation_identifier: OperationIdentifier {
+            index: FEE_OPERATION_IDENTIFIER,
+            network_index: None,
+        },
+        related_operations: Some(vec![
+            OperationIdentifier::new(TRANSFER_FROM_OPERATION_IDENTIFIER),
+            OperationIdentifier::new(TRANSFER_TO_OPERATION_IDENTIFIER),
+        ]),
+        type_: "FEE".to_owned(),
+        status: None,
+        account: Some(AccountIdentifier {
+            address: sender_keypair
+                .generate_principal_id()
+                .unwrap()
+                .0
+                .to_string(),
+            sub_account: None,
+            metadata: None,
+        }),
+        amount: Some(rosetta_core::objects::Amount {
+            value: format!("-{}", Nat::from(DEFAULT_TRANSFER_FEE)),
+            currency: Currency {
+                symbol: env.icrc1_ledger_init_args.token_symbol.clone(),
+                decimals: env
+                    .icrc1_ledger_init_args
+                    .decimals
+                    .unwrap_or(DEFAULT_DECIMAL_PLACES) as u32,
+                metadata: None,
+            },
+            metadata: None,
+        }),
+        coin_change: None,
         metadata: Some(
-            TransferMetadata {
-                from_account: Account::from(sender_keypair.generate_principal_id().unwrap().0)
-                    .into(),
-                fee_set_by_user: None,
-                spender_account: None,
+            FeeMetadata {
+                fee_set_by: FeeSetter::User,
             }
             .try_into()
             .unwrap(),
         ),
     };
 
+    let mut operations = vec![to_operation, from_operation, fee_operation];
+
     let construction_preprocess_response = env
         .rosetta_client
-        .construction_preprocess(vec![operation.clone()], env.network_identifier.clone())
+        .construction_preprocess(operations.clone(), env.network_identifier.clone())
         .await
         .expect("Unable to call /construction/preprocess");
 
@@ -827,13 +908,14 @@ async fn test_construction_submit() {
         .rosetta_client
         .construction_payloads(
             env.network_identifier.clone(),
-            vec![operation.clone()],
+            operations.clone(),
             Some(public_keys),
+            None,
         )
         .await
         .expect("Unable to call /construction/payloads");
 
-    let construction_parse_response = env
+    let mut construction_parse_response = env
         .rosetta_client
         .construction_parse(
             env.network_identifier.clone(),
@@ -843,10 +925,23 @@ async fn test_construction_submit() {
         .await
         .expect("Unable to call /construction/parse");
 
-    assert_eq!(
-        construction_parse_response.operations,
-        vec![operation.clone()]
-    );
+    construction_parse_response
+        .operations
+        .iter_mut()
+        .for_each(|op| {
+            op.related_operations = op.related_operations.clone().map(|mut x| {
+                x.sort_by(|a, b| a.index.cmp(&b.index));
+                x
+            })
+        });
+    operations.iter_mut().for_each(|op| {
+        op.related_operations = op.related_operations.clone().map(|mut x| {
+            x.sort_by(|a, b| a.index.cmp(&b.index));
+            x
+        })
+    });
+
+    assert_eq!(construction_parse_response.operations, operations.clone());
 
     let signatures =
         RosettaClient::sign_transaction(&sender_keypair, construction_payloads_response.clone())
@@ -874,10 +969,7 @@ async fn test_construction_submit() {
         .await
         .expect("Unable to call /construction/parse");
 
-    assert_eq!(
-        construction_parse_response.operations,
-        vec![operation.clone()]
-    );
+    assert_eq!(construction_parse_response.operations, operations.clone());
 
     let balance_before_transfer = env
         .icrc1_agent
@@ -921,5 +1013,227 @@ async fn test_construction_submit() {
     assert_eq!(
         current_balance,
         balance_before_transfer - Nat::from(DEFAULT_TRANSFER_FEE)
+    );
+}
+
+#[tokio::test]
+async fn test_rosetta_client_construction_api_flow() {
+    let sender_keypair = EdKeypair::generate_from_u64(0);
+    let receiver_keypair = EdKeypair::generate_from_u64(1);
+
+    let env = RosettaTestingEnvironmentBuilder::new()
+        .with_init_args_builder(
+            local_replica::icrc_ledger_default_args_builder()
+                .with_minting_account((*MINTING_IDENTITY).clone().sender().unwrap())
+                .with_initial_balance(
+                    sender_keypair.generate_principal_id().unwrap().0,
+                    1_000_000_000_000u64,
+                ),
+        )
+        .build()
+        .await;
+
+    // Test the transfer functionality of the rosetta client
+    let transfer_amount: Nat = 1_000_000_000u64.into();
+
+    let operations = env
+        .rosetta_client
+        .build_transfer_operations(
+            &sender_keypair,
+            None,
+            receiver_keypair.generate_principal_id().unwrap().0.into(),
+            transfer_amount.clone(),
+            env.network_identifier.clone(),
+        )
+        .await
+        .unwrap();
+
+    let balance_before_transfer = env
+        .icrc1_agent
+        .balance_of(
+            sender_keypair.generate_principal_id().unwrap().0.into(),
+            CallMode::Query,
+        )
+        .await
+        .unwrap();
+
+    env.rosetta_client
+        .make_and_submit_transaction(
+            &sender_keypair,
+            env.network_identifier.clone(),
+            operations,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let current_balance = env
+        .icrc1_agent
+        .balance_of(
+            sender_keypair.generate_principal_id().unwrap().0.into(),
+            CallMode::Query,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        current_balance,
+        balance_before_transfer - Nat::from(DEFAULT_TRANSFER_FEE) - transfer_amount
+    );
+
+    // Test the approve functionality of the rosetta client
+    let approve_amount: Nat = 1_000_000_000u64.into();
+
+    let operations = env
+        .rosetta_client
+        .build_approve_operations(
+            &sender_keypair,
+            None,
+            receiver_keypair.generate_principal_id().unwrap().0.into(),
+            approve_amount.clone(),
+            None,
+            env.network_identifier.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let balance_before_approve = env
+        .icrc1_agent
+        .balance_of(
+            sender_keypair.generate_principal_id().unwrap().0.into(),
+            CallMode::Query,
+        )
+        .await
+        .unwrap();
+
+    env.rosetta_client
+        .make_and_submit_transaction(
+            &sender_keypair,
+            env.network_identifier.clone(),
+            operations,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let current_balance = env
+        .icrc1_agent
+        .balance_of(
+            sender_keypair.generate_principal_id().unwrap().0.into(),
+            CallMode::Query,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        current_balance,
+        balance_before_approve - Nat::from(DEFAULT_TRANSFER_FEE)
+    );
+}
+
+#[tokio::test]
+async fn test_rosetta_client_binary() {
+    let sender_keypair = EdKeypair::generate_from_u64(0);
+    let receiver_keypair = EdKeypair::generate_from_u64(1);
+
+    let sender_account = Account {
+        owner: sender_keypair.generate_principal_id().unwrap().0,
+        subaccount: Some([1; 32]),
+    };
+
+    let env = RosettaTestingEnvironmentBuilder::new()
+        .with_init_args_builder(
+            local_replica::icrc_ledger_default_args_builder()
+                .with_minting_account((*MINTING_IDENTITY).clone().sender().unwrap())
+                .with_initial_balance(sender_account, 1_000_000_000_000u64),
+        )
+        .build()
+        .await;
+
+    // Test the transfer functionality of the rosetta client binary
+    let transfer_amount: Nat = 1_000_000_000u64.into();
+
+    let balance_before_transfer = env
+        .icrc1_agent
+        .balance_of(sender_account, CallMode::Query)
+        .await
+        .unwrap();
+
+    let rosetta_client_args = RosettaClientArgs {
+        operation_type: "transfer".to_owned(),
+        to: Some(receiver_keypair.generate_principal_id().unwrap().0.into()),
+        spender: None,
+        from_subaccount: sender_account.subaccount.map(|s| s.to_vec()),
+        amount: Some(transfer_amount.clone()),
+        allowance: None,
+        rosetta_url: env.rosetta_client.url.clone().to_string(),
+        expires_at: None,
+        expected_allowance: None,
+        memo: None,
+        created_at_time: None,
+    };
+
+    make_transaction_with_rosetta_client_binary(
+        &rosetta_client_bin(),
+        rosetta_client_args,
+        sender_keypair.to_pem(),
+    )
+    .await
+    .unwrap();
+
+    let current_balance = env
+        .icrc1_agent
+        .balance_of(sender_account, CallMode::Query)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        current_balance,
+        balance_before_transfer - Nat::from(DEFAULT_TRANSFER_FEE) - transfer_amount
+    );
+
+    // Test the approve functionality of the rosetta client binary
+    let approve_amount: Nat = 1_000_000_000u64.into();
+
+    let balance_before_approve = env
+        .icrc1_agent
+        .balance_of(sender_account, CallMode::Query)
+        .await
+        .unwrap();
+
+    let rosetta_client_args = RosettaClientArgs {
+        operation_type: "approve".to_owned(),
+        to: None,
+        spender: Some(receiver_keypair.generate_principal_id().unwrap().0.into()),
+        from_subaccount: sender_account.subaccount.map(|s| s.to_vec()),
+        amount: None,
+        allowance: Some(approve_amount),
+        rosetta_url: env.rosetta_client.url.clone().to_string(),
+        expires_at: None,
+        expected_allowance: None,
+        memo: Some(b"test_bytes".to_vec()),
+        created_at_time: None,
+    };
+
+    make_transaction_with_rosetta_client_binary(
+        &rosetta_client_bin(),
+        rosetta_client_args,
+        sender_keypair.to_pem(),
+    )
+    .await
+    .unwrap();
+
+    let current_balance = env
+        .icrc1_agent
+        .balance_of(sender_account, CallMode::Query)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        current_balance,
+        balance_before_approve - Nat::from(DEFAULT_TRANSFER_FEE)
     );
 }

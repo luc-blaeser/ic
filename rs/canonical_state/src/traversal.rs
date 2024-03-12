@@ -63,15 +63,17 @@ mod tests {
         testing::ReplicatedStateTesting,
         Memory,
     };
-    use ic_test_utilities::{
-        state::new_canister_state,
-        types::ids::{canister_test_id, node_test_id, subnet_test_id, user_test_id},
-        types::xnet::StreamHeaderBuilder,
+    use ic_test_utilities::state::new_canister_state;
+    use ic_test_utilities_types::ids::{
+        canister_test_id, node_test_id, subnet_test_id, user_test_id,
     };
-    use ic_types::{CanisterId, Cycles, ExecutionRound};
+    use ic_types::{
+        xnet::{StreamFlags, StreamHeader},
+        CanisterId, Cycles, ExecutionRound,
+    };
     use ic_wasm_types::CanisterModule;
     use maplit::{btreemap, btreeset};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, VecDeque};
     use std::convert::TryFrom;
     use std::sync::Arc;
     use std::time::Duration;
@@ -346,11 +348,13 @@ mod tests {
         use ic_replicated_state::metadata_state::Stream;
         use ic_types::xnet::{StreamIndex, StreamIndexedQueue};
 
-        let header = StreamHeaderBuilder::new()
-            .begin(4.into())
-            .end(4.into())
-            .signals_end(11.into())
-            .build();
+        let header = StreamHeader::new(
+            4.into(),
+            4.into(),
+            11.into(),
+            VecDeque::default(),
+            StreamFlags::default(),
+        );
 
         let stream = Stream::new(
             StreamIndexedQueue::with_begin(StreamIndex::from(4)),
@@ -422,7 +426,7 @@ mod tests {
     fn test_traverse_ingress_history() {
         use crate::subtree_visitor::{Pattern, SubtreeVisitor};
         use ic_error_types::{ErrorCode, UserError};
-        use ic_test_utilities::types::ids::{message_test_id, subnet_test_id, user_test_id};
+        use ic_test_utilities_types::ids::{message_test_id, subnet_test_id, user_test_id};
         use ic_types::ingress::{IngressState, IngressStatus, WasmResult};
         use ic_types::time::UNIX_EPOCH;
 
@@ -554,7 +558,7 @@ mod tests {
                     E::StartSubtree,
                 ]),
                 (certification_version >= V11)
-                    .then_some(vec![edge("error_code"), E::VisitBlob(b"IC0516".to_vec())]),
+                    .then_some(vec![edge("error_code"), E::VisitBlob(b"IC0406".to_vec())]),
                 Some(vec![
                     edge("reject_code"),
                     leb_num(4),

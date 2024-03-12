@@ -6,7 +6,7 @@ mod provisional;
 #[cfg(feature = "fuzzing_code")]
 use arbitrary::{Arbitrary, Result as ArbitraryResult, Unstructured};
 pub use bounded_vec::*;
-use candid::{CandidType, Decode, Deserialize, Encode};
+use candid::{CandidType, Decode, DecoderConfig, Deserialize, Encode};
 pub use http::{
     BoundedHttpHeaders, CanisterHttpRequestArgs, CanisterHttpResponsePayload, HttpHeader,
     HttpMethod, TransformArgs, TransformContext, TransformFunc,
@@ -29,7 +29,14 @@ pub use provisional::{ProvisionalCreateCanisterWithCyclesArgs, ProvisionalTopUpC
 use serde::Serialize;
 use serde_bytes::ByteBuf;
 use std::mem::size_of;
-use std::{collections::BTreeSet, convert::TryFrom, error::Error, fmt, slice::Iter, str::FromStr};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    convert::TryFrom,
+    error::Error,
+    fmt,
+    slice::Iter,
+    str::FromStr,
+};
 use strum_macros::{Display, EnumIter, EnumString};
 
 /// The id of the management canister.
@@ -45,6 +52,17 @@ const WASM_HASH_LENGTH: usize = 32;
 /// See https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki#serialization-format
 /// for details
 const MAXIMUM_DERIVATION_PATH_LENGTH: usize = 255;
+
+/// Limit the amount of work for skipping unneeded data on the wire when parsing Candid.
+/// The value of 10_000 follows the Candid recommendation.
+const DEFAULT_SKIPPING_QUOTA: usize = 10_000;
+
+fn decoder_config() -> DecoderConfig {
+    let mut config = DecoderConfig::new();
+    config.set_skipping_quota(DEFAULT_SKIPPING_QUOTA);
+    config.set_full_error_message(false);
+    config
+}
 
 /// Methods exported by ic:00.
 #[derive(Debug, EnumString, EnumIter, Display, Copy, Clone, PartialEq, Eq)]
@@ -115,7 +133,7 @@ pub trait Payload<'a>: Sized + CandidType + Deserialize<'a> {
     }
 
     fn decode(blob: &'a [u8]) -> Result<Self, UserError> {
-        Decode!(blob, Self).map_err(candid_error_to_user_error)
+        Decode!([decoder_config()]; blob, Self).map_err(candid_error_to_user_error)
     }
 }
 
@@ -1516,7 +1534,7 @@ impl<'a> Payload<'a> for EmptyBlob {
     }
 
     fn decode(blob: &'a [u8]) -> Result<EmptyBlob, UserError> {
-        Decode!(blob)
+        Decode!([decoder_config()]; blob)
             .map(|_| EmptyBlob)
             .map_err(candid_error_to_user_error)
     }
@@ -1782,7 +1800,7 @@ impl CreateCanisterArgs {
 
 impl<'a> Payload<'a> for CreateCanisterArgs {
     fn decode(blob: &'a [u8]) -> Result<Self, UserError> {
-        match Decode!(blob, Self) {
+        match Decode!([decoder_config()]; blob, Self) {
             Err(err) => {
                 // First check if deserialization failed due to exceeding the maximum allowed limit.
                 if format!("{err:?}").contains("The number of elements exceeds maximum allowed") {
@@ -1922,7 +1940,7 @@ impl SetupInitialDKGResponse {
 
     pub fn decode(blob: &[u8]) -> Result<Self, UserError> {
         let serde_encoded_transcript_records =
-            Decode!(blob, Vec<u8>).map_err(candid_error_to_user_error)?;
+            Decode!([decoder_config()]; blob, Vec<u8>).map_err(candid_error_to_user_error)?;
         match serde_cbor::from_slice::<(
             InitialNiDkgTranscriptRecord,
             InitialNiDkgTranscriptRecord,
@@ -2329,7 +2347,7 @@ impl ComputeInitialEcdsaDealingsResponse {
 
     pub fn decode(blob: &[u8]) -> Result<Self, UserError> {
         let serde_encoded_transcript_records =
-            Decode!(blob, Vec<u8>).map_err(candid_error_to_user_error)?;
+            Decode!([decoder_config()]; blob, Vec<u8>).map_err(candid_error_to_user_error)?;
         match serde_cbor::from_slice::<(InitialIDkgDealings,)>(&serde_encoded_transcript_records) {
             Err(err) => Err(UserError::new(
                 ErrorCode::CanisterContractViolation,
@@ -2489,6 +2507,71 @@ impl From<CanisterLogRecord> for pb_canister_state_bits::CanisterLogRecord {
             timestamp_nanos: item.timestamp_nanos,
             content: item.content,
         }
+    }
+}
+
+/// The maximum allowed size of a canister log buffer.
+pub const MAX_ALLOWED_CANISTER_LOG_BUFFER_SIZE: usize = 4 * 1024;
+
+// TODO(EXC-1572): needs refactoring to find a proper place to put this.
+/// Holds canister log records and keeps track of the next canister log record index.
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CanisterLog {
+    next_idx: u64,
+    records: VecDeque<CanisterLogRecord>,
+}
+
+impl CanisterLog {
+    /// Creates a new `CanisterLog` with the given next index and records.
+    pub fn new(next_idx: u64, records: Vec<CanisterLogRecord>) -> Self {
+        Self {
+            next_idx,
+            records: VecDeque::from(records),
+        }
+    }
+
+    /// Creates a new `CanisterLog` with the given next index and an empty records list.
+    pub fn new_with_next_index(next_idx: u64) -> Self {
+        Self::new(next_idx, Default::default())
+    }
+
+    /// Returns the next canister log record index.
+    pub fn next_idx(&self) -> u64 {
+        self.next_idx
+    }
+
+    /// Returns the canister log records.
+    pub fn records(&self) -> &VecDeque<CanisterLogRecord> {
+        &self.records
+    }
+
+    /// Adds a new log record.
+    pub fn add_record(&mut self, timestamp_nanos: u64, content: &[u8]) {
+        // Keep the new log record size within limit.
+        let max_content_size =
+            MAX_ALLOWED_CANISTER_LOG_BUFFER_SIZE - CanisterLogRecord::default().data_size();
+        let size = content.len().min(max_content_size);
+        self.records.push_back(CanisterLogRecord {
+            idx: self.next_idx,
+            timestamp_nanos,
+            content: content[..size].to_vec(),
+        });
+        // Update the next canister log record index.
+        self.next_idx += 1;
+        // Keep the total canister log records size within limit.
+        while self.records.data_size() > MAX_ALLOWED_CANISTER_LOG_BUFFER_SIZE {
+            self.records.pop_front();
+        }
+    }
+
+    /// Moves all the logs from `other` to `self`.
+    pub fn append(&mut self, other: &mut Self) {
+        // Assume records sorted cronologically (with increasing idx) and
+        // update the system state's next index with the last record's index.
+        if let Some(last) = other.records.back() {
+            self.next_idx = last.idx + 1;
+        }
+        self.records.append(&mut other.records);
     }
 }
 
@@ -2712,11 +2795,49 @@ pub struct TakeCanisterSnapshotResponse {
 impl Payload<'_> for TakeCanisterSnapshotResponse {}
 
 impl TakeCanisterSnapshotResponse {
-    pub fn new(snapshot_id: u64, taken_at_timestamp: u64, total_size: u64) -> Self {
+    pub fn new(snapshot_id: u64, taken_at_timestamp: u64, total_size: NumBytes) -> Self {
         Self {
             snapshot_id: candid::Nat::from(snapshot_id),
             taken_at_timestamp,
-            total_size: candid::Nat::from(total_size),
+            total_size: candid::Nat::from(total_size.get()),
         }
+    }
+
+    pub fn snapshot_id(&self) -> u64 {
+        self.snapshot_id.0.to_u64().unwrap()
+    }
+
+    pub fn total_size(&self) -> u64 {
+        self.total_size.0.to_u64().unwrap()
+    }
+}
+
+/// Struct used for encoding/decoding
+/// `(record {
+///     canister_id: principal;
+///     snapshot_id: nat;
+/// })`
+#[derive(Default, Clone, CandidType, Deserialize, Debug, PartialEq, Eq)]
+pub struct DeleteCanisterSnapshotArgs {
+    pub canister_id: PrincipalId,
+    pub snapshot_id: candid::Nat,
+}
+
+impl Payload<'_> for DeleteCanisterSnapshotArgs {}
+
+impl DeleteCanisterSnapshotArgs {
+    pub fn new(canister_id: CanisterId, snapshot_id: u64) -> Self {
+        Self {
+            canister_id: canister_id.get(),
+            snapshot_id: candid::Nat::from(snapshot_id),
+        }
+    }
+
+    pub fn get_canister_id(&self) -> CanisterId {
+        CanisterId::unchecked_from_principal(self.canister_id)
+    }
+
+    pub fn get_snapshot_id(&self) -> u64 {
+        self.snapshot_id.0.to_u64().unwrap()
     }
 }

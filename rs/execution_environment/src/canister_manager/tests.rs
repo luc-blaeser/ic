@@ -53,19 +53,19 @@ use ic_test_utilities::{
         get_stopping_canister_with_controller, CallContextBuilder, CanisterStateBuilder,
         ReplicatedStateBuilder,
     },
-    types::{
-        ids::{canister_test_id, message_test_id, subnet_test_id, user_test_id},
-        messages::{IngressBuilder, RequestBuilder, SignedIngressBuilder},
-    },
     universal_canister::{call_args, wasm, UNIVERSAL_CANISTER_WASM},
 };
 use ic_test_utilities_execution_environment::{
     assert_delta, get_reply, get_routing_table_with_specified_ids_allocation_range,
     wasm_compilation_cost, wat_compilation_cost, ExecutionTest, ExecutionTestBuilder,
 };
+use ic_test_utilities_types::{
+    ids::{canister_test_id, message_test_id, subnet_test_id, user_test_id},
+    messages::{IngressBuilder, RequestBuilder, SignedIngressBuilder},
+};
 use ic_types::{
     ingress::{IngressState, IngressStatus, WasmResult},
-    messages::{CallbackId, CanisterCall, StopCanisterCallId, StopCanisterContext},
+    messages::{CallbackId, CanisterCall, StopCanisterCallId, StopCanisterContext, NO_DEADLINE},
     nominal_cycles::NominalCycles,
     time::UNIX_EPOCH,
     CanisterId, CanisterTimer, ComputeAllocation, Cycles, MemoryAllocation, NumBytes,
@@ -1717,6 +1717,7 @@ fn stop_a_running_canister() {
             reply_callback: CallbackId::new(0),
             call_id: Some(StopCanisterCallId::new(0)),
             cycles: Cycles::zero(),
+            deadline: NO_DEADLINE,
         };
         assert_eq!(
             canister_manager.stop_canister(canister_id, stop_context.clone(), &mut state),
@@ -1799,6 +1800,7 @@ fn stop_a_stopped_canister_from_another_canister() {
             reply_callback: CallbackId::from(0),
             call_id: Some(StopCanisterCallId::new(0)),
             cycles: Cycles::from(cycles),
+            deadline: NO_DEADLINE,
         };
         assert_eq!(
             canister_manager.stop_canister(canister_id, stop_context, &mut state),
