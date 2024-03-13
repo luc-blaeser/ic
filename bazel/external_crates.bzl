@@ -263,7 +263,7 @@ def external_crates_repository(name, cargo_lockfile, lockfile, sanitizers_enable
                 default_features = False,
             ),
             "candid": crate.spec(
-                version = "^0.10.2",
+                version = "^0.10.5",
             ),
             "cargo_metadata": crate.spec(
                 version = "^0.14.2",
@@ -296,14 +296,14 @@ def external_crates_repository(name, cargo_lockfile, lockfile, sanitizers_enable
             "cidr": crate.spec(
                 version = "^0.2.2",
             ),
-            "clap": crate.spec(
+            "clap_3_2_25": crate.spec(
+                package = "clap",
                 version = "^3.2.25",
                 features = [
                     "derive",
                 ],
             ),
-            "clap_4_0_0": crate.spec(
-                package = "clap",
+            "clap": crate.spec(
                 version = "^4.0.0",
                 features = [
                     "derive",
@@ -560,13 +560,13 @@ def external_crates_repository(name, cargo_lockfile, lockfile, sanitizers_enable
                 version = "2.3.0",
             ),
             "ic-cdk": crate.spec(
-                version = "^0.12.0",
+                version = "^0.13.1",
             ),
             "ic-cdk-timers": crate.spec(
-                version = "^0.6.0",
+                version = "^0.7.0",
             ),
             "ic-cdk-macros": crate.spec(
-                version = "^0.8.3",
+                version = "^0.9.0",
             ),
             "ic-certified-map": crate.spec(
                 version = "^0.3.1",
@@ -579,6 +579,10 @@ def external_crates_repository(name, cargo_lockfile, lockfile, sanitizers_enable
             ),
             "ic-metrics-encoder": crate.spec(
                 version = "^1.1.1",
+            ),
+            "ic_principal": crate.spec(
+                version = "^0.1.1",
+                default_features = False,
             ),
             "ic-stable-structures": crate.spec(
                 version = "^0.6.0",
