@@ -70,7 +70,7 @@ impl RequestInPrep {
             // the minimum of the limits.
 
             // method_name checked against sum of exported function names.
-            if method_name_len as usize > max_sum_exported_function_name_lengths {
+            if method_name_len > max_sum_exported_function_name_lengths {
                 return Err(HypervisorError::ContractViolation(format!(
                     "Size of method_name {} exceeds the allowed sum of exported function name lengths {}",
                     method_name_len, max_sum_exported_function_name_lengths

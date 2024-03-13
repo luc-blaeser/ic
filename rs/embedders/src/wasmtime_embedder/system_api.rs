@@ -1315,7 +1315,7 @@ pub(crate) fn syscalls(
         charge_for_cpu_and_mem(
             &mut caller,
             overhead!(CERTIFIED_DATA_SET, metering_type),
-            size as u64,
+            size,
         )?;
         with_memory_and_system_api(&mut caller, |system_api, memory| {
             system_api.ic0_certified_data_set_64(src, size, memory)
