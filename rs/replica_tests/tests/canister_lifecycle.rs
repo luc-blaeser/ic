@@ -992,6 +992,7 @@ fn test_canister_skip_upgrade() {
                 management::install_code(canister_id, UNIVERSAL_CANISTER_WASM).with_mode(
                     management::InstallMode::Upgrade(Some(CanisterUpgradeOptions {
                         skip_pre_upgrade: Some(false),
+                        wasm_memory_persistence: None,
                     })),
                 ),
             )),
@@ -1004,6 +1005,7 @@ fn test_canister_skip_upgrade() {
                 management::install_code(canister_id, UNIVERSAL_CANISTER_WASM).with_mode(
                     management::InstallMode::Upgrade(Some(CanisterUpgradeOptions {
                         skip_pre_upgrade: Some(true),
+                        wasm_memory_persistence: None,
                     }))
                 ),
             )),
@@ -1017,6 +1019,7 @@ fn test_canister_skip_upgrade() {
                 management::install_code(canister_id, UNIVERSAL_CANISTER_WASM).with_mode(
                     management::InstallMode::Upgrade(Some(CanisterUpgradeOptions {
                         skip_pre_upgrade: Some(false),
+                        wasm_memory_persistence: None,
                     })),
                 ),
             )),

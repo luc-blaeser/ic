@@ -7,19 +7,19 @@ use std::sync::Arc;
 
 use crate::as_round_instructions;
 use crate::canister_manager::{
-    DtsInstallCodeResult, InstallCodeContext, PausedInstallCodeExecution,
+    CanisterManagerError, DtsInstallCodeResult, InstallCodeContext, PausedInstallCodeExecution,
 };
 use crate::execution::common::{ingress_status_with_processing_state, update_round_limits};
 use crate::execution::install_code::{
-    canister_layout, finish_err, InstallCodeHelper, MainMemoryHandling, MemoryHandling,
-    OriginalContext, PausedInstallCodeHelper, StableMemoryHandling,
+    canister_layout, finish_err, CanisterMemoryHandling, InstallCodeHelper, OriginalContext,
+    PausedInstallCodeHelper,
 };
 use crate::execution_environment::{RoundContext, RoundLimits};
 use ic_base_types::PrincipalId;
 use ic_embedders::wasm_executor::{CanisterStateChanges, PausedWasmExecution, WasmExecutionResult};
 use ic_interfaces::execution_environment::{HypervisorError, WasmExecutionOutput};
 use ic_logger::{info, warn, ReplicaLogger};
-use ic_management_canister_types::CanisterInstallModeV2;
+use ic_management_canister_types::{CanisterInstallModeV2, WasmMemoryPersistence};
 use ic_replicated_state::page_map::PageAllocatorFileDescriptor;
 use ic_replicated_state::{
     metadata_state::subnet_call_context_manager::InstallCodeCallId, CanisterState, SystemState,
@@ -30,6 +30,8 @@ use ic_types::{
     funds::Cycles,
     messages::{CanisterCall, RequestMetadata},
 };
+
+use super::install_code::MemoryHandling;
 
 #[cfg(test)]
 mod tests;
@@ -288,19 +290,35 @@ fn upgrade_stage_2_and_3a_create_execution_state_and_call_start(
 
     let main_memory_handling = match context.mode {
         CanisterInstallModeV2::Upgrade(Some(upgrade_options)) => {
-            match upgrade_options.keep_main_memory {
-                Some(true) => MainMemoryHandling::Keep,
-                Some(false) => MainMemoryHandling::Replace { explicit: true },
-                None => MainMemoryHandling::Replace { explicit: false },
+            match upgrade_options.wasm_memory_persistence {
+                Some(WasmMemoryPersistence::Keep) => MemoryHandling::Keep,
+                Some(WasmMemoryPersistence::Drop) => MemoryHandling::Replace,
+                None => {
+                    // Safety guard checking that the `wasm_memory_persistence` upgrade option has not been omitted in error.
+                    if helper.expects_orthogonal_persistence() {
+                        let instructions_left = helper.instructions_left();
+                        let message = "Enhanced orthogonal persistence requires the `wasm_memory_persistence` upgrade option.".to_string();
+                        let error = CanisterManagerError::MissingUpgradeOptionError { message };
+                        return finish_err(
+                            clean_canister,
+                            instructions_left,
+                            original,
+                            round,
+                            error,
+                        );
+                    }
+                    MemoryHandling::Replace
+                }
             }
         }
-        _ => MainMemoryHandling::Replace { explicit: false },
+        _ => MemoryHandling::Replace,
     };
 
-    let memory_handling = MemoryHandling {
-        stable_memory_handling: StableMemoryHandling::Keep,
+    let memory_handling = CanisterMemoryHandling {
+        stable_memory_handling: MemoryHandling::Keep,
         main_memory_handling,
     };
+
     if let Err(err) = helper.replace_execution_state_and_allocations(
         instructions_from_compilation,
         result,
