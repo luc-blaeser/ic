@@ -47,32 +47,6 @@ pub(crate) enum MemoryHandling {
     Keep,
     /// Reset the memory.
     Replace,
-    /// Retain the stable memory on upgrade.
-    Keep,
-}
-
-/// Indicates whether the main memory is kept or replaced with new (empty) memory.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum MainMemoryHandling {
-    /// Erase the main memory on install, re-install, or on an ordinary upgrade that does not
-    /// use enhanced orthogonal persistence.
-    /// `explicit` denotes whether the upgrade option `keep_main_memory = false` is specified
-    /// or it is an install or re-install.
-    Replace { explicit: bool },
-    /// For enhanced orthogonal persistence (as with Motoko): Retain the main memory on upgrade.
-    Keep,
-}
-
-/// Specifies the retention of the canister's memories.
-/// * On install and re-install:
-///   - Replace both stable and main memory.
-/// * On upgrade:
-///   - For canisters with enhanced orthogonal persistence (Motoko): Retain both main and stable memory.
-///   - For all other canisters: Retain only stable memory and erase main memory.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct MemoryHandling {
-    pub stable_memory_handling: StableMemoryHandling,
-    pub main_memory_handling: MainMemoryHandling,
 }
 
 /// Specifies the handling of the canister's memories.
