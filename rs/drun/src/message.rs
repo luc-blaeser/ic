@@ -1,7 +1,7 @@
 use super::CanisterId;
 
 use hex::decode;
-use ic_execution_environment::execution::install_code::ENHANCED_ORTHOGONAL_PERSISTENCE_SECTION;
+use ic_execution_environment::execution::upgrade::ENHANCED_ORTHOGONAL_PERSISTENCE_SECTION;
 use ic_management_canister_types::{
     self as ic00, CanisterInstallModeV2, CanisterUpgradeOptions, Payload, WasmMemoryPersistence,
 };
