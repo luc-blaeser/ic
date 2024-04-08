@@ -2037,6 +2037,9 @@ pub(crate) enum CanisterManagerError {
     MissingUpgradeOptionError {
         message: String,
     },
+    InvalidUpgradeOptionError {
+        message: String,
+    },
 }
 
 impl From<CanisterManagerError> for UserError {
@@ -2300,6 +2303,14 @@ impl From<CanisterManagerError> for UserError {
                     ErrorCode::CanisterContractViolation,
                     format!(
                         "Missing upgrade option: {}", message
+                    )
+                )
+            }
+            InvalidUpgradeOptionError { message } => {
+                Self::new(
+                    ErrorCode::CanisterContractViolation,
+                    format!(
+                        "Invalid upgrade option: {}", message
                     )
                 )
             }
