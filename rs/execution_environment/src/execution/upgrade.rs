@@ -112,6 +112,7 @@ pub(crate) fn execute_upgrade(
             original,
             round,
             err,
+            helper.take_canister_log(),
         );
     }
 
@@ -128,6 +129,7 @@ pub(crate) fn execute_upgrade(
                 original,
                 round,
                 (canister_id, HypervisorError::WasmModuleNotFound).into(),
+                helper.take_canister_log(),
             );
         }
     };
@@ -229,7 +231,14 @@ fn upgrade_stage_1_process_pre_upgrade_result(
 
     if let Err(err) = result {
         let instructions_left = helper.instructions_left();
-        return finish_err(clean_canister, instructions_left, original, round, err);
+        return finish_err(
+            clean_canister,
+            instructions_left,
+            original,
+            round,
+            err,
+            helper.take_canister_log(),
+        );
     }
 
     upgrade_stage_2_and_3a_create_execution_state_and_call_start(
@@ -266,6 +275,7 @@ fn upgrade_stage_2_and_3a_create_execution_state_and_call_start(
                 original,
                 round,
                 err,
+                helper.take_canister_log(),
             );
         }
     };
@@ -307,7 +317,14 @@ fn upgrade_stage_2_and_3a_create_execution_state_and_call_start(
         &original,
     ) {
         let instructions_left = helper.instructions_left();
-        return finish_err(clean_canister, instructions_left, original, round, err);
+        return finish_err(
+            clean_canister,
+            instructions_left,
+            original,
+            round,
+            err,
+            helper.take_canister_log(),
+        );
     }
 
     helper.deactivate_global_timer();
@@ -412,7 +429,14 @@ fn upgrade_stage_3b_process_start_result(
 
     if let Err(err) = result {
         let instructions_left = helper.instructions_left();
-        return finish_err(clean_canister, instructions_left, original, round, err);
+        return finish_err(
+            clean_canister,
+            instructions_left,
+            original,
+            round,
+            err,
+            helper.take_canister_log(),
+        );
     }
 
     upgrade_stage_4a_call_post_upgrade(
@@ -519,7 +543,14 @@ fn upgrade_stage_4b_process_post_upgrade_result(
     );
     if let Err(err) = result {
         let instructions_left = helper.instructions_left();
-        return finish_err(clean_canister, instructions_left, original, round, err);
+        return finish_err(
+            clean_canister,
+            instructions_left,
+            original,
+            round,
+            err,
+            helper.take_canister_log(),
+        );
     }
     helper.finish(clean_canister, original, round, round_limits)
 }
@@ -555,7 +586,7 @@ impl PausedInstallCodeExecution for PausedPreUpgradeExecution {
             round_limits,
         ) {
             Ok(helper) => helper,
-            Err((err, instructions_left)) => {
+            Err((err, instructions_left, new_canister_log)) => {
                 warn!(
                     round.log,
                     "[DTS] Canister {} failed to resume paused (canister_pre_upgrade) execution: {:?}.",
@@ -563,7 +594,14 @@ impl PausedInstallCodeExecution for PausedPreUpgradeExecution {
                     err
                 );
                 self.paused_wasm_execution.abort();
-                return finish_err(clean_canister, instructions_left, self.original, round, err);
+                return finish_err(
+                    clean_canister,
+                    instructions_left,
+                    self.original,
+                    round,
+                    err,
+                    new_canister_log,
+                );
             }
         };
         let execution_state = helper.canister().execution_state.as_ref().unwrap();
@@ -653,7 +691,7 @@ impl PausedInstallCodeExecution for PausedStartExecutionDuringUpgrade {
             round_limits,
         ) {
             Ok(helper) => helper,
-            Err((err, instructions_left)) => {
+            Err((err, instructions_left, new_canister_log)) => {
                 warn!(
                     round.log,
                     "[DTS] Canister {} failed to resume paused (start) execution: {:?}.",
@@ -661,7 +699,14 @@ impl PausedInstallCodeExecution for PausedStartExecutionDuringUpgrade {
                     err
                 );
                 self.paused_wasm_execution.abort();
-                return finish_err(clean_canister, instructions_left, self.original, round, err);
+                return finish_err(
+                    clean_canister,
+                    instructions_left,
+                    self.original,
+                    round,
+                    err,
+                    new_canister_log,
+                );
             }
         };
         let execution_state = helper.canister().execution_state.as_ref().unwrap();
@@ -750,7 +795,7 @@ impl PausedInstallCodeExecution for PausedPostUpgradeExecution {
             round_limits,
         ) {
             Ok(helper) => helper,
-            Err((err, instructions_left)) => {
+            Err((err, instructions_left, new_canister_log)) => {
                 warn!(
                     round.log,
                     "[DTS] Canister {} failed to resume paused (canister_post_upgrade) execution: {:?}.",
@@ -758,7 +803,14 @@ impl PausedInstallCodeExecution for PausedPostUpgradeExecution {
                     err
                 );
                 self.paused_wasm_execution.abort();
-                return finish_err(clean_canister, instructions_left, self.original, round, err);
+                return finish_err(
+                    clean_canister,
+                    instructions_left,
+                    self.original,
+                    round,
+                    err,
+                    new_canister_log,
+                );
             }
         };
         let execution_state = helper.canister().execution_state.as_ref().unwrap();
