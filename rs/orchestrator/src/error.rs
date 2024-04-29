@@ -1,11 +1,14 @@
 use ic_http_utils::file_downloader::FileDownloadError;
 use ic_image_upgrader::error::UpgradeError;
-use ic_types::replica_version::ReplicaVersionParseError;
-use ic_types::{registry::RegistryClientError, NodeId, RegistryVersion, ReplicaVersion, SubnetId};
-use std::error::Error;
-use std::fmt;
-use std::io;
-use std::path::{Path, PathBuf};
+use ic_types::{
+    registry::RegistryClientError, replica_version::ReplicaVersionParseError, NodeId,
+    RegistryVersion, ReplicaVersion, SubnetId,
+};
+use std::{
+    error::Error,
+    fmt, io,
+    path::{Path, PathBuf},
+};
 
 pub type OrchestratorResult<T> = Result<T, OrchestratorError>;
 
@@ -64,6 +67,9 @@ pub enum OrchestratorError {
 
     /// Network configuration error
     NetworkConfigurationError(String),
+
+    /// The given node is missing a domain name
+    DomainNameMissingError(NodeId),
 }
 
 impl OrchestratorError {
@@ -77,10 +83,6 @@ impl OrchestratorError {
 
     pub(crate) fn key_monitoring_error(msg: impl ToString) -> Self {
         OrchestratorError::ThresholdKeyMonitoringError(msg.to_string())
-    }
-
-    pub(crate) fn snp_error(msg: impl ToString) -> Self {
-        OrchestratorError::SnpError(msg.to_string())
     }
 }
 
@@ -145,6 +147,11 @@ impl fmt::Display for OrchestratorError {
             OrchestratorError::NetworkConfigurationError(msg) => {
                 write!(f, "Failed to apply network configuration: {}", msg)
             }
+            OrchestratorError::DomainNameMissingError(node_id) => write!(
+                f,
+                "Node {} does not have an associated domain name",
+                node_id
+            ),
         }
     }
 }

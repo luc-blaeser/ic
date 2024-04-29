@@ -1,14 +1,12 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use crate::common::{PeerRestrictedSevHandshake, PeerRestrictedTlsConfig};
-use axum::http::Request;
+use crate::common::PeerRestrictedTlsConfig;
+use axum::{http::Request, Router};
 use bytes::Bytes;
 use either::Either;
 use futures::FutureExt;
 use ic_base_types::{NodeId, RegistryVersion};
-use ic_icos_sev::Sev;
 use ic_logger::info;
-use ic_logger::replica_logger::no_op_logger;
 use ic_metrics::MetricsRegistry;
 use ic_p2p_test_utils::{
     create_peer_manager_and_registry_handle, temp_crypto_component_with_tls_keys,
@@ -20,8 +18,11 @@ use ic_p2p_test_utils::{
 };
 use ic_quic_transport::{DummyUdpSocket, QuicTransport, Transport};
 use ic_test_utilities_logger::with_test_replica_logger;
-use ic_types_test_utils::ids::{NODE_1, NODE_2, NODE_3, NODE_4, NODE_5, SUBNET_1};
-use tokio::{sync::Notify, time::timeout};
+use ic_types_test_utils::ids::{NODE_1, NODE_2, NODE_3, NODE_4, NODE_5};
+use tokio::{
+    sync::{mpsc, Notify},
+    time::timeout,
+};
 use turmoil::Builder;
 
 mod common;
@@ -53,7 +54,6 @@ fn test_ping_pong() {
             None,
             None,
             None,
-            None,
             conn_checker.check_fut(),
         );
 
@@ -64,7 +64,6 @@ fn test_ping_pong() {
             registry_handle.clone(),
             topology_watcher,
             Some(ConnectivityChecker::router()),
-            None,
             None,
             None,
             None,
@@ -98,19 +97,7 @@ fn test_graceful_shutdown() {
             create_peer_manager_and_registry_handle(rt.handle(), log.clone());
 
         let node_crypto_1 = temp_crypto_component_with_tls_keys(&registry_handler, NODE_1);
-        let sev_handshake_1 = Arc::new(Sev::new(
-            NODE_1,
-            SUBNET_1,
-            registry_handler.registry_client.clone(),
-            no_op_logger(),
-        ));
         let node_crypto_2 = temp_crypto_component_with_tls_keys(&registry_handler, NODE_2);
-        let sev_handshake_2 = Arc::new(Sev::new(
-            NODE_2,
-            SUBNET_1,
-            registry_handler.registry_client.clone(),
-            no_op_logger(),
-        ));
         registry_handler.registry_client.update_to_latest_version();
 
         let socket_1: SocketAddr = "127.0.10.1:4100".parse().unwrap();
@@ -122,7 +109,6 @@ fn test_graceful_shutdown() {
             rt.handle(),
             node_crypto_1,
             registry_handler.registry_client.clone(),
-            sev_handshake_1,
             NODE_1,
             topology_watcher.clone(),
             Either::Left::<_, DummyUdpSocket>(socket_1),
@@ -135,7 +121,6 @@ fn test_graceful_shutdown() {
             rt.handle(),
             node_crypto_2,
             registry_handler.registry_client.clone(),
-            sev_handshake_2,
             NODE_2,
             topology_watcher,
             Either::Left::<_, DummyUdpSocket>(socket_2),
@@ -189,19 +174,7 @@ fn test_real_socket() {
             create_peer_manager_and_registry_handle(rt.handle(), log.clone());
 
         let node_crypto_1 = temp_crypto_component_with_tls_keys(&registry_handler, NODE_1);
-        let sev_handshake_1 = Arc::new(Sev::new(
-            NODE_1,
-            SUBNET_1,
-            registry_handler.registry_client.clone(),
-            log.clone(),
-        ));
         let node_crypto_2 = temp_crypto_component_with_tls_keys(&registry_handler, NODE_2);
-        let sev_handshake_2 = Arc::new(Sev::new(
-            NODE_2,
-            SUBNET_1,
-            registry_handler.registry_client.clone(),
-            log.clone(),
-        ));
         registry_handler.registry_client.update_to_latest_version();
 
         let socket_1: SocketAddr = "127.0.1.1:4100".parse().unwrap();
@@ -213,7 +186,6 @@ fn test_real_socket() {
             rt.handle(),
             node_crypto_1,
             registry_handler.registry_client.clone(),
-            sev_handshake_1,
             NODE_1,
             topology_watcher.clone(),
             Either::Left::<_, DummyUdpSocket>(socket_1),
@@ -226,7 +198,6 @@ fn test_real_socket() {
             rt.handle(),
             node_crypto_2,
             registry_handler.registry_client.clone(),
-            sev_handshake_2,
             NODE_2,
             topology_watcher,
             Either::Left::<_, DummyUdpSocket>(socket_2),
@@ -262,15 +233,88 @@ fn test_real_socket() {
     })
 }
 
-/// Test sending large message that is above our message limit. This should be rejected during the serialization step.
+#[test]
+fn test_real_socket_large_msg() {
+    with_test_replica_logger(|log| {
+        info!(log, "Starting test");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let (_jh, topology_watcher, mut registry_handler) =
+            create_peer_manager_and_registry_handle(rt.handle(), log.clone());
+
+        let node_crypto_1 = temp_crypto_component_with_tls_keys(&registry_handler, NODE_1);
+        let node_crypto_2 = temp_crypto_component_with_tls_keys(&registry_handler, NODE_2);
+        registry_handler.registry_client.update_to_latest_version();
+
+        let socket_1: SocketAddr = "127.0.3.1:4100".parse().unwrap();
+        let socket_2: SocketAddr = "127.0.4.1:4100".parse().unwrap();
+
+        let transport_1 = Arc::new(QuicTransport::start(
+            &log,
+            &MetricsRegistry::default(),
+            rt.handle(),
+            node_crypto_1,
+            registry_handler.registry_client.clone(),
+            NODE_1,
+            topology_watcher.clone(),
+            Either::Left::<_, DummyUdpSocket>(socket_1),
+            ConnectivityChecker::router(),
+        ));
+
+        let transport_2 = Arc::new(QuicTransport::start(
+            &log,
+            &MetricsRegistry::default(),
+            rt.handle(),
+            node_crypto_2,
+            registry_handler.registry_client.clone(),
+            NODE_2,
+            topology_watcher,
+            Either::Left::<_, DummyUdpSocket>(socket_2),
+            ConnectivityChecker::router(),
+        ));
+
+        registry_handler.add_node(
+            RegistryVersion::from(2),
+            NODE_1,
+            Some(&socket_1.ip().to_string()),
+        );
+        registry_handler.add_node(
+            RegistryVersion::from(3),
+            NODE_2,
+            Some(&socket_2.ip().to_string()),
+        );
+        registry_handler.registry_client.reload();
+        registry_handler.registry_client.update_to_latest_version();
+
+        rt.block_on(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+
+                let request = Request::builder()
+                    .uri("/Ping")
+                    .body(Bytes::from(vec![0; 100_000_000]))
+                    .unwrap();
+                let node_1_reachable_from_node_2 = transport_2.push(&NODE_1, request).await.is_ok();
+                let request = Request::builder().uri("/Ping").body(Bytes::new()).unwrap();
+                let node_2_reachable_from_node_1 = transport_1.push(&NODE_2, request).await.is_ok();
+                if node_2_reachable_from_node_1 && node_1_reachable_from_node_2 {
+                    break;
+                }
+            }
+        });
+    })
+}
+
+/// Test sending large message works fine.
 #[test]
 fn test_sending_large_message() {
     with_test_replica_logger(|log| {
         info!(log, "Starting test");
 
         let mut sim = Builder::new()
-            .tick_duration(Duration::from_millis(100))
-            .simulation_duration(Duration::from_secs(10))
+            .max_message_latency(Duration::from_millis(0))
+            .udp_capacity(1024 * 1024)
+            .simulation_duration(Duration::from_secs(30))
             .build();
 
         let exit_notify = Arc::new(Notify::new());
@@ -278,16 +322,40 @@ fn test_sending_large_message() {
         let (peer_manager_cmd_sender, topology_watcher, registry_handle) =
             add_peer_manager_to_sim(&mut sim, exit_notify.clone(), log.clone());
 
-        let conn_checker = ConnectivityChecker::new(&[NODE_1, NODE_2]);
+        let (received_large_msg1_tx, mut received_large_msg1_rx) = mpsc::channel(1);
+        let router_1: Router<()> = Router::new().route(
+            "/",
+            axum::routing::any(|| async move {
+                received_large_msg1_tx.send(()).await.unwrap();
+            }),
+        );
+
+        let (received_large_msg2_tx, mut received_large_msg2_rx) = mpsc::channel(1);
+        let router_2: Router<()> = Router::new().route(
+            "/",
+            axum::routing::any(|| async move {
+                received_large_msg2_tx.send(()).await.unwrap();
+            }),
+        );
 
         // Send large message that should be reject and verify connectivity.
         let send_large_msg_to_node_2 = |_node_id: NodeId, transport: Arc<dyn Transport>| {
             async move {
                 loop {
-                    transport
+                    let _ = transport
                         .push(&NODE_2, Request::new(Bytes::from(vec![0; 50_000_000])))
-                        .await
-                        .unwrap_err();
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+            .boxed()
+        };
+        let send_large_msg_to_node_1 = |_node_id: NodeId, transport: Arc<dyn Transport>| {
+            async move {
+                loop {
+                    let _ = transport
+                        .push(&NODE_1, Request::new(Bytes::from(vec![0; 50_000_000])))
+                        .await;
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
@@ -300,8 +368,7 @@ fn test_sending_large_message() {
             NODE_1,
             registry_handle.clone(),
             topology_watcher.clone(),
-            Some(ConnectivityChecker::router()),
-            None,
+            Some(router_1),
             None,
             None,
             None,
@@ -314,12 +381,11 @@ fn test_sending_large_message() {
             NODE_2,
             registry_handle.clone(),
             topology_watcher,
-            Some(ConnectivityChecker::router()),
+            Some(router_2),
             None,
             None,
             None,
-            None,
-            conn_checker.check_fut(),
+            send_large_msg_to_node_1,
         );
 
         peer_manager_cmd_sender
@@ -331,8 +397,10 @@ fn test_sending_large_message() {
         registry_handle.registry_client.reload();
         registry_handle.registry_client.update_to_latest_version();
 
-        wait_for_timeout(&mut sim, || false, Duration::from_secs(5))
-            .expect("The network did not reach a fully connected state after startup");
+        wait_for(&mut sim, || received_large_msg1_rx.try_recv().is_ok())
+            .expect("Node 1 is still reachable from other nodes after crashing it.");
+        wait_for(&mut sim, || received_large_msg2_rx.try_recv().is_ok())
+            .expect("Node 1 is still reachable from other nodes after crashing it.");
 
         exit_notify.notify_waiters();
         sim.run().unwrap();
@@ -367,7 +435,6 @@ fn test_peer_restart() {
             None,
             None,
             None,
-            None,
             conn_checker.check_fut(),
         );
 
@@ -378,7 +445,6 @@ fn test_peer_restart() {
             registry_handle.clone(),
             topology_watcher,
             Some(ConnectivityChecker::router()),
-            None,
             None,
             None,
             None,
@@ -466,7 +532,6 @@ fn test_changing_subnet_membership() {
             None,
             None,
             None,
-            None,
             conn_checker.check_fut(),
         );
 
@@ -477,7 +542,6 @@ fn test_changing_subnet_membership() {
             registry_handle.clone(),
             topology_watcher.clone(),
             Some(ConnectivityChecker::router()),
-            None,
             None,
             None,
             None,
@@ -494,7 +558,6 @@ fn test_changing_subnet_membership() {
             None,
             None,
             None,
-            None,
             conn_checker.check_fut(),
         );
 
@@ -508,7 +571,6 @@ fn test_changing_subnet_membership() {
             None,
             None,
             None,
-            None,
             conn_checker.check_fut(),
         );
 
@@ -519,7 +581,6 @@ fn test_changing_subnet_membership() {
             registry_handle.clone(),
             topology_watcher,
             Some(ConnectivityChecker::router()),
-            None,
             None,
             None,
             None,
@@ -657,122 +718,6 @@ fn test_changing_subnet_membership() {
     })
 }
 
-/// Test that we reconnect after AMD SEV-SNP handshake failures.
-#[test]
-fn test_transient_failing_sev() {
-    with_test_replica_logger(|log| {
-        info!(log, "Starting test");
-
-        let mut sim = Builder::new()
-            .simulation_duration(Duration::from_secs(40))
-            .tick_duration(Duration::from_millis(100))
-            .build();
-
-        let exit_notify = Arc::new(Notify::new());
-
-        let (peer_manager_cmd_sender, topology_watcher, registry_handle) =
-            add_peer_manager_to_sim(&mut sim, exit_notify.clone(), log.clone());
-
-        let conn_checker = ConnectivityChecker::new(&[NODE_1, NODE_2]);
-
-        let sev = Arc::new(PeerRestrictedSevHandshake::new());
-        sev.set_allowed_peers(vec![NODE_1, NODE_2]);
-
-        add_transport_to_sim(
-            &mut sim,
-            log.clone(),
-            NODE_1,
-            registry_handle.clone(),
-            topology_watcher.clone(),
-            Some(ConnectivityChecker::router()),
-            None,
-            Some(sev.clone()),
-            None,
-            None,
-            conn_checker.check_fut(),
-        );
-
-        add_transport_to_sim(
-            &mut sim,
-            log.clone(),
-            NODE_2,
-            registry_handle.clone(),
-            topology_watcher,
-            Some(ConnectivityChecker::router()),
-            None,
-            Some(sev.clone()),
-            None,
-            None,
-            conn_checker.check_fut(),
-        );
-
-        // Add two starting nodes 1 and 2.
-        info!(log, "Adding node 1 and 2");
-        peer_manager_cmd_sender
-            .send(PeerManagerAction::Add((NODE_1, RegistryVersion::from(2))))
-            .unwrap();
-        peer_manager_cmd_sender
-            .send(PeerManagerAction::Add((NODE_2, RegistryVersion::from(3))))
-            .unwrap();
-        registry_handle.registry_client.reload();
-        registry_handle.registry_client.update_to_latest_version();
-
-        wait_for(&mut sim, || conn_checker.fully_connected()).unwrap();
-
-        // Node 1 will start to reject connections from node 2.
-        sev.set_allowed_peers(vec![]);
-        // Restart node 1 to reset connection
-        sim.bounce(NODE_1.to_string());
-        conn_checker.reset(&NODE_1);
-        conn_checker.reset(&NODE_2);
-
-        // Make sure we can't connect by trying to connect for a 7s.
-        wait_for_timeout(
-            &mut sim,
-            || conn_checker.fully_connected(),
-            Duration::from_secs(7),
-        )
-        .expect("Nodes should not connect");
-
-        // Allow all nodes again
-        sev.set_allowed_peers(vec![NODE_1, NODE_2]);
-        wait_for(&mut sim, || {
-            conn_checker.fully_connected()
-                && conn_checker.connected_with_min_id(&NODE_2, &NODE_1, 1)
-                && conn_checker.connected_with_min_id(&NODE_1, &NODE_2, 0)
-        })
-        .expect("Nodes failed to reconnect or node 2 didn't increase connection id");
-
-        // Do the inverse
-        // Node 2 will start to reject connections from node 1.
-        sev.set_allowed_peers(vec![]);
-        // Restart node 1 to reset connection
-        sim.bounce(NODE_2.to_string());
-        conn_checker.reset(&NODE_1);
-        conn_checker.reset(&NODE_2);
-
-        // Try for 7s simulated time to connect
-        wait_for_timeout(
-            &mut sim,
-            || conn_checker.fully_connected(),
-            Duration::from_secs(7),
-        )
-        .expect("Nodes should not connect");
-
-        // Allow all nodes again
-        sev.set_allowed_peers(vec![NODE_1, NODE_2]);
-        wait_for(&mut sim, || {
-            conn_checker.fully_connected()
-                && conn_checker.connected_with_min_id(&NODE_1, &NODE_2, 1)
-                && conn_checker.connected_with_min_id(&NODE_2, &NODE_1, 0)
-        })
-        .expect("Nodes failed to reconnect or node 1 didn't increase connection id");
-
-        exit_notify.notify_waiters();
-        sim.run().unwrap();
-    })
-}
-
 /// Test that we reconnect after TLS handshake failures.
 #[test]
 fn test_transient_failing_tls() {
@@ -805,7 +750,6 @@ fn test_transient_failing_tls() {
             None,
             None,
             None,
-            None,
             conn_checker.check_fut(),
         );
 
@@ -818,7 +762,6 @@ fn test_transient_failing_tls() {
             topology_watcher,
             Some(ConnectivityChecker::router()),
             Some(tls_2.clone()),
-            None,
             None,
             None,
             conn_checker.check_fut(),
@@ -884,7 +827,6 @@ fn test_bad_network() {
             None,
             None,
             None,
-            None,
             conn_checker.check_fut(),
         );
 
@@ -895,7 +837,6 @@ fn test_bad_network() {
             registry_handle.clone(),
             topology_watcher.clone(),
             Some(ConnectivityChecker::router()),
-            None,
             None,
             None,
             None,
@@ -912,7 +853,6 @@ fn test_bad_network() {
             None,
             None,
             None,
-            None,
             conn_checker.check_fut(),
         );
 
@@ -926,7 +866,6 @@ fn test_bad_network() {
             None,
             None,
             None,
-            None,
             conn_checker.check_fut(),
         );
 
@@ -937,7 +876,6 @@ fn test_bad_network() {
             registry_handle.clone(),
             topology_watcher,
             Some(ConnectivityChecker::router()),
-            None,
             None,
             None,
             None,
@@ -1045,7 +983,6 @@ fn test_bad_network_and_membership_change() {
             None,
             None,
             None,
-            None,
             conn_checker.check_fut(),
         );
 
@@ -1056,7 +993,6 @@ fn test_bad_network_and_membership_change() {
             registry_handle.clone(),
             topology_watcher.clone(),
             Some(ConnectivityChecker::router()),
-            None,
             None,
             None,
             None,
@@ -1073,7 +1009,6 @@ fn test_bad_network_and_membership_change() {
             None,
             None,
             None,
-            None,
             conn_checker.check_fut(),
         );
 
@@ -1087,7 +1022,6 @@ fn test_bad_network_and_membership_change() {
             None,
             None,
             None,
-            None,
             conn_checker.check_fut(),
         );
 
@@ -1098,7 +1032,6 @@ fn test_bad_network_and_membership_change() {
             registry_handle.clone(),
             topology_watcher,
             Some(ConnectivityChecker::router()),
-            None,
             None,
             None,
             None,

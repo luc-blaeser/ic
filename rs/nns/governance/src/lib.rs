@@ -124,6 +124,7 @@ use crate::{
     governance::{Governance, TimeWarp},
     pb::v1::{governance::GovernanceCachedMetrics, ProposalStatus},
 };
+use candid::DecoderConfig;
 use mockall::automock;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -146,6 +147,7 @@ mod garbage_collection;
 /// distribute configuration information to all nodes of all
 /// subnetworks that participate in the Internet Computer (IC).
 pub mod governance;
+pub mod governance_proto_builder;
 mod heap_governance_data;
 pub mod init;
 mod known_neuron_index;
@@ -159,6 +161,17 @@ pub mod proposals;
 mod reward;
 pub mod storage;
 mod subaccount_index;
+
+/// Limit the amount of work for skipping unneeded data on the wire when parsing Candid.
+/// The value of 10_000 follows the Candid recommendation.
+const DEFAULT_SKIPPING_QUOTA: usize = 10_000;
+
+pub fn decoder_config() -> DecoderConfig {
+    let mut config = DecoderConfig::new();
+    config.set_skipping_quota(DEFAULT_SKIPPING_QUOTA);
+    config.set_full_error_message(false);
+    config
+}
 
 #[automock]
 trait Clock {
@@ -690,4 +703,9 @@ pub fn encode_metrics(
     }
 
     Ok(())
+}
+
+/// Whether we should switch to new merge neurons flow.
+fn should_use_new_merge_neurons_flow() -> bool {
+    true
 }

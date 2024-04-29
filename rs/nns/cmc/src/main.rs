@@ -66,7 +66,7 @@ const MAX_NOTIFY_PURGE: usize = 100_000;
 const CREATE_CANISTER_MIN_CYCLES: u64 = 100_000_000_000;
 
 thread_local! {
-    static STATE: RefCell<Option<State>> = RefCell::new(None);
+    static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
 }
 
 fn with_state<R>(f: impl FnOnce(&State) -> R) -> R {
@@ -406,7 +406,7 @@ impl Default for State {
             authorized_subnets: BTreeMap::new(),
             default_subnets: vec![],
             icp_xdr_conversion_rate: Some(IcpXdrConversionRate {
-                timestamp_seconds: 1620633600,    // 10 May 2021 10:00:00 AM CEST
+                timestamp_seconds: DEFAULT_ICP_XDR_CONVERSION_RATE_TIMESTAMP_SECONDS,
                 xdr_permyriad_per_icp: 1_000_000, // 100 XDR = 1 ICP
             }),
             average_icp_xdr_conversion_rate: None,

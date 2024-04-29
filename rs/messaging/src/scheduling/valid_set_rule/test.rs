@@ -8,21 +8,18 @@ use ic_management_canister_types::{
 };
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::testing::CanisterQueuesTesting;
-use ic_test_utilities::{
-    cycles_account_manager::CyclesAccountManagerBuilder,
-    history::MockIngressHistory,
-    state::{
-        get_running_canister, get_stopped_canister, get_stopping_canister, CanisterStateBuilder,
-        ReplicatedStateBuilder,
-    },
-};
+use ic_test_utilities::cycles_account_manager::CyclesAccountManagerBuilder;
 use ic_test_utilities_logger::with_test_replica_logger;
 use ic_test_utilities_metrics::{
     fetch_histogram_stats, fetch_int_counter_vec, metric_vec, nonzero_values, HistogramStats,
     MetricVec,
 };
+use ic_test_utilities_state::{
+    get_running_canister, get_stopped_canister, get_stopping_canister, CanisterStateBuilder,
+    MockIngressHistory, ReplicatedStateBuilder,
+};
 use ic_test_utilities_types::{
-    ids::{canister_test_id, message_test_id, subnet_test_id, user_test_id},
+    ids::{canister_test_id, message_test_id, node_test_id, subnet_test_id, user_test_id},
     messages::SignedIngressBuilder,
 };
 use ic_types::{
@@ -467,6 +464,11 @@ fn canister_on_application_subnet_charges_for_ingress() {
     let own_subnet_type = SubnetType::Application;
     let own_subnet_id = subnet_test_id(0);
     let mut state = ReplicatedStateBuilder::new()
+        .with_node_ids(
+            (1..=SMALL_APP_SUBNET_MAX_SIZE as u64)
+                .map(node_test_id)
+                .collect(),
+        )
         .with_subnet_type(own_subnet_type)
         .with_canister(
             CanisterStateBuilder::new()

@@ -7,7 +7,7 @@ use ic_protobuf::{
 };
 use ic_types::{
     canister_http::CanisterHttpRequestContext,
-    consensus::ecdsa::QuadrupleId,
+    consensus::idkg::QuadrupleId,
     crypto::threshold_sig::ni_dkg::{id::ni_dkg_target_id, NiDkgTargetId},
     messages::{CallbackId, CanisterCall, Request, StopCanisterCallId},
     node_id_into_protobuf, node_id_try_from_option, CanisterId, ExecutionRound, Height, NodeId,
@@ -742,7 +742,7 @@ impl TryFrom<pb_metadata::SignWithEcdsaContext> for SignWithEcdsaContext {
             batch_time: Time::from_nanos_since_unix_epoch(context.batch_time),
             matched_quadruple: context
                 .quadruple_id
-                .map(|q| QuadrupleId(q, Some(key_id)))
+                .map(QuadrupleId::new)
                 .zip(context.height)
                 .map(|(q, h)| (q, Height::from(h))),
             nonce: if let Some(nonce) = context.nonce.as_ref() {

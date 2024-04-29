@@ -7,7 +7,7 @@ description.workspace = true
 documentation.workspace = true
 
 [dependencies]
-async-trait = "0.1.42"
+async-trait = { workspace = true }
 candid = { workspace = true }
 canister-test = { path = "../../rust_canisters/canister_test" }
 dfn_candid = { path = "../../rust_canisters/dfn_candid" }
@@ -43,7 +43,7 @@ icp-ledger = { path = "../../rosetta-api/icp_ledger" }
 icrc-ledger-types = { path = "../../../packages/icrc-ledger-types" }
 lazy_static = "1.4.0"
 maplit = "1.0.2"
-num-traits = "0.2.14"
+num-traits = { workspace = true }
 on_wire = { path = "../../rust_canisters/on_wire" }
 prost = { workspace = true }
 tokio = { workspace = true }

@@ -1,3 +1,4 @@
+use crate::events::MinterEventAssert;
 use crate::flow::{
     ApprovalFlow, DepositFlow, DepositParams, LedgerTransactionAssert, WithdrawalFlow,
 };
@@ -16,50 +17,66 @@ use ic_cketh_minter::{
 use ic_ethereum_types::Address;
 use ic_icrc1_ledger::{InitArgsBuilder as LedgerInitArgsBuilder, LedgerArgument};
 use ic_state_machine_tests::{
-    CanisterHttpResponsePayload, CanisterId, Cycles, PayloadBuilder, PrincipalId, StateMachine,
-    StateMachineBuilder, UserError, WasmResult,
+    CanisterHttpResponsePayload, CanisterId, CanisterStatusType, Cycles, PayloadBuilder,
+    PrincipalId, StateMachine, StateMachineBuilder, UserError, WasmResult,
 };
 use ic_test_utilities_load_wasm::load_wasm;
 use icrc_ledger_types::icrc1::account::Account;
 use icrc_ledger_types::icrc2::approve::{ApproveArgs, ApproveError};
 use num_traits::cast::ToPrimitive;
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 pub mod ckerc20;
+pub mod events;
 pub mod flow;
 pub mod mock;
 pub mod response;
 #[cfg(test)]
 mod tests;
 
-pub const CKETH_TRANSFER_FEE: u64 = 10;
+pub const CKETH_TRANSFER_FEE: u64 = 2_000_000_000_000;
+pub const CKETH_MINIMUM_WITHDRAWAL_AMOUNT: u64 = 30_000_000_000_000_000;
 pub const MAX_TICKS: usize = 10;
 pub const DEFAULT_PRINCIPAL_ID: u64 = 10352385;
 pub const DEFAULT_DEPOSIT_BLOCK_NUMBER: u64 = 0x9;
 pub const DEFAULT_DEPOSIT_FROM_ADDRESS: &str = "0x55654e7405fcb336386ea8f36954a211b2cda764";
 pub const DEFAULT_DEPOSIT_TRANSACTION_HASH: &str =
     "0xcfa48c44dc89d18a898a42b4a5b02b6847a3c2019507d5571a481751c7a2f353";
+pub const DEFAULT_ERC20_DEPOSIT_TRANSACTION_HASH: &str =
+    "0x2044da6b095d6be2308b868287b8b70d9e01b226c02546b7abcce31dabc34929";
+
 pub const DEFAULT_DEPOSIT_LOG_INDEX: u64 = 0x24;
+pub const DEFAULT_ERC20_DEPOSIT_LOG_INDEX: u64 = 0x42;
 pub const DEFAULT_BLOCK_HASH: &str =
     "0x82005d2f17b251900968f01b0ed482cb49b7e1d797342bc504904d442b64dbe4";
 pub const LAST_SCRAPED_BLOCK_NUMBER_AT_INSTALL: u64 = 3_956_206;
 pub const DEFAULT_BLOCK_NUMBER: u64 = 0x4132ec;
-pub const EXPECTED_BALANCE: u64 = 100_000_000_000_000_000;
+pub const EXPECTED_BALANCE: u64 = 100_000_000_000_000_000 + CKETH_TRANSFER_FEE - 10_u64;
+pub const CKETH_WITHDRAWAL_AMOUNT: u64 = EXPECTED_BALANCE - CKETH_TRANSFER_FEE;
 pub const EFFECTIVE_GAS_PRICE: u64 = 4_277_923_390;
 
 pub const DEFAULT_WITHDRAWAL_TRANSACTION_HASH: &str =
     "0x2cf1763e8ee3990103a31a5709b17b83f167738abb400844e67f608a98b0bdb5";
 pub const DEFAULT_WITHDRAWAL_TRANSACTION: &str = "0x02f87301808459682f008507af2c9f6282520894221e931fbfcb9bd54ddd26ce6f5e29e98add01c0880160cf1e9917a0e680c001a0b27af25a08e87836a778ac2858fdfcff1f6f3a0d43313782c81d05ca34b80271a078026b399a32d3d7abab625388a3c57f651c66a182eb7f8b1a58d9aef7547256";
+
+pub const DEFAULT_CKERC20_WITHDRAWAL_TRANSACTION: &str = "0x02f8b001808459682f008507af2c9f6282fde894a0b86991c6218b36c1d19d4a2e9eb0ce3606eb4880b844a9059cbb000000000000000000000000221e931fbfcb9bd54ddd26ce6f5e29e98add01c000000000000000000000000000000000000000000000000000000000001e8480c080a0bb694aec6175b489523a55d5fce39452368e97096d4afa2cdcc35cf2d805152fa00112b26a028af84dd397d23549844efdaf761d90cdcfdbe6c3608239648a85a3";
+pub const DEFAULT_CKERC20_WITHDRAWAL_TRANSACTION_HASH: &str =
+    "0x2c0c328876b8d60580e00d8e5a82599e22099e78d9d9c25cc5e6164bc8f4db62";
+
+pub const DEFAULT_CKERC20_WITHDRAWAL_TRANSACTION_FEE: u64 = 2_145_241_036_770_000_u64;
+pub const USDC_ERC20_CONTRACT_ADDRESS: &str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
 pub const MINTER_ADDRESS: &str = "0xfd644a761079369962386f8e4259217c2a10b8d0";
 pub const DEFAULT_WITHDRAWAL_DESTINATION_ADDRESS: &str =
     "0x221E931fbFcb9bd54DdD26cE6f5e29E98AdD01C0";
-pub const HELPER_SMART_CONTRACT_ADDRESS: &str = "0x907b6efc1a398fd88a8161b3ca02eec8eaf72ca1";
+pub const ETH_HELPER_CONTRACT_ADDRESS: &str = "0x907b6efc1a398fd88a8161b3ca02eec8eaf72ca1";
+pub const ERC20_HELPER_CONTRACT_ADDRESS: &str = "0xe1788e4834c896f1932188645cc36c54d1b80ac1";
 pub const RECEIVED_ETH_EVENT_TOPIC: &str =
     "0x257e057bb61920d8d0ed2cb7b720ac7f9c513cd1110bc9fa543079154f45f435";
+pub const RECEIVED_ERC20_EVENT_TOPIC: &str =
+    "0x4d69d0bd4287b7f66c548f90154dc81bc98f65a1b362775df5ae171a2ccd262b";
 pub const HEADER_SIZE_LIMIT: u64 = 2 * 1024;
 pub const MAX_ETH_LOGS_BLOCK_RANGE: u64 = 799;
 
@@ -73,6 +90,12 @@ pub struct CkEthSetup {
 impl Default for CkEthSetup {
     fn default() -> Self {
         Self::new(Arc::new(new_state_machine()))
+    }
+}
+
+impl AsRef<CkEthSetup> for CkEthSetup {
+    fn as_ref(&self) -> &CkEthSetup {
+        self
     }
 }
 
@@ -156,11 +179,16 @@ impl CkEthSetup {
     }
 
     pub fn balance_of(&self, account: impl Into<Account>) -> Nat {
+        let ledger_id = self.ledger_id;
+        self.balance_of_ledger(ledger_id, account)
+    }
+
+    pub fn balance_of_ledger(&self, ledger_id: CanisterId, account: impl Into<Account>) -> Nat {
         Decode!(
             &assert_reply(
                 self.env
                     .query(
-                        self.ledger_id,
+                        ledger_id,
                         "icrc1_balance_of",
                         Encode!(&account.into()).unwrap()
                     )
@@ -229,9 +257,20 @@ impl CkEthSetup {
         amount: u64,
         from_subaccount: Option<[u8; 32]>,
     ) -> ApprovalFlow {
+        let cketh_ledger_id = self.ledger_id;
+        self.call_ledger_id_approve_minter(cketh_ledger_id, from, amount, from_subaccount)
+    }
+
+    pub fn call_ledger_id_approve_minter(
+        self,
+        ledger_id: CanisterId,
+        from: Principal,
+        amount: u64,
+        from_subaccount: Option<[u8; 32]>,
+    ) -> ApprovalFlow {
         let approval_response = Decode!(&assert_reply(self.env.execute_ingress_as(
             PrincipalId::from(from),
-            self.ledger_id,
+            ledger_id,
             "icrc2_approve",
             Encode!(&ApproveArgs {
                 from_subaccount,
@@ -259,37 +298,21 @@ impl CkEthSetup {
     pub fn call_ledger_get_transaction<T: Into<Nat>>(
         self,
         ledger_index: T,
-    ) -> LedgerTransactionAssert {
-        use icrc_ledger_types::icrc3::transactions::{
-            GetTransactionsRequest, GetTransactionsResponse,
-        };
+    ) -> LedgerTransactionAssert<Self> {
+        let ledger_id = self.ledger_id;
+        self.call_ledger_id_get_transaction(ledger_id, ledger_index)
+    }
 
-        let request = GetTransactionsRequest {
-            start: ledger_index.into(),
-            length: 1_u8.into(),
-        };
-        let mut response = Decode!(
-            &assert_reply(
-                self.env
-                    .query(
-                        self.ledger_id,
-                        "get_transactions",
-                        Encode!(&request).unwrap()
-                    )
-                    .expect("failed to query get_transactions on the ledger")
-            ),
-            GetTransactionsResponse
-        )
-        .unwrap();
-        assert_eq!(
-            response.transactions.len(),
-            1,
-            "Expected exactly one transaction but got {:?}",
-            response.transactions
-        );
+    pub fn call_ledger_id_get_transaction<T: Into<Nat>>(
+        self,
+        ledger_id: CanisterId,
+        ledger_index: T,
+    ) -> LedgerTransactionAssert<Self> {
+        let ledger_transaction =
+            crate::flow::call_ledger_id_get_transaction(&self.env, ledger_id, ledger_index);
         LedgerTransactionAssert {
             setup: self,
-            ledger_transaction: response.transactions.pop().unwrap(),
+            ledger_transaction,
         }
     }
 
@@ -332,54 +355,15 @@ impl CkEthSetup {
     }
 
     pub fn assert_has_unique_events_in_order(self, expected_events: &[EventPayload]) -> Self {
-        let audit_events = self.get_all_events();
-        let mut found_event_indexes = BTreeMap::new();
-        for (index_expected_event, expected_event) in expected_events.iter().enumerate() {
-            for (index_audit_event, audit_event) in audit_events.iter().enumerate() {
-                if &audit_event.payload == expected_event {
-                    assert_eq!(
-                        found_event_indexes.insert(index_expected_event, index_audit_event),
-                        None,
-                        "Event {:?} occurs multiple times",
-                        expected_event
-                    );
-                }
-            }
-            assert!(
-                found_event_indexes.contains_key(&index_expected_event),
-                "Missing event {:?}. All events: {:?}",
-                expected_event,
-                audit_events
-            )
-        }
-        let audit_event_indexes = found_event_indexes.into_values().collect::<Vec<_>>();
-        let sorted_audit_event_indexes = {
-            let mut indexes = audit_event_indexes.clone();
-            indexes.sort_unstable();
-            indexes
-        };
-        assert_eq!(
-            audit_event_indexes, sorted_audit_event_indexes,
-            "Events were found in unexpected order"
-        );
-        self
+        MinterEventAssert::from_fetching_all_events(self)
+            .assert_has_unique_events_in_order(expected_events)
     }
 
     pub fn assert_has_no_event_satisfying<P: Fn(&EventPayload) -> bool>(
         self,
         predicate: P,
     ) -> Self {
-        if let Some(unexpected_event) = self
-            .get_all_events()
-            .into_iter()
-            .find(|event| predicate(&event.payload))
-        {
-            panic!(
-                "Found an event satisfying the predicate: {:?}",
-                unexpected_event
-            )
-        }
-        self
+        MinterEventAssert::from_fetching_all_events(self).assert_has_no_event_satisfying(predicate)
     }
 
     fn get_events(&self, start: u64, length: u64) -> GetEventsResult {
@@ -438,14 +422,14 @@ impl CkEthSetup {
         self.start_minter();
     }
 
-    fn stop_minter(&self) {
+    pub fn stop_minter(&self) {
         let stop_msg_id = self.env.stop_canister_non_blocking(self.minter_id);
         self.stop_ongoing_https_outcalls();
         let stop_res = self.env.await_ingress(stop_msg_id, 100);
         assert_matches!(stop_res, Ok(WasmResult::Reply(_)));
     }
 
-    fn stop_ongoing_https_outcalls(&self) {
+    pub fn stop_ongoing_https_outcalls(&self) {
         let server_error_response = CanisterHttpResponsePayload {
             status: 500_u128,
             headers: vec![],
@@ -463,27 +447,44 @@ impl CkEthSetup {
         self.env.execute_payload(payload);
     }
 
-    fn start_minter(&self) {
+    pub fn start_minter(&self) {
         let start_res = self.env.start_canister(self.minter_id);
         assert_matches!(start_res, Ok(WasmResult::Reply(_)));
     }
 
+    pub fn minter_status(&self) -> CanisterStatusType {
+        self.env
+            .canister_status(self.minter_id)
+            .unwrap()
+            .unwrap()
+            .status()
+    }
+
     pub fn upgrade_minter_to_add_orchestrator_id(self, orchestrator_id: Principal) -> Self {
         self.upgrade_minter(UpgradeArg {
-            next_transaction_nonce: None,
-            minimum_withdrawal_amount: None,
-            ethereum_contract_address: None,
-            ethereum_block_height: None,
             ledger_suite_orchestrator_id: Some(orchestrator_id),
+            ..Default::default()
+        });
+        self
+    }
+
+    pub fn upgrade_minter_to_add_erc20_helper_contract(self, contract_address: String) -> Self {
+        self.upgrade_minter(UpgradeArg {
+            erc20_helper_contract_address: Some(contract_address),
+            ..Default::default()
         });
         self
     }
 
     pub fn check_audit_logs_and_upgrade(self, upgrade_arg: UpgradeArg) -> Self {
+        self.check_audit_logs_and_upgrade_as_ref(upgrade_arg);
+        self
+    }
+
+    pub fn check_audit_logs_and_upgrade_as_ref(&self, upgrade_arg: UpgradeArg) {
         self.check_audit_log();
         self.env.tick(); //tick before upgrade to finish current timers which are reset afterwards
         self.upgrade_minter(upgrade_arg);
-        self
     }
 
     pub fn assert_has_no_rpc_call(self, method: &JsonRpcMethod) -> Self {
@@ -548,8 +549,8 @@ fn install_minter(env: &StateMachine, ledger_id: CanisterId, minter_id: Canister
         ledger_id: ledger_id.get().0,
         next_transaction_nonce: 0_u8.into(),
         ethereum_block_height: CandidBlockTag::Finalized,
-        ethereum_contract_address: Some(HELPER_SMART_CONTRACT_ADDRESS.to_string()),
-        minimum_withdrawal_amount: CKETH_TRANSFER_FEE.into(),
+        ethereum_contract_address: Some(ETH_HELPER_CONTRACT_ADDRESS.to_string()),
+        minimum_withdrawal_amount: CKETH_MINIMUM_WITHDRAWAL_AMOUNT.into(),
         last_scraped_block_number: LAST_SCRAPED_BLOCK_NUMBER_AT_INSTALL.into(),
     };
     let minter_arg = MinterArg::InitArg(args);

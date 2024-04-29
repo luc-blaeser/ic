@@ -27,6 +27,7 @@ use lazy_static::lazy_static;
 use maplit::btreemap;
 use proptest::prelude::*;
 use std::{ops::Range, sync::Arc, time::Duration};
+use strum::IntoEnumIterator;
 
 struct DummyMetrics;
 impl CheckpointLoadingMetrics for DummyMetrics {
@@ -446,10 +447,12 @@ fn roundtrip_encoding() {
     };
     system_metadata.network_topology = network_topology;
 
-    use ic_crypto_internal_basic_sig_ed25519::{public_key_to_der, types::PublicKeyBytes};
     use ic_crypto_test_utils_keys::public_keys::valid_node_signing_public_key;
     let pk_der =
-        public_key_to_der(PublicKeyBytes::try_from(&valid_node_signing_public_key()).unwrap());
+        ic_crypto_ed25519::PublicKey::deserialize_raw(&valid_node_signing_public_key().key_value)
+            .unwrap()
+            .serialize_rfc8410_der();
+
     system_metadata.node_public_keys = btreemap! {
         node_test_id(1) => pk_der,
     };
@@ -1465,7 +1468,7 @@ fn stream_roundtrip_encoding() {
         SignalConfig { end: 153 },
     );
     stream.reverse_stream_flags = StreamFlags {
-        responses_only: true,
+        deprecated_responses_only: true,
     };
 
     let proto_stream: pb_queues::Stream = (&stream).into();
@@ -1909,6 +1912,30 @@ fn blockmaker_metrics_soft_invariant_size_limit_bumps_critical_error_counter() {
     let metrics = BlockmakerMetricsFixture::new_with_too_many_observations();
     assert_matches!(metrics.check_soft_invariants(), Err(err) if err.contains("exceeds limit"));
     do_roundtrip_and_check_error(&metrics, "exceeds limit");
+}
+
+#[test]
+fn canister_state_bits_cycles_use_case_round_trip() {
+    use ic_protobuf::state::canister_state_bits::v1 as pb;
+
+    for initial in CyclesUseCase::iter() {
+        let encoded = pb::CyclesUseCase::from(initial);
+        let round_trip = CyclesUseCase::try_from(encoded).unwrap();
+
+        assert_eq!(initial, round_trip);
+    }
+}
+
+#[test]
+fn compatibility_for_cycles_use_case() {
+    // If this fails, you are making a potentially incompatible change to `CyclesUseCase`.
+    // See note [Handling changes to Enums in Replicated State] for how to proceed.
+    assert_eq!(
+        CyclesUseCase::iter()
+            .map(|x| x as i32)
+            .collect::<Vec<i32>>(),
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    );
 }
 
 const MAX_NUM_DAYS: usize = BLOCKMAKER_METRICS_TIME_SERIES_NUM_SNAPSHOTS + 10;

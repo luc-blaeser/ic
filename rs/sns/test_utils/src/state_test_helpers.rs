@@ -40,12 +40,16 @@ use ic_sns_swap::pb::v1::{
     NewSaleTicketResponse, NotifyPaymentFailureResponse, OpenRequest, OpenResponse, Params,
     RefreshBuyerTokensRequest, RefreshBuyerTokensResponse, Ticket,
 };
-use ic_state_machine_tests::StateMachine;
+use ic_state_machine_tests::{StateMachine, StateMachineBuilder};
 use ic_types::ingress::WasmResult;
 use icp_ledger::{
     AccountIdentifier, BlockIndex, Memo, TransferArgs, TransferError, DEFAULT_TRANSFER_FEE,
 };
 use icrc_ledger_types::icrc1::account::Account;
+
+pub fn state_machine_builder_for_sns_tests() -> StateMachineBuilder {
+    StateMachineBuilder::new().with_current_time()
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct SnsTestCanisterIds {
@@ -105,11 +109,11 @@ pub fn setup_sns_canisters(
     );
 
     populate_canister_ids(
-        root_canister_id,
-        governance_canister_id,
-        ledger_canister_id,
-        swap_canister_id,
-        index_canister_id,
+        root_canister_id.get(),
+        governance_canister_id.get(),
+        ledger_canister_id.get(),
+        swap_canister_id.get(),
+        index_canister_id.get(),
         vec![],
         &mut payloads,
     );
@@ -569,12 +573,13 @@ impl Scenario {
         let mut configuration = SnsTestsInitPayloadBuilder::new()
             .with_ledger_accounts(account_identifiers, sns_tokens)
             .build();
+
         populate_canister_ids(
-            root_canister_id,
-            governance_canister_id,
-            ledger_canister_id,
-            swap_canister_id,
-            index_canister_id,
+            root_canister_id.get(),
+            governance_canister_id.get(),
+            ledger_canister_id.get(),
+            swap_canister_id.get(),
+            index_canister_id.get(),
             vec![],
             &mut configuration,
         );

@@ -18,9 +18,9 @@ pub use self::{
     xnet::XNetPayload,
 };
 use crate::{
-    consensus::ecdsa::QuadrupleId,
-    crypto::canister_threshold_sig::MasterEcdsaPublicKey,
-    messages::{Response, SignedIngress},
+    consensus::idkg::QuadrupleId,
+    crypto::canister_threshold_sig::MasterPublicKey,
+    messages::{CallbackId, Payload, SignedIngress},
     xnet::CertifiedStreamSlice,
     Height, Randomness, RegistryVersion, SubnetId, Time,
 };
@@ -29,11 +29,12 @@ use ic_btc_types_internal::BitcoinAdapterResponse;
 #[cfg(test)]
 use ic_exhaustive_derive::ExhaustiveSet;
 use ic_management_canister_types::EcdsaKeyId;
-use ic_protobuf::proxy::ProxyDecodeError;
+use ic_protobuf::{proxy::ProxyDecodeError, types::v1 as pb};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     convert::TryInto,
+    hash::Hash,
 };
 
 /// The `Batch` provided to Message Routing for deterministic processing.
@@ -41,6 +42,15 @@ use std::{
 pub struct Batch {
     /// The sequence number attached to the batch.
     pub batch_number: Height,
+    /// The next start height is always set by the consensus,
+    /// see `deliver_batches()`. But the tests and the `PocketIC`
+    /// might set it to `None`, i.e. "unknown".
+    ///
+    /// In a case of a subnet recovery, the DSM will observe an instant
+    /// jump for the `batch_number` and `next_checkpoint_height` values.
+    /// The `next_checkpoint_height`, if set, should be always greater
+    /// than the `batch_number`.
+    pub next_checkpoint_height: Option<Height>,
     /// Whether the state obtained by executing this batch needs to be fully
     /// hashed to be eligible for StateSync.
     pub requires_full_state_hash: bool,
@@ -49,7 +59,7 @@ pub struct Batch {
     /// A source of randomness for processing the Batch.
     pub randomness: Randomness,
     /// The ECDSA public keys of the subnet.
-    pub ecdsa_subnet_public_keys: BTreeMap<EcdsaKeyId, MasterEcdsaPublicKey>,
+    pub ecdsa_subnet_public_keys: BTreeMap<EcdsaKeyId, MasterPublicKey>,
     /// The ECDSA quadruple Ids available to be matched with signature requests.
     pub ecdsa_quadruple_ids: BTreeMap<EcdsaKeyId, BTreeSet<QuadrupleId>>,
     /// The version of the registry to be referenced when processing the batch.
@@ -57,7 +67,7 @@ pub struct Batch {
     /// A clock time to be used for processing messages.
     pub time: Time,
     /// Responses to subnet calls that require consensus' involvement.
-    pub consensus_responses: Vec<Response>,
+    pub consensus_responses: Vec<ConsensusResponse>,
     /// Information about block makers
     pub blockmaker_metrics: BlockmakerMetrics,
 }
@@ -162,6 +172,55 @@ impl BlockmakerMetrics {
             blockmaker: NodeId::new(ic_base_types::PrincipalId::new_node_test_id(0)),
             failed_blockmakers: vec![],
         }
+    }
+}
+
+/// Response to a subnet call that requires Consensus' involvement.
+///
+/// Only holds the payload and callback ID, Execution populates other fields
+/// (originator, respondent, refund) from the incoming request.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ExhaustiveSet))]
+pub struct ConsensusResponse {
+    pub callback: CallbackId,
+    pub payload: Payload,
+}
+
+impl ConsensusResponse {
+    pub fn new(callback: CallbackId, payload: Payload) -> Self {
+        Self { callback, payload }
+    }
+}
+
+impl From<&ConsensusResponse> for pb::ConsensusResponse {
+    fn from(rep: &ConsensusResponse) -> Self {
+        let p = match &rep.payload {
+            Payload::Data(d) => pb::consensus_response::Payload::Data(d.clone()),
+            Payload::Reject(r) => pb::consensus_response::Payload::Reject(r.into()),
+        };
+        Self {
+            callback: rep.callback.get(),
+            payload: Some(p),
+        }
+    }
+}
+
+impl TryFrom<pb::ConsensusResponse> for ConsensusResponse {
+    type Error = ProxyDecodeError;
+
+    fn try_from(rep: pb::ConsensusResponse) -> Result<Self, Self::Error> {
+        let payload = match rep
+            .payload
+            .ok_or(ProxyDecodeError::MissingField("ConsensusResponse::payload"))?
+        {
+            pb::consensus_response::Payload::Data(d) => Payload::Data(d),
+            pb::consensus_response::Payload::Reject(r) => Payload::Reject(r.try_into()?),
+        };
+
+        Ok(Self {
+            callback: rep.callback.into(),
+            payload,
+        })
     }
 }
 

@@ -4,7 +4,7 @@
 //!
 //! As much as possible the naming of structs in this module should match the
 //! naming used in the [Interface
-//! Specification](https://sdk.dfinity.org/docs/interface-spec/index.html)
+//! Specification](https://internetcomputer.org/docs/current/references/ic-interface-spec)
 mod catch_up_package;
 mod common;
 mod dashboard;
@@ -15,6 +15,10 @@ mod read_state;
 mod state_reader_executor;
 mod status;
 mod threads;
+mod tracing_flamegraph;
+
+pub use call::CallServiceBuilder;
+pub use query::QueryServiceBuilder;
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "fuzzing_code")] {
@@ -37,20 +41,20 @@ use crate::{
     pprof::{PprofFlamegraphService, PprofHomeService, PprofProfileService},
     read_state::subnet::SubnetReadStateService,
     state_reader_executor::StateReaderExecutor,
+    status::StatusService,
+    tracing_flamegraph::TracingFlamegraphService,
 };
-pub use call::CallServiceBuilder;
 pub use common::cors_layer;
 
 use axum::{
     body::Body,
     error_handling::HandleErrorLayer,
-    extract::{MatchedPath, State},
+    extract::{DefaultBodyLimit, MatchedPath, State},
     middleware::Next,
-    response::{IntoResponse, Redirect},
-    routing::{get, get_service, post_service, MethodRouter},
+    response::Redirect,
+    routing::get,
     Router,
 };
-use bytes::Bytes;
 use crossbeam::atomic::AtomicCell;
 use http_body_util::{BodyExt, Full, LengthLimitError};
 use hyper::{body::Incoming, Request, Response, StatusCode};
@@ -82,6 +86,7 @@ use ic_registry_client_helpers::{
 };
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::ReplicatedState;
+use ic_tracing::ReloadHandles;
 use ic_types::{
     artifact::UnvalidatedArtifactMutation,
     artifact_kind::IngressArtifact,
@@ -91,19 +96,16 @@ use ic_types::{
         HttpReadStateResponse, HttpRequestEnvelope, QueryResponseHash, ReplicaHealthStatus,
     },
     time::expiry_time_from_now,
-    NodeId, PrincipalId, SubnetId,
+    NodeId, SubnetId,
 };
 use metrics::{HttpHandlerMetrics, LABEL_UNKNOWN};
-pub use query::QueryServiceBuilder;
 use rand::Rng;
 pub use read_state::canister::{CanisterReadStateService, CanisterReadStateServiceBuilder};
-use status::StatusState;
 use std::{
     convert::{Infallible, TryFrom},
     io::Write,
     net::SocketAddr,
     path::PathBuf,
-    str::FromStr,
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -124,7 +126,6 @@ use tower::{
 };
 use tower_http::limit::RequestBodyLimitLayer;
 
-const HTTP_DASHBOARD_URL_PATH: &str = "/_/dashboard";
 const CONTENT_TYPE_CBOR: &str = "application/cbor";
 
 /// [TLS Application-Layer Protocol Negotiation (ALPN) Protocol `HTTP/2 over TLS` ID][spec]
@@ -141,21 +142,20 @@ pub struct HttpError {
     pub message: String,
 }
 
-pub(crate) type EndpointService = BoxCloneService<Request<Body>, Response<Body>, Infallible>;
-
 /// Struct that holds all endpoint services.
 #[derive(Clone)]
 struct HttpHandler {
-    call_service: EndpointService,
-    query_service: EndpointService,
-    catchup_service: EndpointService,
-    dashboard_service: EndpointService,
-    status_method: MethodRouter,
-    canister_read_state_service: EndpointService,
-    subnet_read_state_service: EndpointService,
-    pprof_home_service: EndpointService,
-    pprof_profile_service: EndpointService,
-    pprof_flamegraph_service: EndpointService,
+    call_router: Router,
+    query_router: Router,
+    catchup_router: Router,
+    dashboard_router: Router,
+    status_router: Router,
+    canister_read_state_router: Router,
+    subnet_read_state_router: Router,
+    pprof_home_router: Router,
+    pprof_profile_router: Router,
+    pprof_flamegraph_router: Router,
+    tracing_flamegraph_router: Router,
 }
 
 // Crates a detached tokio blocking task that initializes the server (reading
@@ -181,8 +181,8 @@ fn start_server_initialization(
         metrics
             .health_status_transitions_total
             .with_label_values(&[
-                &health_status.load().to_string(),
-                &ReplicaHealthStatus::WaitingForCertifiedState.to_string(),
+                &health_status.load().as_ref(),
+                &ReplicaHealthStatus::WaitingForCertifiedState.as_ref(),
             ])
             .inc();
         health_status.store(ReplicaHealthStatus::WaitingForCertifiedState);
@@ -214,8 +214,8 @@ fn start_server_initialization(
         metrics
             .health_status_transitions_total
             .with_label_values(&[
-                &health_status.load().to_string(),
-                &ReplicaHealthStatus::Healthy.to_string(),
+                &health_status.load().as_ref(),
+                &ReplicaHealthStatus::Healthy.as_ref(),
             ])
             .inc();
         health_status.store(ReplicaHealthStatus::Healthy);
@@ -294,6 +294,7 @@ pub fn start_server(
     malicious_flags: MaliciousFlags,
     delegation_from_nns: Option<CertificateDelegation>,
     pprof_collector: Arc<dyn PprofCollector>,
+    tracing_handle: ReloadHandles,
 ) {
     let listen_addr = config.listen_addr;
     info!(log, "Starting HTTP server...");
@@ -315,76 +316,63 @@ pub fn start_server(
     let health_status = Arc::new(AtomicCell::new(ReplicaHealthStatus::Starting));
     let state_reader_clone = state_reader.clone();
     let state_reader_executor = StateReaderExecutor::new(state_reader);
-    let call_service = BoxCloneService::new(
-        CallServiceBuilder::builder(
-            node_id,
-            subnet_id,
-            registry_client.clone(),
-            ingress_verifier.clone(),
-            ingress_filter,
-            ingress_throttler,
-            ingress_tx,
-        )
-        .with_logger(log.clone())
-        .with_malicious_flags(malicious_flags.clone())
-        .build(),
-    );
-    let query_service = BoxCloneService::new(
-        QueryServiceBuilder::builder(
-            node_id,
-            query_signer,
-            registry_client.clone(),
-            ingress_verifier.clone(),
-            delegation_from_nns.clone(),
-            query_execution_service,
-        )
-        .with_logger(log.clone())
-        .with_health_status(health_status.clone())
-        .with_malicious_flags(malicious_flags.clone())
-        .build(),
-    );
+    let call_router = CallServiceBuilder::builder(
+        node_id,
+        subnet_id,
+        registry_client.clone(),
+        ingress_verifier.clone(),
+        ingress_filter,
+        ingress_throttler,
+        ingress_tx,
+    )
+    .with_logger(log.clone())
+    .with_malicious_flags(malicious_flags.clone())
+    .build_router();
+    let query_router = QueryServiceBuilder::builder(
+        node_id,
+        query_signer,
+        registry_client.clone(),
+        ingress_verifier.clone(),
+        delegation_from_nns.clone(),
+        query_execution_service,
+    )
+    .with_logger(log.clone())
+    .with_health_status(health_status.clone())
+    .with_malicious_flags(malicious_flags.clone())
+    .build_router();
 
-    let canister_read_state_service = BoxCloneService::new(
-        CanisterReadStateServiceBuilder::builder(
-            state_reader_clone,
-            registry_client.clone(),
-            ingress_verifier,
-            delegation_from_nns.clone(),
-        )
-        .with_logger(log.clone())
-        .with_health_status(health_status.clone())
-        .with_malicious_flags(malicious_flags)
-        .build(),
-    );
+    let canister_read_state_router = CanisterReadStateServiceBuilder::builder(
+        state_reader_clone,
+        registry_client.clone(),
+        ingress_verifier,
+        delegation_from_nns.clone(),
+    )
+    .with_logger(log.clone())
+    .with_health_status(health_status.clone())
+    .with_malicious_flags(malicious_flags)
+    .build_router();
 
-    let subnet_read_state_service = SubnetReadStateService::new_service(
-        log.clone(),
+    let subnet_read_state_router = SubnetReadStateService::new_router(
         Arc::clone(&health_status),
         Arc::clone(&delegation_from_nns),
         state_reader_executor.clone(),
     );
-    let status_method =
-        MethodRouter::new()
-            .get(crate::status::status)
-            .with_state(StatusState::new(
-                log.clone(),
-                nns_subnet_id,
-                Arc::clone(&registry_client),
-                Arc::clone(&health_status),
-                state_reader_executor.clone(),
-            ));
-    let dashboard_service =
-        DashboardService::new_service(config.clone(), subnet_type, state_reader_executor.clone());
-    let catchup_service = CatchUpPackageService::new_service(consensus_pool_cache.clone());
+    let status_router = StatusService::build_router(
+        log.clone(),
+        nns_subnet_id,
+        Arc::clone(&registry_client),
+        Arc::clone(&health_status),
+        state_reader_executor.clone(),
+    );
+    let dashboard_router =
+        DashboardService::new_router(config.clone(), subnet_type, state_reader_executor.clone());
+    let catchup_router = CatchUpPackageService::new_router(consensus_pool_cache.clone());
 
-    let pprof_concurrency_buffer =
-        GlobalConcurrencyLimitLayer::new(config.max_pprof_concurrent_requests);
+    let pprof_home_router = PprofHomeService::new_router();
+    let pprof_profile_router = PprofProfileService::new_router(pprof_collector.clone());
+    let pprof_flamegraph_router = PprofFlamegraphService::new_router(pprof_collector);
 
-    let pprof_home_service = PprofHomeService::new_service(pprof_concurrency_buffer.clone());
-    let pprof_profile_service =
-        PprofProfileService::new_service(pprof_collector.clone(), pprof_concurrency_buffer.clone());
-    let pprof_flamegraph_service =
-        PprofFlamegraphService::new_service(pprof_collector, pprof_concurrency_buffer);
+    let tracing_flamegraph_router = TracingFlamegraphService::build_router(tracing_handle);
 
     let health_status_refresher = HealthStatusRefreshLayer::new(
         log.clone(),
@@ -409,16 +397,17 @@ pub fn start_server(
     );
 
     let http_handler = HttpHandler {
-        call_service,
-        query_service,
-        status_method,
-        catchup_service,
-        dashboard_service,
-        canister_read_state_service,
-        subnet_read_state_service,
-        pprof_home_service,
-        pprof_profile_service,
-        pprof_flamegraph_service,
+        call_router,
+        query_router,
+        status_router,
+        catchup_router,
+        dashboard_router,
+        canister_read_state_router,
+        subnet_read_state_router,
+        pprof_home_router,
+        pprof_profile_router,
+        pprof_flamegraph_router,
+        tracing_flamegraph_router,
     };
     let main_service = create_main_service(
         metrics.clone(),
@@ -453,6 +442,9 @@ pub fn start_server(
         loop {
             match tcp_listener.accept().await {
                 Ok((tcp_stream, _)) => {
+                    if let Err(err) = tcp_stream.set_nodelay(true) {
+                        error!(log, "Failed to set nodelay, error = {}", err);
+                    }
                     metrics.connections_total.inc();
                     // Start recording connection setup duration.
                     let mut conn_svc = conn_svc.clone();
@@ -669,94 +661,26 @@ fn make_router(
     metrics: HttpHandlerMetrics,
     health_status_refresher: HealthStatusRefreshLayer,
 ) -> Router {
-    let call_service = http_handler.call_service.clone();
-    let query_service = http_handler.query_service.clone();
-    let catch_up_package_service = http_handler.catchup_service.clone();
-    let dashboard_service = http_handler.dashboard_service.clone();
-    let canister_read_state_service = http_handler.canister_read_state_service.clone();
-    let subnet_read_state_service = http_handler.subnet_read_state_service.clone();
-    let pprof_home_service = http_handler.pprof_home_service.clone();
-    let pprof_profile_service = http_handler.pprof_profile_service.clone();
-    let pprof_flamegraph_service = http_handler.pprof_flamegraph_service.clone();
-
-    let post_router: Router = Router::new()
-        .route(
-            "/api/v2/canister/:effective_canister_id/call",
-            post_service(
-                ServiceBuilder::new()
-                    .layer(HandleErrorLayer::new(map_box_error_to_response))
-                    .load_shed()
-                    .layer(GlobalConcurrencyLimitLayer::new(
-                        config.max_call_concurrent_requests,
-                    ))
-                    .layer(axum::middleware::from_fn(verify_cbor_content_header))
-                    .layer(axum::middleware::from_fn(attach_effective_canister_id))
-                    .service(call_service),
-            ),
-        )
-        .route(
-            "/api/v2/canister/:effective_canister_id/query",
-            post_service(
-                ServiceBuilder::new()
-                    .layer(HandleErrorLayer::new(map_box_error_to_response))
-                    .load_shed()
-                    .layer(GlobalConcurrencyLimitLayer::new(
-                        config.max_query_concurrent_requests,
-                    ))
-                    .layer(axum::middleware::from_fn(verify_cbor_content_header))
-                    .layer(axum::middleware::from_fn(attach_effective_canister_id))
-                    .service(query_service),
-            ),
-        )
-        .route(
-            "/api/v2/canister/:effective_canister_id/read_state",
-            post_service(
-                ServiceBuilder::new()
-                    .layer(HandleErrorLayer::new(map_box_error_to_response))
-                    .load_shed()
-                    .layer(GlobalConcurrencyLimitLayer::new(
-                        config.max_read_state_concurrent_requests,
-                    ))
-                    .layer(axum::middleware::from_fn(verify_cbor_content_header))
-                    .layer(axum::middleware::from_fn(attach_effective_canister_id))
-                    .service(canister_read_state_service),
-            ),
-        )
-        .route(
-            "/api/v2/subnet/:effective_canister_id/read_state",
-            post_service(
-                ServiceBuilder::new()
-                    .layer(HandleErrorLayer::new(map_box_error_to_response))
-                    .load_shed()
-                    .layer(GlobalConcurrencyLimitLayer::new(
-                        config.max_read_state_concurrent_requests,
-                    ))
-                    .layer(axum::middleware::from_fn(verify_cbor_content_header))
-                    .layer(axum::middleware::from_fn(attach_effective_canister_id))
-                    .service(subnet_read_state_service),
-            ),
-        )
-        .route(
-            "/_/catch_up_package",
-            post_service(
-                ServiceBuilder::new()
-                    .layer(HandleErrorLayer::new(map_box_error_to_response))
-                    .load_shed()
-                    .layer(GlobalConcurrencyLimitLayer::new(
-                        config.max_catch_up_package_concurrent_requests,
-                    ))
-                    .layer(axum::middleware::from_fn(verify_cbor_content_header))
-                    .service(catch_up_package_service),
-            ),
-        );
-
     let pprof_concurrency_limiter =
         GlobalConcurrencyLimitLayer::new(config.max_pprof_concurrent_requests);
 
-    let get_router = Router::new()
-        .route_service(
-            "/api/v2/status",
-            http_handler.status_method.layer(
+    let base_router = Router::new()
+        // TODO this is 303 instead of 302
+        .route(
+            "/",
+            get(|| async { Redirect::to(DashboardService::route()) }),
+        )
+        .route(
+            "/_/",
+            get(|| async { Redirect::to(DashboardService::route()) }),
+        )
+        .fallback(|| async {
+            make_plaintext_response(StatusCode::NOT_FOUND, "Endpoint not found.".to_string())
+        });
+
+    let final_router = base_router
+        .merge(
+            http_handler.status_router.layer(
                 ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(map_box_error_to_response))
                     .load_shed()
@@ -765,42 +689,58 @@ fn make_router(
                     )),
             ),
         )
-        // TODO this is 303 instead of 302
-        .route("/", get(|| async { Redirect::to(HTTP_DASHBOARD_URL_PATH) }))
-        .route(
-            "/_/",
-            get(|| async { Redirect::to(HTTP_DASHBOARD_URL_PATH) }),
-        )
-        .route_service(
-            "/_/pprof",
-            get_service(pprof_home_service).layer(
+        .merge(
+            http_handler.call_router.layer(
                 ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(map_box_error_to_response))
                     .load_shed()
-                    .layer(pprof_concurrency_limiter.clone()),
+                    .layer(GlobalConcurrencyLimitLayer::new(
+                        config.max_call_concurrent_requests,
+                    )),
             ),
         )
-        .route_service(
-            "/_/pprof/profile",
-            get_service(pprof_profile_service).layer(
+        .merge(
+            http_handler.query_router.layer(
                 ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(map_box_error_to_response))
                     .load_shed()
-                    .layer(pprof_concurrency_limiter.clone()),
+                    .layer(GlobalConcurrencyLimitLayer::new(
+                        config.max_query_concurrent_requests,
+                    )),
             ),
         )
-        .route_service(
-            "/_/pprof/flamegraph",
-            get_service(pprof_flamegraph_service).layer(
+        .merge(
+            http_handler.subnet_read_state_router.layer(
                 ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(map_box_error_to_response))
                     .load_shed()
-                    .layer(pprof_concurrency_limiter),
+                    .layer(GlobalConcurrencyLimitLayer::new(
+                        config.max_read_state_concurrent_requests,
+                    )),
             ),
         )
-        .route_service(
-            HTTP_DASHBOARD_URL_PATH,
-            get_service(dashboard_service).layer(
+        .merge(
+            http_handler.canister_read_state_router.layer(
+                ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(map_box_error_to_response))
+                    .load_shed()
+                    .layer(GlobalConcurrencyLimitLayer::new(
+                        config.max_read_state_concurrent_requests,
+                    )),
+            ),
+        )
+        .merge(
+            http_handler.catchup_router.layer(
+                ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(map_box_error_to_response))
+                    .load_shed()
+                    .layer(GlobalConcurrencyLimitLayer::new(
+                        config.max_catch_up_package_concurrent_requests,
+                    )),
+            ),
+        )
+        .merge(
+            http_handler.dashboard_router.layer(
                 ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(map_box_error_to_response))
                     .load_shed()
@@ -809,11 +749,40 @@ fn make_router(
                     )),
             ),
         )
-        .fallback(|| async {
-            make_plaintext_response(StatusCode::NOT_FOUND, "Endpoint not found.".to_string())
-        });
-
-    let final_router = get_router.merge(post_router);
+        .merge(
+            http_handler.pprof_home_router.layer(
+                ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(map_box_error_to_response))
+                    .load_shed()
+                    .layer(pprof_concurrency_limiter.clone()),
+            ),
+        )
+        .merge(
+            http_handler.pprof_flamegraph_router.layer(
+                ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(map_box_error_to_response))
+                    .load_shed()
+                    .layer(pprof_concurrency_limiter.clone()),
+            ),
+        )
+        .merge(
+            http_handler.pprof_profile_router.layer(
+                ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(map_box_error_to_response))
+                    .load_shed()
+                    .layer(pprof_concurrency_limiter.clone()),
+            ),
+        )
+        .merge(
+            http_handler.tracing_flamegraph_router.layer(
+                ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(map_box_error_to_response))
+                    .load_shed()
+                    .layer(GlobalConcurrencyLimitLayer::new(
+                        config.max_tracing_flamegraph_concurrent_requests,
+                    )),
+            ),
+        );
 
     final_router.layer(
         ServiceBuilder::new()
@@ -825,6 +794,8 @@ fn make_router(
                 Arc::new(metrics),
                 collect_timer_metric,
             ))
+            // Disable default limit since apply a request limit to all routes.
+            .layer(DefaultBodyLimit::disable())
             .layer(RequestBodyLimitLayer::new(
                 config.max_request_size_bytes as usize,
             ))
@@ -856,27 +827,6 @@ async fn verify_cbor_content_header(
     next.run(request).await
 }
 
-async fn attach_effective_canister_id(
-    axum::extract::Path(effective_canister_id): axum::extract::Path<String>,
-    mut request: axum::extract::Request,
-    next: Next,
-) -> axum::response::Response {
-    match PrincipalId::from_str(&effective_canister_id) {
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Malformed request: Invalid efffective principal id {}: {}",
-                effective_canister_id, e
-            ),
-        )
-            .into_response(),
-        Ok(eci) => {
-            request.extensions_mut().insert(eci);
-            next.run(request).await
-        }
-    }
-}
-
 async fn collect_timer_metric(
     State(metrics): State<Arc<HttpHandlerMetrics>>,
     request: axum::extract::Request,
@@ -889,6 +839,14 @@ async fn collect_timer_metric(
     } else {
         request.uri().path().to_owned()
     };
+
+    let http_version = format!("{:?}", request.version());
+
+    metrics
+        .request_http_version_counts
+        .with_label_values(&[&http_version])
+        .inc();
+
     metrics
         .request_body_size_bytes
         .with_label_values(&[&path, LABEL_UNKNOWN])
@@ -913,26 +871,6 @@ async fn collect_timer_metric(
         .with_label_values(&[&path])
         .observe(resp.body().size_hint().lower() as f64);
     resp
-}
-
-async fn receive_request_body(body: Body) -> Result<Bytes, Response<Body>> {
-    match body.collect().await.map_err(|e| e.into_inner()) {
-        Ok(b) => Ok(b.to_bytes()),
-        Err(e) if e.is::<LengthLimitError>() => {
-            let res = make_plaintext_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "Http body too large".to_string(),
-            );
-            Err(res)
-        }
-        Err(_) => {
-            let res = make_plaintext_response(
-                StatusCode::BAD_REQUEST,
-                "Unable to receive http body".to_string(),
-            );
-            Err(res)
-        }
-    }
 }
 
 // Fetches a delegation from the NNS subnet to allow this subnet to issue
@@ -1216,6 +1154,7 @@ async fn get_random_node_from_nns_subnet(
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use futures_util::{future::select_all, stream::pending, FutureExt};
     use http::{
         header::{
@@ -1230,26 +1169,46 @@ mod tests {
     use ic_logger::replica_logger::no_op_logger;
     use ic_types::{CanisterId, Height};
 
+    use crate::{call::CallService, common::Cbor, query::QueryService};
+
     use super::*;
 
+    fn empty_cbor() -> Bytes {
+        Bytes::from(serde_cbor::to_vec(&()).unwrap())
+    }
+
     fn dummy_router(config: Config) -> Router {
-        let dummy_service = BoxCloneService::new(service_fn(|req: Request<Body>| async move {
-            match receive_request_body(req.into_body()).await {
-                Ok(_) => Ok(Response::new(Body::new("success".to_string()))),
-                Err(e) => Ok(e),
-            }
-        }));
+        async fn dummy(_body: Bytes) -> String {
+            "success".to_string()
+        }
+        async fn dummy_cbor(_body: Cbor<()>) -> String {
+            "success".to_string()
+        }
         let http_handler = HttpHandler {
-            call_service: dummy_service.clone(),
-            query_service: dummy_service.clone(),
-            catchup_service: dummy_service.clone(),
-            dashboard_service: dummy_service.clone(),
-            status_method: MethodRouter::new().get_service(dummy_service.clone()),
-            canister_read_state_service: dummy_service.clone(),
-            subnet_read_state_service: dummy_service.clone(),
-            pprof_home_service: dummy_service.clone(),
-            pprof_profile_service: dummy_service.clone(),
-            pprof_flamegraph_service: dummy_service.clone(),
+            call_router: Router::new().route(CallService::route(), axum::routing::post(dummy)),
+            query_router: Router::new()
+                .route(QueryService::route(), axum::routing::post(dummy_cbor)),
+            catchup_router: Router::new().route(
+                CatchUpPackageService::route(),
+                axum::routing::post(dummy_cbor),
+            ),
+            dashboard_router: Router::new()
+                .route(DashboardService::route(), axum::routing::get(dummy)),
+            status_router: Router::new().route(StatusService::route(), axum::routing::get(dummy)),
+            canister_read_state_router: Router::new().route(
+                CanisterReadStateService::route(),
+                axum::routing::post(dummy),
+            ),
+            subnet_read_state_router: Router::new()
+                .route(SubnetReadStateService::route(), axum::routing::post(dummy)),
+            pprof_home_router: Router::new()
+                .route(PprofHomeService::route(), axum::routing::get(dummy)),
+            pprof_profile_router: Router::new()
+                .route(PprofProfileService::route(), axum::routing::get(dummy)),
+            pprof_flamegraph_router: Router::new()
+                .route(PprofFlamegraphService::route(), axum::routing::get(dummy)),
+            tracing_flamegraph_router: Router::new()
+                .route(TracingFlamegraphService::route(), axum::routing::get(dummy)),
         };
 
         let metrics = HttpHandlerMetrics::new(&MetricsRegistry::default());
@@ -1384,7 +1343,7 @@ mod tests {
             .uri(format!("/api/v2/canister/{}/query", CanisterId::ic_00()))
             .header(CONTENT_TYPE, CONTENT_TYPE_CBOR)
             .method(hyper::Method::POST)
-            .body(Body::new(Empty::new()))
+            .body(Body::new(Full::new(empty_cbor())))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert!(resp.headers().contains_key(ACCESS_CONTROL_ALLOW_ORIGIN));
@@ -1504,7 +1463,7 @@ mod tests {
             .uri("/_/catch_up_package")
             .header(CONTENT_TYPE, CONTENT_TYPE_CBOR)
             .method(hyper::Method::POST)
-            .body(Body::new(Empty::new()))
+            .body(Body::new(Full::new(empty_cbor())))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

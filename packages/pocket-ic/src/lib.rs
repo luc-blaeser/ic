@@ -7,15 +7,16 @@
 //! With PocketIC, testing canisters is as simple as calling rust functions. Here is a minimal example:
 //!
 //! ```rust,no_run
-//! use candid;
-//! use pocket_ic;
+//! use candid::encode_one;
+//! use pocket_ic::PocketIc;
 //!
 //!  #[test]
 //!  fn test_counter_canister() {
 //!     let pic = PocketIc::new();
-//!     // Create an empty canister as the anonymous principal.
-//!     let canister_id = pic.create_canister(None);
-//!     pic.add_cycles(canister_id, 2_000_000_000_000); // 2T cycles
+//!     // Create an empty canister as the anonymous principal and add cycles.
+//!     let canister_id = pic.create_canister();
+//!     pic.add_cycles(canister_id, 2_000_000_000_000);
+//!  
 //!     let wasm_bytes = load_counter_wasm(...);
 //!     pic.install_canister(canister_id, wasm_bytes, vec![], None);
 //!     // 'inc' is a counter canister method.
@@ -33,10 +34,12 @@
 //! For more information, see the [README](https://crates.io/crates/pocket-ic).
 //!
 use crate::common::rest::{
-    ApiResponse, BlobCompression, BlobId, CreateInstanceResponse, ExtendedSubnetConfigSet,
+    ApiResponse, BlobCompression, BlobId, CreateHttpGatewayResponse, CreateInstanceResponse,
+    DtsFlag, ExtendedSubnetConfigSet, HttpGatewayBackend, HttpGatewayConfig, HttpGatewayInfo,
     InstanceId, RawAddCycles, RawCanisterCall, RawCanisterId, RawCanisterResult, RawCycles,
-    RawEffectivePrincipal, RawSetStableMemory, RawStableMemory, RawSubnetId, RawTime,
-    RawVerifyCanisterSigArg, RawWasmResult, SubnetId, SubnetSpec, Topology,
+    RawEffectivePrincipal, RawMessageId, RawSetStableMemory, RawStableMemory,
+    RawSubmitIngressResult, RawSubnetId, RawTime, RawVerifyCanisterSigArg, RawWasmResult, SubnetId,
+    SubnetSpec, Topology,
 };
 use candid::{
     decode_args, encode_args,
@@ -46,7 +49,7 @@ use candid::{
 pub use ic_cdk::api::management_canister::main::CanisterSettings;
 use ic_cdk::api::management_canister::main::{
     CanisterId, CanisterIdRecord, CanisterInstallMode, CanisterStatusResponse, InstallCodeArgument,
-    UpdateSettingsArgument,
+    SkipPreUpgrade, UpdateSettingsArgument,
 };
 use reqwest::Url;
 use schemars::JsonSchema;
@@ -56,13 +59,16 @@ use std::{
     process::Command,
     time::{Duration, Instant, SystemTime},
 };
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 pub mod common;
 
-const PROCESSING_TIME_HEADER: &str = "processing-timeout-ms";
-const PROCESSING_TIME_VALUE_MS: u64 = 300_000;
+// how long a get/post request may retry or poll
+const MAX_REQUEST_TIME_MS: u64 = 300_000;
+// wait time between polling requests
+const POLLING_PERIOD_MS: u64 = 10;
+
 const LOCALHOST: &str = "127.0.0.1";
 
 const LOG_DIR_PATH_ENV_NAME: &str = "POCKET_IC_LOG_DIR";
@@ -193,11 +199,17 @@ impl PocketIcBuilder {
             .push(SubnetSpec::default().with_benchmarking_instruction_config());
         self
     }
+
+    pub fn with_dts_flag(mut self, dts_flag: DtsFlag) -> Self {
+        self.config = self.config.with_dts_flag(dts_flag);
+        self
+    }
 }
 /// Main entry point for interacting with PocketIC.
 pub struct PocketIc {
     /// The unique ID of this PocketIC instance.
     pub instance_id: InstanceId,
+    http_gateway: Option<HttpGatewayInfo>,
     topology: Topology,
     server_url: Url,
     reqwest_client: reqwest::blocking::Client,
@@ -214,13 +226,22 @@ impl PocketIc {
     /// Creates a new PocketIC instance with the specified subnet config.
     /// The server is started if it's not already running.
     pub fn from_config(config: impl Into<ExtendedSubnetConfigSet>) -> Self {
+        let server_url = crate::start_or_reuse_server();
+        Self::from_config_and_server_url(config, server_url)
+    }
+
+    /// Creates a new PocketIC instance with the specified subnet config and server url.
+    /// This function is intended for advanced users who start the server manually.
+    pub fn from_config_and_server_url(
+        config: impl Into<ExtendedSubnetConfigSet>,
+        server_url: Url,
+    ) -> Self {
         let config = config.into();
         config.validate().unwrap();
 
         let parent_pid = std::os::unix::process::parent_id();
         let log_guard = setup_tracing(parent_pid);
 
-        let server_url = crate::start_or_reuse_server();
         let reqwest_client = reqwest::blocking::Client::new();
         let (instance_id, topology) = match reqwest_client
             .post(server_url.join("instances").unwrap())
@@ -240,6 +261,7 @@ impl PocketIc {
 
         Self {
             instance_id,
+            http_gateway: None,
             topology,
             server_url,
             reqwest_client,
@@ -355,10 +377,15 @@ impl PocketIc {
     /// Configures the IC to make progress automatically,
     /// i.e., periodically update the time of the IC
     /// to the real time and execute rounds on the subnets.
+    /// Returns the URL at which `/api/v2` requests
+    /// for this instance can be made.
     #[instrument(skip(self), fields(instance_id=self.instance_id))]
-    pub fn auto_progress(&self) {
+    pub fn auto_progress(&self) -> Url {
+        let now = std::time::SystemTime::now();
+        self.set_time(now);
         let endpoint = "auto_progress";
         self.post::<(), _>(endpoint, "");
+        self.instance_url()
     }
 
     /// Stops automatic progress (see `auto_progress`) on the IC.
@@ -366,6 +393,68 @@ impl PocketIc {
     pub fn stop_progress(&self) {
         let endpoint = "stop_progress";
         self.post::<(), _>(endpoint, "");
+    }
+
+    /// Creates an HTTP gateway for this IC instance
+    /// listening on an optionally specified port
+    /// and configures the IC instance to make progress
+    /// automatically, i.e., periodically update the time
+    /// of the IC to the real time and execute rounds on the subnets.
+    /// Returns the URL at which `/api/v2` requests
+    /// for this instance can be made.
+    #[instrument(skip(self), fields(instance_id=self.instance_id))]
+    pub fn make_live(&mut self, listen_at: Option<u16>) -> Url {
+        self.auto_progress();
+        if let Some(res) = &self.http_gateway {
+            return Url::parse(&format!("http://{}:{}/", LOCALHOST, res.port)).unwrap();
+        }
+        let endpoint = self.server_url.join("http_gateway").unwrap();
+        let http_gateway_config = HttpGatewayConfig {
+            listen_at,
+            forward_to: HttpGatewayBackend::PocketIcInstance(self.instance_id),
+        };
+        let res = self
+            .reqwest_client
+            .post(endpoint)
+            .json(&http_gateway_config)
+            .send()
+            .expect("HTTP failure")
+            .json::<CreateHttpGatewayResponse>()
+            .expect("Could not parse response for create HTTP gateway request");
+        match res {
+            CreateHttpGatewayResponse::Created(info) => {
+                let port = info.port;
+                self.http_gateway = Some(info);
+                Url::parse(&format!("http://{}:{}/", LOCALHOST, port)).unwrap()
+            }
+            CreateHttpGatewayResponse::Error { message } => {
+                panic!("Failed to crate http gateway: {}", message)
+            }
+        }
+    }
+
+    fn stop_http_gateway(&mut self) {
+        if let Some(info) = self.http_gateway.take() {
+            let stop_http_gateway_url = self
+                .server_url
+                .join(&format!("http_gateway/{}/stop", info.instance_id))
+                .unwrap();
+            self.reqwest_client
+                .post(stop_http_gateway_url)
+                .send()
+                .unwrap()
+                .json::<()>()
+                .expect("Could not parse response for stop HTTP gateway request");
+        }
+    }
+
+    /// Makes the IC instance deterministic by stopping automatic progress
+    /// (time updates and round executions) on the IC instance
+    /// and stops the HTTP gateway for this IC instance.
+    #[instrument(skip(self), fields(instance_id=self.instance_id))]
+    pub fn make_deterministic(&mut self) {
+        self.stop_http_gateway();
+        self.stop_progress();
     }
 
     /// Get the root key of this IC instance. Returns `None` if the IC has no NNS subnet.
@@ -435,6 +524,60 @@ impl PocketIc {
         result.cycles
     }
 
+    /// Submit an update call (without executing it immediately).
+    pub fn submit_call(
+        &self,
+        canister_id: CanisterId,
+        sender: Principal,
+        method: &str,
+        payload: Vec<u8>,
+    ) -> Result<RawMessageId, UserError> {
+        self.submit_call_with_effective_principal(
+            canister_id,
+            RawEffectivePrincipal::None,
+            sender,
+            method,
+            payload,
+        )
+    }
+
+    /// Submit an update call with a provided effective principal (without executing it immediately).
+    pub fn submit_call_with_effective_principal(
+        &self,
+        canister_id: CanisterId,
+        effective_principal: RawEffectivePrincipal,
+        sender: Principal,
+        method: &str,
+        payload: Vec<u8>,
+    ) -> Result<RawMessageId, UserError> {
+        let endpoint = "update/submit_ingress_message";
+        let raw_canister_call = RawCanisterCall {
+            sender: sender.as_slice().to_vec(),
+            canister_id: canister_id.as_slice().to_vec(),
+            method: method.to_string(),
+            payload,
+            effective_principal,
+        };
+        let res: RawSubmitIngressResult = self.post(endpoint, raw_canister_call);
+        match res {
+            RawSubmitIngressResult::Ok(message_id) => Ok(message_id),
+            RawSubmitIngressResult::Err(user_error) => Err(user_error),
+        }
+    }
+
+    /// Await an update call submitted previously by `submit_call_with_effective_principal`.
+    pub fn await_call(&self, message_id: RawMessageId) -> Result<WasmResult, UserError> {
+        let endpoint = "update/await_ingress_message";
+        let result: RawCanisterResult = self.post(endpoint, message_id);
+        match result {
+            RawCanisterResult::Ok(raw_wasm_result) => match raw_wasm_result {
+                RawWasmResult::Reply(data) => Ok(WasmResult::Reply(data)),
+                RawWasmResult::Reject(text) => Ok(WasmResult::Reject(text)),
+            },
+            RawCanisterResult::Err(user_error) => Err(user_error),
+        }
+    }
+
     /// Execute an update call on a canister.
     #[instrument(skip(self, payload), fields(instance_id=self.instance_id, canister_id = %canister_id.to_string(), sender = %sender.to_string(), method = %method, payload_len = %payload.len()))]
     pub fn update_call(
@@ -444,11 +587,9 @@ impl PocketIc {
         method: &str,
         payload: Vec<u8>,
     ) -> Result<WasmResult, UserError> {
-        let endpoint = "update/execute_ingress_message";
-        self.canister_call(
-            endpoint,
-            RawEffectivePrincipal::None,
+        self.update_call_with_effective_principal(
             canister_id,
+            RawEffectivePrincipal::CanisterId(canister_id.as_slice().to_vec()),
             sender,
             method,
             payload,
@@ -638,7 +779,7 @@ impl PocketIc {
             sender.unwrap_or(Principal::anonymous()),
             "install_code",
             (InstallCodeArgument {
-                mode: CanisterInstallMode::Upgrade,
+                mode: CanisterInstallMode::Upgrade(Some(SkipPreUpgrade(Some(false)))),
                 canister_id,
                 wasm_module,
                 arg,
@@ -777,51 +918,103 @@ impl PocketIc {
     }
 
     fn get<T: DeserializeOwned>(&self, endpoint: &str) -> T {
+        // we may have to try several times if the instance is busy
+        let start = std::time::SystemTime::now();
         loop {
             let result = self
                 .reqwest_client
                 .get(self.instance_url().join(endpoint).unwrap())
-                .header(PROCESSING_TIME_HEADER, PROCESSING_TIME_VALUE_MS)
                 .send()
                 .expect("HTTP failure");
-            if let Some(t) = self.check_response(result) {
-                break t;
+            match result.into() {
+                ApiResponse::Success(t) => break t,
+                ApiResponse::Error { message } => panic!("{}", message),
+                ApiResponse::Busy { state_label, op_id } => {
+                    debug!(
+                        "instance_id={} Instance is busy: state_label: {}, op_id: {}",
+                        self.instance_id, state_label, op_id
+                    );
+                }
+                ApiResponse::Started { state_label, op_id } => {
+                    panic!(
+                        "Error: A 'get' should not return Started: state_label: {}, op_id: {}",
+                        state_label, op_id
+                    )
+                }
             }
+            if start.elapsed().unwrap() > Duration::from_millis(MAX_REQUEST_TIME_MS) {
+                panic!("'get' request to PocketIC server timed out.");
+            }
+            std::thread::sleep(Duration::from_millis(POLLING_PERIOD_MS));
         }
     }
 
     fn post<T: DeserializeOwned, B: Serialize>(&self, endpoint: &str, body: B) -> T {
+        // we may have to try several times if the instance is busy
+        let start = std::time::SystemTime::now();
         loop {
             let result = self
                 .reqwest_client
                 .post(self.instance_url().join(endpoint).unwrap())
-                .header(PROCESSING_TIME_HEADER, PROCESSING_TIME_VALUE_MS)
                 .json(&body)
                 .send()
                 .expect("HTTP failure");
-            if let Some(t) = self.check_response(result) {
-                break t;
+            match result.into() {
+                ApiResponse::Success(t) => break t,
+                ApiResponse::Error { message } => panic!("{}", message),
+                ApiResponse::Busy { state_label, op_id } => {
+                    debug!(
+                        "instance_id={} Instance is busy (with a different computation): state_label: {}, op_id: {}",
+                        self.instance_id, state_label, op_id
+                    );
+                }
+                ApiResponse::Started { state_label, op_id } => {
+                    // once we have a Started reply, we only want to query the result to that computation
+                    debug!(
+                        "instance_id={} Instance has Started: state_label: {}, op_id: {}",
+                        self.instance_id, state_label, op_id
+                    );
+                    loop {
+                        std::thread::sleep(Duration::from_millis(POLLING_PERIOD_MS));
+                        let result = self
+                            .reqwest_client
+                            .get(
+                                self.server_url
+                                    .join(&format!("/read_graph/{}/{}", state_label, op_id))
+                                    .unwrap(),
+                            )
+                            .send()
+                            .expect("HTTP failure");
+                        match result.into() {
+                            ApiResponse::Error { message } => {
+                                debug!("Polling has not succeeded yet: {}", message)
+                            }
+                            ApiResponse::Success(t) => {
+                                return t;
+                            }
+                            ApiResponse::Started { state_label, op_id } => {
+                                warn!(
+                                    "instance_id={} unexpected Started({} {})",
+                                    self.instance_id, state_label, op_id
+                                );
+                            }
+                            ApiResponse::Busy { state_label, op_id } => {
+                                warn!(
+                                    "instance_id={} unexpected Busy({} {})",
+                                    self.instance_id, state_label, op_id
+                                );
+                            }
+                        }
+                        if start.elapsed().unwrap() > Duration::from_millis(MAX_REQUEST_TIME_MS) {
+                            panic!("'post' request to PocketIC server timed out.");
+                        }
+                    }
+                }
             }
-        }
-    }
-
-    fn check_response<T: DeserializeOwned>(
-        &self,
-        result: reqwest::blocking::Response,
-    ) -> Option<T> {
-        match result.into() {
-            ApiResponse::Success(t) => Some(t),
-            ApiResponse::Error { message } => panic!("{}", message),
-            ApiResponse::Busy { state_label, op_id } => {
-                debug!(
-                    "instance_id={} Instance is busy: state_label: {}, op_id: {}",
-                    self.instance_id, state_label, op_id
-                );
-                None
+            if start.elapsed().unwrap() > Duration::from_millis(MAX_REQUEST_TIME_MS) {
+                panic!("'post' request to PocketIC server timed out.");
             }
-            ApiResponse::Started { state_label, op_id } => {
-                panic!("Started: state_label: {}, op_id: {}", state_label, op_id)
-            }
+            std::thread::sleep(Duration::from_millis(POLLING_PERIOD_MS));
         }
     }
 
@@ -860,15 +1053,14 @@ impl PocketIc {
         method: &str,
         payload: Vec<u8>,
     ) -> Result<WasmResult, UserError> {
-        let endpoint = "update/execute_ingress_message";
-        self.canister_call(
-            endpoint,
-            effective_principal,
+        let message_id = self.submit_call_with_effective_principal(
             canister_id,
+            effective_principal,
             sender,
             method,
             payload,
-        )
+        )?;
+        self.await_call(message_id)
     }
 }
 
@@ -880,6 +1072,7 @@ impl Default for PocketIc {
 
 impl Drop for PocketIc {
     fn drop(&mut self) {
+        self.stop_http_gateway();
         self.reqwest_client
             .delete(self.instance_url())
             .send()
@@ -1164,9 +1357,10 @@ impl TryFrom<u64> for ErrorCode {
             209 => Ok(ErrorCode::CanisterInstallCodeRateLimited),
             // 3xx -- `RejectCode::DestinationInvalid`
             301 => Ok(ErrorCode::CanisterNotFound),
-            // 302 (previously `CanisterMethodNotFound`)
-            // 303 (previously `CanisterAlreadyInstalled`)
-            // 304 (previously `CanisterWasmModuleNotFound`)
+            // TODO: RUN-948: Backward compatibility
+            302 => Ok(ErrorCode::CanisterMethodNotFound),
+            303 => Ok(ErrorCode::CanisterAlreadyInstalled),
+            304 => Ok(ErrorCode::CanisterWasmModuleNotFound),
             // 4xx -- `RejectCode::CanisterReject`
             // 401
             402 => Ok(ErrorCode::InsufficientMemoryAllocation),
@@ -1191,15 +1385,16 @@ impl TryFrom<u64> for ErrorCode {
             512 => Ok(ErrorCode::CanisterInvalidController),
             513 => Ok(ErrorCode::CanisterFunctionNotFound),
             514 => Ok(ErrorCode::CanisterNonEmpty),
-            // 515 (previously `CertifiedStateUnavailable`)
-            // 516 (previously `CanisterRejectedMessage`)
+            // TODO: RUN-948: Backward compatibility
+            515 => Ok(ErrorCode::CertifiedStateUnavailable),
+            516 => Ok(ErrorCode::CanisterRejectedMessage),
             517 => Ok(ErrorCode::QueryCallGraphLoopDetected),
-            // 518 (previously `UnknownManagementMessage`)
-            // 519 (previously `InvalidManagementPayload`)
+            518 => Ok(ErrorCode::UnknownManagementMessage),
+            519 => Ok(ErrorCode::InvalidManagementPayload),
             520 => Ok(ErrorCode::InsufficientCyclesInCall),
             521 => Ok(ErrorCode::CanisterWasmEngineError),
             522 => Ok(ErrorCode::CanisterInstructionLimitExceeded),
-            // 523 (previously `CanisterInstallCodeRateLimited`)
+            523 => Ok(ErrorCode::CanisterInstallCodeRateLimited),
             524 => Ok(ErrorCode::CanisterMemoryAccessLimitExceeded),
             525 => Ok(ErrorCode::QueryCallGraphTooDeep),
             526 => Ok(ErrorCode::QueryCallGraphTotalInstructionLimitExceeded),

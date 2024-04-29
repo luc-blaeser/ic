@@ -43,9 +43,12 @@ MACRO_DEPENDENCIES = []
 DEV_DEPENDENCIES = [
     "//rs/registry/routing_table",
     "//rs/rust_canisters/canister_test",
+    "//rs/types/base_types",
     "//rs/test_utilities",
-    "//rs/test_utilities/logger",
+    "//rs/test_utilities/embedders",
     "//rs/test_utilities/execution_environment",
+    "//rs/test_utilities/logger",
+    "//rs/test_utilities/state",
     "//rs/test_utilities/time",
     "//rs/test_utilities/types",
     "@crate_index//:assert_matches",
@@ -171,7 +174,6 @@ rust_ic_bench(
     env = ENV,
     deps = [
         ":embedders_bench",
-        "//rs/types/base_types",
         "@crate_index//:candid",
     ] + DEPENDENCIES + DEV_DEPENDENCIES,
 )
@@ -185,7 +187,6 @@ rust_ic_bench(
     env = ENV,
     deps = [
         ":embedders_bench",
-        "//rs/types/base_types",
         "@crate_index//:candid",
     ] + DEPENDENCIES + DEV_DEPENDENCIES,
 )

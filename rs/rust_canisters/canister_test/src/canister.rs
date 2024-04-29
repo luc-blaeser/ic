@@ -9,13 +9,15 @@ pub use ic_management_canister_types::{
     ProvisionalCreateCanisterWithCyclesArgs, IC_00,
 };
 use ic_registry_transport::pb::v1::RegistryMutation;
-use ic_replica_tests::*;
 pub use ic_types::{ingress::WasmResult, CanisterId, Cycles, PrincipalId};
 use on_wire::{FromWire, IntoWire, NewType};
 
 use ic_management_canister_types::{
     CanisterSettingsArgsBuilder, CanisterStatusResultV2, UpdateSettingsArgs,
 };
+use ic_replica_tests::{canister_test_async, LocalTestRuntime};
+pub use ic_replica_tests::{canister_test_with_config_async, get_ic_config};
+use ic_state_machine_tests::StateMachine;
 use std::{
     convert::{AsRef, TryFrom},
     env, fmt,
@@ -151,7 +153,6 @@ impl Wasm {
             wasm: self,
             compute_allocation: None,
             memory_allocation: None,
-            query_allocation: None,
             // By default, give the max amount of cycles to the created canister.
             num_cycles: Some(u128::MAX),
         }
@@ -172,6 +173,10 @@ impl Wasm {
     /// Extract the wasm bytes.
     pub fn bytes(self) -> Vec<u8> {
         self.0
+    }
+
+    pub fn sha256_hash(&self) -> [u8; 32] {
+        ic_crypto_sha2::Sha256::hash(&self.0)
     }
 
     /// Installs this wasm onto a pre-existing canister.
@@ -271,6 +276,7 @@ where
 pub enum Runtime {
     Remote(RemoteTestRuntime),
     Local(LocalTestRuntime),
+    StateMachine(StateMachine),
 }
 
 impl<'a> Runtime {
@@ -507,6 +513,7 @@ impl<'a> Canister<'a> {
         match self.runtime {
             Runtime::Remote(_) => false,
             Runtime::Local(_) => true,
+            Runtime::StateMachine(_) => true,
         }
     }
 }
@@ -856,7 +863,6 @@ pub struct Install<'a> {
     pub wasm: Wasm,
     pub compute_allocation: Option<u64>,
     pub memory_allocation: Option<u64>,
-    pub query_allocation: Option<u64>,
     pub num_cycles: Option<u128>,
 }
 
@@ -869,6 +875,17 @@ impl<'a> Query<'a> {
                     .query(canister.canister_id, &self.method_name, payload)
                     .await
                     .map_err(|e| e.to_string())?;
+                match result {
+                    WasmResult::Reply(v) => Ok(v),
+                    WasmResult::Reject(s) => Err(format!("Canister rejected with message: {}", s)),
+                }
+            }
+            Runtime::StateMachine(state_machine) => {
+                let result = state_machine
+                    .query(canister.canister_id, &self.method_name, payload)
+                    .map_err(|e| e.to_string())?;
+                state_machine.advance_time(Duration::from_millis(1));
+                state_machine.tick();
                 match result {
                     WasmResult::Reply(v) => Ok(v),
                     WasmResult::Reject(s) => Err(format!("Canister rejected with message: {}", s)),
@@ -895,6 +912,22 @@ impl<'a> Query<'a> {
                 let result = t
                     .ingress_with_sender(canister.canister_id, &self.method_name, payload, sender)
                     .map_err(|e| e.to_string())?;
+                match result {
+                    WasmResult::Reply(v) => Ok(v),
+                    WasmResult::Reject(s) => Err(format!("Canister rejected with message: {}", s)),
+                }
+            }
+            Runtime::StateMachine(state_machine) => {
+                let result = state_machine
+                    .execute_ingress_as(
+                        sender.get_principal_id(),
+                        canister.canister_id,
+                        &self.method_name,
+                        payload,
+                    )
+                    .map_err(|e| e.to_string())?;
+                state_machine.advance_time(Duration::from_millis(1));
+                state_machine.tick();
                 match result {
                     WasmResult::Reply(v) => Ok(v),
                     WasmResult::Reject(s) => Err(format!("Canister rejected with message: {}", s)),
@@ -927,6 +960,17 @@ impl<'a> Update<'a> {
                     WasmResult::Reject(s) => Err(format!("Canister rejected with message: {}", s)),
                 }
             }
+            Runtime::StateMachine(state_machine) => {
+                let result = state_machine
+                    .execute_ingress(canister.canister_id, &self.method_name, payload)
+                    .map_err(|e| e.to_string())?;
+                state_machine.advance_time(Duration::from_millis(1));
+                state_machine.tick();
+                match result {
+                    WasmResult::Reply(v) => Ok(v),
+                    WasmResult::Reject(s) => Err(format!("Canister rejected with message: {}", s)),
+                }
+            }
             Runtime::Remote(c) => {
                 let ingress_result = c
                     .agent
@@ -954,6 +998,22 @@ impl<'a> Update<'a> {
                 let result = t
                     .ingress_with_sender(canister.canister_id, &self.method_name, payload, sender)
                     .map_err(|e| e.to_string())?;
+                match result {
+                    WasmResult::Reply(v) => Ok(v),
+                    WasmResult::Reject(s) => Err(format!("Canister rejected with message: {}", s)),
+                }
+            }
+            Runtime::StateMachine(state_machine) => {
+                let result = state_machine
+                    .execute_ingress_as(
+                        sender.get_principal_id(),
+                        canister.canister_id,
+                        &self.method_name,
+                        payload,
+                    )
+                    .map_err(|e| e.to_string())?;
+                state_machine.advance_time(Duration::from_millis(1));
+                state_machine.tick();
                 match result {
                     WasmResult::Reply(v) => Ok(v),
                     WasmResult::Reject(s) => Err(format!("Canister rejected with message: {}", s)),
@@ -1002,7 +1062,6 @@ impl<'a> Install<'a> {
             payload,
             self.compute_allocation,
             self.memory_allocation,
-            self.query_allocation,
         );
         eprintln!("Install args: {}", &install_args);
         match self.runtime {
@@ -1011,6 +1070,37 @@ impl<'a> Install<'a> {
                 .await
                 .map_err(|e| e.to_string())
                 .map(|_| {}),
+            Runtime::StateMachine(state_machine) => {
+                let InstallCodeArgs {
+                    mode,
+                    canister_id,
+                    wasm_module,
+                    arg,
+                    compute_allocation: _,
+                    memory_allocation: _,
+                    sender_canister_version: _,
+                } = install_args;
+                state_machine
+                    .install_wasm_in_mode(
+                        CanisterId::unchecked_from_principal(canister_id),
+                        mode,
+                        wasm_module,
+                        arg,
+                    )
+                    .map_err(|e| e.to_string())?;
+                state_machine
+                    .update_settings(
+                        &CanisterId::unchecked_from_principal(canister_id),
+                        CanisterSettingsArgsBuilder::new()
+                            .with_compute_allocation(self.compute_allocation.unwrap_or_default())
+                            .with_memory_allocation(self.memory_allocation.unwrap_or_default())
+                            .build(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                state_machine.advance_time(Duration::from_millis(1));
+                state_machine.tick();
+                Ok(())
+            }
             Runtime::Remote(c) => c.agent.install_canister(install_args).await,
         }?;
         canister.wasm = Some(self.wasm);
@@ -1024,11 +1114,6 @@ impl<'a> Install<'a> {
 
     pub fn with_memory_allocation(mut self, memory_allocation: u64) -> Install<'a> {
         self.memory_allocation = Some(memory_allocation);
-        self
-    }
-
-    pub fn with_query_allocation(mut self, query_allocation: u64) -> Install<'a> {
-        self.query_allocation = Some(query_allocation);
         self
     }
 

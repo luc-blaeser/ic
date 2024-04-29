@@ -9,6 +9,7 @@ use crate::{
     metrics::{LABEL_POOL_TYPE, POOL_TYPE_UNVALIDATED, POOL_TYPE_VALIDATED},
 };
 use ic_config::artifact_pool::{ArtifactPoolConfig, PersistentPoolBackend};
+use ic_interfaces::p2p::consensus::ArtifactWithOpt;
 use ic_interfaces::{
     consensus_pool::{
         ChangeAction, ChangeSet, ConsensusBlockCache, ConsensusBlockChain, ConsensusPool,
@@ -24,8 +25,8 @@ use ic_protobuf::types::v1 as pb;
 use ic_types::crypto::CryptoHashOf;
 use ic_types::NodeId;
 use ic_types::{
-    artifact::ArtifactKind, artifact::ConsensusMessageFilter, artifact::ConsensusMessageId,
-    artifact_kind::ConsensusArtifact, consensus::*, Height, SubnetId, Time,
+    artifact::ArtifactKind, artifact::ConsensusMessageId, artifact_kind::ConsensusArtifact,
+    consensus::*, Height, SubnetId, Time,
 };
 use prometheus::{histogram_opts, labels, opts, Histogram, IntCounter, IntGauge};
 use std::collections::BTreeMap;
@@ -685,7 +686,7 @@ impl MutablePool<ConsensusArtifact> for ConsensusPoolImpl {
         let updates = self.cache.prepare(&change_set);
         let mut unvalidated_ops = PoolSectionOps::new();
         let mut validated_ops = PoolSectionOps::new();
-        let mut adverts = Vec::new();
+        let mut artifacts_with_opt = Vec::new();
         // DO NOT Add a default nop. Explicitly mention all cases.
         // This helps with keeping this readable and obvious what
         // change is causing tests to break.
@@ -693,7 +694,10 @@ impl MutablePool<ConsensusArtifact> for ConsensusPoolImpl {
             match change_action {
                 ChangeAction::AddToValidated(to_add) => {
                     self.record_instant(&to_add.msg);
-                    adverts.push(ConsensusArtifact::message_to_advert(&to_add.msg));
+                    artifacts_with_opt.push(ArtifactWithOpt {
+                        advert: ConsensusArtifact::message_to_advert(&to_add.msg),
+                        is_latency_sensitive: is_latency_sensitive(&to_add.msg),
+                    });
                     validated_ops.insert(to_add);
                 }
                 ChangeAction::RemoveFromValidated(to_remove) => {
@@ -701,7 +705,10 @@ impl MutablePool<ConsensusArtifact> for ConsensusPoolImpl {
                 }
                 ChangeAction::MoveToValidated(to_move) => {
                     if !to_move.is_share() {
-                        adverts.push(ConsensusArtifact::message_to_advert(&to_move));
+                        artifacts_with_opt.push(ArtifactWithOpt {
+                            advert: ConsensusArtifact::message_to_advert(&to_move),
+                            is_latency_sensitive: false,
+                        });
                     }
                     let msg_id = to_move.get_id();
                     let timestamp = self.unvalidated.get_timestamp(&msg_id).unwrap_or_else(|| {
@@ -728,11 +735,14 @@ impl MutablePool<ConsensusArtifact> for ConsensusPoolImpl {
                     self.clear_instants(height);
                     unvalidated_ops.purge_below(height);
                 }
-                ChangeAction::HandleInvalid(to_remove, s) => {
+                ChangeAction::HandleInvalid(to_remove, error_message) => {
                     self.invalidated_artifacts.inc();
                     warn!(
                         self.log,
-                        "Invalid consensus artifact ({}): {:?}", s, to_remove
+                        "Invalid consensus artifact ({}) at height {}: {:?}",
+                        error_message,
+                        to_remove.height(),
+                        to_remove
                     );
                     unvalidated_ops.remove(to_remove.get_id());
                 }
@@ -773,27 +783,35 @@ impl MutablePool<ConsensusArtifact> for ConsensusPoolImpl {
 
         ChangeResult {
             purged,
-            adverts,
+            artifacts_with_opt,
             poll_immediately: changed,
         }
     }
 }
 
-impl ValidatedPoolReader<ConsensusArtifact> for ConsensusPoolImpl {
-    fn contains(&self, id: &ConsensusMessageId) -> bool {
-        self.unvalidated.contains(id) || self.validated.contains(id)
+fn is_latency_sensitive(msg: &ConsensusMessage) -> bool {
+    match msg {
+        ConsensusMessage::Finalization(_) => true,
+        ConsensusMessage::Notarization(_) => true,
+        ConsensusMessage::RandomBeacon(_) => true,
+        ConsensusMessage::RandomTape(_) => true,
+        ConsensusMessage::FinalizationShare(_) => true,
+        ConsensusMessage::NotarizationShare(_) => true,
+        ConsensusMessage::RandomBeaconShare(_) => true,
+        ConsensusMessage::RandomTapeShare(_) => true,
+        // Might be big and is relayed and can cause excessive BW usage.
+        ConsensusMessage::CatchUpPackage(_) => false,
+        ConsensusMessage::CatchUpPackageShare(_) => true,
+        ConsensusMessage::BlockProposal(prop) => prop.rank() == Rank(0),
     }
+}
 
-    fn get_validated_by_identifier(&self, id: &ConsensusMessageId) -> Option<ConsensusMessage> {
+impl ValidatedPoolReader<ConsensusArtifact> for ConsensusPoolImpl {
+    fn get(&self, id: &ConsensusMessageId) -> Option<ConsensusMessage> {
         self.validated.get(id)
     }
 
-    // Return an iterator of all artifacts that are required to make progress
-    // above the given height filter.
-    fn get_all_validated_by_filter(
-        &self,
-        filter: &ConsensusMessageFilter,
-    ) -> Box<dyn Iterator<Item = ConsensusMessage> + '_> {
+    fn get_all_validated(&self) -> Box<dyn Iterator<Item = ConsensusMessage> + '_> {
         let node_id = self.node_id;
         let max_catch_up_height = self
             .validated
@@ -803,15 +821,9 @@ impl ValidatedPoolReader<ConsensusArtifact> for ConsensusPoolImpl {
             .unwrap();
         // Since random beacon of previous height is required, min_random_beacon_height
         // should be one less than the normal min height.
-        let min_random_beacon_height = max_catch_up_height.max(filter.height);
-        // In case we received a filter of u64::MAX, don't overflow.
-        let Some(min) = min_random_beacon_height
-            .get()
-            .checked_add(1)
-            .map(Height::from)
-        else {
-            return Box::new(std::iter::empty());
-        };
+        let min_random_beacon_height = max_catch_up_height;
+        let min = min_random_beacon_height.increment();
+
         let max_finalized_height = self
             .validated
             .finalization()
@@ -901,7 +913,7 @@ impl ValidatedPoolReader<ConsensusArtifact> for ConsensusPoolImpl {
             self.validated
                 .catch_up_package()
                 .get_by_height_range(HeightRange {
-                    min: max_catch_up_height.max(filter.height),
+                    min: max_catch_up_height,
                     max: max_catch_up_height,
                 })
                 .map(|x| x.into_message())
@@ -1083,7 +1095,7 @@ mod tests {
     }
 
     #[test]
-    fn test_adverts_are_created_for_aggregates() {
+    fn test_artifacts_with_opt_are_created_for_aggregates() {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             let time_source = FastForwardTimeSource::new();
             let mut pool = new_from_cup_without_bytes(
@@ -1135,14 +1147,20 @@ mod tests {
             ];
             let result = pool.apply_changes(changeset);
             assert!(result.purged.is_empty());
-            assert_eq!(result.adverts.len(), 2);
+            assert_eq!(result.artifacts_with_opt.len(), 2);
             assert!(result.poll_immediately);
-            assert_eq!(result.adverts[0].id, random_beacon_2.get_id());
-            assert_eq!(result.adverts[1].id, random_beacon_3.get_id());
+            assert_eq!(
+                result.artifacts_with_opt[0].advert.id,
+                random_beacon_2.get_id()
+            );
+            assert_eq!(
+                result.artifacts_with_opt[1].advert.id,
+                random_beacon_3.get_id()
+            );
 
             let result =
                 pool.apply_changes(vec![ChangeAction::PurgeValidatedBelow(Height::from(3))]);
-            assert!(result.adverts.is_empty());
+            assert!(result.artifacts_with_opt.is_empty());
             // purging genesis CUP & beacon + validated beacon at height 2
             assert_eq!(result.purged.len(), 3);
             assert!(result.purged.contains(&random_beacon_2.get_id()));
@@ -1150,7 +1168,7 @@ mod tests {
 
             let result =
                 pool.apply_changes(vec![ChangeAction::PurgeUnvalidatedBelow(Height::from(3))]);
-            assert!(result.adverts.is_empty());
+            assert!(result.artifacts_with_opt.is_empty());
             assert!(result.purged.is_empty());
             assert!(result.poll_immediately);
 
@@ -1211,13 +1229,16 @@ mod tests {
             // share 2 should be moved to the validated pool and not create an advert
             // share 1 should remain in the unvalidated pool
             assert!(result.purged.is_empty());
-            assert_eq!(result.adverts.len(), 1);
+            assert_eq!(result.artifacts_with_opt.len(), 1);
             assert!(result.poll_immediately);
-            assert_eq!(result.adverts[0].id, random_beacon_share_3.get_id());
+            assert_eq!(
+                result.artifacts_with_opt[0].advert.id,
+                random_beacon_share_3.get_id()
+            );
 
             let result =
                 pool.apply_changes(vec![ChangeAction::PurgeValidatedBelow(Height::from(3))]);
-            assert!(result.adverts.is_empty());
+            assert!(result.artifacts_with_opt.is_empty());
             // purging genesis CUP & beacon + 2 validated beacon shares
             assert_eq!(result.purged.len(), 4);
             assert!(result.purged.contains(&random_beacon_share_2.get_id()));
@@ -1251,15 +1272,15 @@ mod tests {
                 peer_id: node_test_id(0),
                 timestamp: time_source.get_relative_time(),
             });
-            assert!(pool.contains(&id));
+            assert!(pool.unvalidated.contains(&id));
 
             pool.remove(&id);
-            assert!(!pool.contains(&id));
+            assert!(!pool.unvalidated.contains(&id));
         });
     }
 
     #[test]
-    fn test_get_all_validated_by_filter() {
+    fn test_get_all_validated() {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             let time_source = FastForwardTimeSource::new();
             let node = node_test_id(3);
@@ -1274,9 +1295,6 @@ mod tests {
             );
 
             let height_offset = 5_000_000_000;
-            let filter = ConsensusMessageFilter {
-                height: Height::from(height_offset + 10),
-            };
 
             let fake_block = |height: Height| {
                 Block::new(
@@ -1417,8 +1435,7 @@ mod tests {
                 _ => panic!("No signer for aggregate artifacts"),
             };
 
-            pool.get_all_validated_by_filter(&filter).for_each(|m| {
-                assert!(m.height() >= filter.height);
+            pool.get_all_validated().for_each(|m| {
                 if m.height().get() <= height_offset + 15 {
                     assert!(!m.is_share());
                 }
@@ -1427,20 +1444,11 @@ mod tests {
                 }
             });
 
-            let min_filter = ConsensusMessageFilter {
-                height: Height::from(u64::MIN),
-            };
-
             assert_eq!(
-                pool.get_all_validated_by_filter(&min_filter).count(),
+                pool.get_all_validated().count(),
                 // 1 CUP, 15 heights of aggregates, 5 heights of shares, 20 heights of proposals
                 1 + 15 * 4 + 5 * 4 + 20 * 5
             );
-
-            let max_filter = ConsensusMessageFilter {
-                height: Height::from(u64::MAX),
-            };
-            assert_eq!(pool.get_all_validated_by_filter(&max_filter).count(), 0);
         });
     }
 

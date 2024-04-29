@@ -25,17 +25,15 @@ use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::canister_state::system_state::PausedExecutionId;
 use ic_replicated_state::testing::{CanisterQueuesTesting, SystemStateTesting};
 use ic_state_machine_tests::{PayloadBuilder, StateMachineBuilder};
-use ic_test_utilities::state::{get_running_canister, get_stopped_canister, get_stopping_canister};
 use ic_test_utilities_metrics::{
     fetch_counter, fetch_gauge, fetch_gauge_vec, fetch_histogram_stats, fetch_int_gauge,
     fetch_int_gauge_vec, metric_vec, HistogramStats,
 };
+use ic_test_utilities_state::{get_running_canister, get_stopped_canister, get_stopping_canister};
 use ic_test_utilities_types::messages::RequestBuilder;
 use ic_types::{
-    messages::{
-        CallbackId, Payload, RejectContext, Response, StopCanisterCallId, MAX_RESPONSE_COUNT_BYTES,
-        NO_DEADLINE,
-    },
+    batch::ConsensusResponse,
+    messages::{CallbackId, Payload, RejectContext, StopCanisterCallId, MAX_RESPONSE_COUNT_BYTES},
     methods::SystemMethod,
     time::{expiry_time_from_now, UNIX_EPOCH},
     ComputeAllocation, Cycles, Height, NumBytes,
@@ -3034,15 +3032,11 @@ fn ecdsa_signature_agreements_metric_is_updated() {
     assert_eq!(sign_with_ecdsa_contexts.len(), 2);
 
     // reject the first one
-    let (callback_id, context) = sign_with_ecdsa_contexts.iter().next().unwrap();
-    let response = Response {
-        originator: context.request.sender,
-        respondent: ic_types::CanisterId::ic_00(),
-        originator_reply_callback: *callback_id,
-        refund: context.request.payment,
-        response_payload: Payload::Reject(RejectContext::new(RejectCode::SysFatal, "")),
-        deadline: context.request.deadline,
-    };
+    let (callback_id, _) = sign_with_ecdsa_contexts.iter().next().unwrap();
+    let response = ConsensusResponse::new(
+        *callback_id,
+        Payload::Reject(RejectContext::new(RejectCode::SysFatal, "")),
+    );
 
     test.state_mut().consensus_queue.push(response);
     test.execute_round(ExecutionRoundType::OrdinaryRound);
@@ -3078,20 +3072,16 @@ fn ecdsa_signature_agreements_metric_is_updated() {
     assert_eq!(sign_with_ecdsa_contexts.len(), 1);
 
     // send a reply to the second request
-    let (callback_id, context) = sign_with_ecdsa_contexts.iter().next().unwrap();
-    let response = Response {
-        originator: context.request.sender,
-        respondent: ic_types::CanisterId::ic_00(),
-        originator_reply_callback: *callback_id,
-        refund: context.request.payment,
-        response_payload: Payload::Data(
+    let (callback_id, _) = sign_with_ecdsa_contexts.iter().next().unwrap();
+    let response = ConsensusResponse::new(
+        *callback_id,
+        Payload::Data(
             ic00::SignWithECDSAReply {
                 signature: vec![1, 2, 3],
             }
             .encode(),
         ),
-        deadline: NO_DEADLINE,
-    };
+    );
 
     test.state_mut().consensus_queue.push(response);
     test.execute_round(ExecutionRoundType::OrdinaryRound);
@@ -4912,7 +4902,7 @@ fn test_sign_with_ecdsa_contexts_are_updated_with_quadruples() {
     let mut test = SchedulerTestBuilder::new()
         .with_ecdsa_key(key_id.clone())
         .build();
-    let quadruple_id = QuadrupleId(0, Some(key_id.clone()));
+    let quadruple_id = QuadrupleId::new(0);
     let quadruple_ids = BTreeSet::from_iter([quadruple_id.clone()]);
 
     inject_ecdsa_signing_request(&mut test, &key_id);
@@ -4974,11 +4964,8 @@ fn test_sign_with_ecdsa_contexts_are_matched_under_multiple_keys() {
         .build();
 
     // Deliver 2 quadruples for the first key, 1 for the second, 0 for the third
-    let quadruple_ids0 = BTreeSet::from_iter([
-        QuadrupleId(0, Some(key_ids[0].clone())),
-        QuadrupleId(1, Some(key_ids[0].clone())),
-    ]);
-    let quadruple_ids1 = BTreeSet::from_iter([QuadrupleId(2, Some(key_ids[1].clone()))]);
+    let quadruple_ids0 = BTreeSet::from_iter([QuadrupleId::new(0), QuadrupleId::new(1)]);
+    let quadruple_ids1 = BTreeSet::from_iter([QuadrupleId::new(2)]);
     let quadruple_id_map = BTreeMap::from_iter([
         (key_ids[0].clone(), quadruple_ids0.clone()),
         (key_ids[1].clone(), quadruple_ids1.clone()),

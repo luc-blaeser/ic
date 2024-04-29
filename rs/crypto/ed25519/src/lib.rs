@@ -104,8 +104,8 @@ impl PrivateKey {
     /// Sign a message and return a signature
     ///
     /// This is the non-prehashed variant of Ed25519
-    pub fn sign_message(&self, msg: &[u8]) -> Vec<u8> {
-        self.sk.sign(msg).to_vec()
+    pub fn sign_message(&self, msg: &[u8]) -> [u8; 64] {
+        self.sk.sign(msg).into()
     }
 
     /// Return the public key associated with this secret key
@@ -127,7 +127,7 @@ impl PrivateKey {
     /// This is just the plain 32 byte random seed from which the
     /// internal key material is derived
     ///
-    /// This corresponds with the format used by PrivateKey::serialize
+    /// This corresponds with the format used by PrivateKey::serialize_raw
     pub fn deserialize_raw(bytes: &[u8]) -> Result<Self, PrivateKeyDecodingError> {
         let bytes = <[u8; Self::BYTES]>::try_from(bytes).map_err(|_| {
             PrivateKeyDecodingError::InvalidKeyEncoding(format!(
@@ -137,8 +137,18 @@ impl PrivateKey {
             ))
         })?;
 
-        let sk = SigningKey::from_bytes(&bytes);
-        Ok(Self { sk })
+        Ok(Self::deserialize_raw_32(&bytes))
+    }
+
+    /// Deserialize an Ed25519 private key from raw format
+    ///
+    /// This is just the plain 32 byte random seed from which the
+    /// internal key material is derived
+    ///
+    /// This corresponds with the format used by PrivateKey::serialize_raw
+    pub fn deserialize_raw_32(bytes: &[u8; 32]) -> Self {
+        let sk = SigningKey::from_bytes(bytes);
+        Self { sk }
     }
 
     /// Serialize the Ed25519 secret key in PKCS8 format
@@ -241,6 +251,10 @@ impl PrivateKey {
 /// An invalid key was encountered
 #[derive(Clone, Debug)]
 pub enum PublicKeyDecodingError {
+    /// The outer PEM encoding is invalid
+    InvalidPemEncoding(String),
+    /// The PEM label was not the expected value
+    UnexpectedPemLabel(String),
     /// The encoding of the public key is invalid, the string contains details
     InvalidKeyEncoding(String),
     /// The public key had a valid encoding, but contains elements of the torsion
@@ -293,6 +307,39 @@ impl PublicKey {
         Ok(Self { pk })
     }
 
+    /// Convert a raw Ed25519 public key (32 bytes) to the DER encoding
+    ///
+    /// # Warning
+    ///
+    /// This performs no validity check on the public key aside from verifying
+    /// that it is exactly 32 bytes long. If you pass an invalid key (ie a
+    /// encoding of a point not in the prime order subgroup), then the DER
+    /// encoding of that invalid key will be returned.
+    pub fn convert_raw_to_der(raw: &[u8]) -> Result<Vec<u8>, PublicKeyDecodingError> {
+        // We continue to check the length, since otherwise the DER
+        // encoding itself would be invalid and unparsable.
+        if raw.len() != Self::BYTES {
+            return Err(PublicKeyDecodingError::InvalidKeyEncoding(format!(
+                "Expected key of exactly {} bytes, got {}",
+                Self::BYTES,
+                raw.len()
+            )));
+        };
+
+        const DER_PREFIX: [u8; 12] = [
+            48, 42, // A sequence of 42 bytes follows
+            48, 5, // An sequence of 5 bytes follows
+            6, 3, 43, 101, 112, // The OID (1.3.101.112)
+            3, 33, // A bitstring of 33 bytes follows
+            0,  // The bitstring has no unused bits
+        ];
+
+        let mut der_enc = Vec::with_capacity(DER_PREFIX.len() + Self::BYTES);
+        der_enc.extend_from_slice(&DER_PREFIX);
+        der_enc.extend_from_slice(raw);
+        Ok(der_enc)
+    }
+
     /// Serialize this public key in raw format
     ///
     /// This is just the 32 byte encoding of the public point
@@ -330,6 +377,17 @@ impl PublicKey {
             .to_vec()
     }
 
+    /// Serialize this public key as a PEM encoded structure
+    ///
+    /// See RFC 8410 for details on the format
+    pub fn serialize_rfc8410_pem(&self) -> Vec<u8> {
+        pem::encode(&pem::Pem {
+            tag: "PUBLIC KEY".to_string(),
+            contents: self.serialize_rfc8410_der(),
+        })
+        .into()
+    }
+
     /// Deserialize the DER encoded public key
     ///
     /// See RFC 8410 for details on the format. This cooresponds to
@@ -338,6 +396,20 @@ impl PublicKey {
         let pk = VerifyingKey::from_public_key_der(bytes)
             .map_err(|e| PublicKeyDecodingError::InvalidKeyEncoding(format!("{:?}", e)))?;
         Self::new(pk)
+    }
+
+    /// Deserialize the PEM encoded public key
+    ///
+    /// See RFC 8410 for details on the format. This cooresponds to
+    /// Self::serialize_rfc8410_pem
+    pub fn deserialize_rfc8410_pem(pem: &str) -> Result<Self, PublicKeyDecodingError> {
+        let der = pem::parse(pem)
+            .map_err(|e| PublicKeyDecodingError::InvalidPemEncoding(format!("{:?}", e)))?;
+        if der.tag != "PUBLIC KEY" {
+            return Err(PublicKeyDecodingError::UnexpectedPemLabel(der.tag));
+        }
+
+        Self::deserialize_rfc8410_der(&der.contents)
     }
 
     /// Verify a Ed25519 signature

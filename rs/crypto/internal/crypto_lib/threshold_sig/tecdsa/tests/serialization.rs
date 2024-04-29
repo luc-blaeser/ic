@@ -22,7 +22,7 @@ fn verify_data(tag: String, expected_hash: &str, serialized: &[u8]) {
     let hash = ic_crypto_sha2::Sha256::hash(serialized);
     let computed_hash = hex::encode(&hash[0..8]);
 
-    if UPDATING_TEST_VECTORS {
+    if !UPDATING_TEST_VECTORS {
         assert_eq!(computed_hash, expected_hash, "{}", tag);
     } else if computed_hash != expected_hash {
         println!(
@@ -66,7 +66,7 @@ fn check_dealings(
     Ok(())
 }
 
-fn check_shares(
+fn check_ecdsa_shares(
     shares: &BTreeMap<NodeIndex, ThresholdEcdsaSigShareInternal>,
     hashes: &[&'static str],
 ) -> ThresholdEcdsaResult<()> {
@@ -80,6 +80,21 @@ fn check_shares(
             hash,
             &share.serialize().expect("Serialization failed"),
         )
+    }
+
+    Ok(())
+}
+
+fn check_ed25519_shares(
+    shares: &BTreeMap<NodeIndex, ThresholdEd25519SignatureShareInternal>,
+    hashes: &[&'static str],
+) -> ThresholdEcdsaResult<()> {
+    assert_eq!(shares.len(), hashes.len());
+
+    for (index, hash) in hashes.iter().enumerate() {
+        let index = index as u32;
+        let share = shares.get(&index).expect("Unable to find signature share");
+        verify_data(format!("share {}", index), hash, &share.serialize())
     }
 
     Ok(())
@@ -181,7 +196,7 @@ fn verify_protocol_output_remains_unchanged_over_time_k256() -> Result<(), Thres
 
     let shares = proto.generate_shares()?;
 
-    check_shares(
+    check_ecdsa_shares(
         &shares,
         &[
             "a5828d246e927eae",
@@ -301,7 +316,7 @@ fn verify_protocol_output_remains_unchanged_over_time_k256_unmasked_kappa(
 
     let shares = proto.generate_shares()?;
 
-    check_shares(
+    check_ecdsa_shares(
         &shares,
         &[
             "ce80c75481040807",
@@ -419,7 +434,7 @@ fn verify_protocol_output_remains_unchanged_over_time_p256() -> Result<(), Thres
 
     let shares = proto.generate_shares()?;
 
-    check_shares(
+    check_ecdsa_shares(
         &shares,
         &[
             "dcd41127ca62253e",
@@ -538,7 +553,7 @@ fn verify_protocol_output_remains_unchanged_over_time_p256_sig_with_k256_mega(
 
     let shares = proto.generate_shares()?;
 
-    check_shares(
+    check_ecdsa_shares(
         &shares,
         &[
             "ec49c07026fad455",
@@ -554,6 +569,86 @@ fn verify_protocol_output_remains_unchanged_over_time_p256_sig_with_k256_mega(
     verify_data(
         "signature".to_string(),
         "b1522949be1e9cab",
+        &sig.serialize(),
+    );
+
+    Ok(())
+}
+
+#[test]
+fn verify_protocol_output_remains_unchanged_over_time_ed25519_sig_with_k256_mega(
+) -> Result<(), ThresholdEcdsaError> {
+    let nodes = 5;
+    let threshold = 2;
+
+    let seed = Seed::from_bytes(b"ic-crypto-fixed-seed-for-ed25519-with-k256-mega");
+
+    let setup = SchnorrSignatureProtocolSetup::new(
+        TestConfig::new_mixed(EccCurveType::Ed25519, EccCurveType::K256),
+        nodes,
+        threshold,
+        0,
+        seed.derive("setup"),
+    )?;
+
+    check_dealings(
+        "key",
+        &setup.key,
+        "904041b4304a5773",
+        "581d0154b6c5f41d",
+        &[
+            "1a320b9df0ace905",
+            "876f9f7d0313823c",
+            "c54c3d5b8692cc67",
+            "9e111965d09cbd4b",
+            "43c56b70044f2c15",
+        ],
+    )?;
+
+    check_dealings(
+        "kappa*lambda",
+        &setup.presig,
+        "9cc1616cd58e54bb",
+        "01c3d11318f8e7f5",
+        &[
+            "3c7b469d4811ff9e",
+            "9ab0aac91db88c6b",
+            "4ac37d70190d6fdf",
+            "a5507c04d54d1284",
+            "0680c52dab755f00",
+        ],
+    )?;
+
+    let signed_message = seed.derive("message").into_rng().gen::<[u8; 32]>().to_vec();
+    let random_beacon =
+        ic_types::Randomness::from(seed.derive("beacon").into_rng().gen::<[u8; 32]>());
+
+    let derivation_path = DerivationPath::new_bip32(&[1, 2, 3]);
+    let proto = Ed25519SignatureProtocolExecution::new(
+        setup,
+        signed_message,
+        random_beacon,
+        derivation_path,
+    );
+
+    let shares = proto.generate_shares()?;
+
+    check_ed25519_shares(
+        &shares,
+        &[
+            "391770613942806b",
+            "7e9bf1bbbfb77563",
+            "574714c5212e1b71",
+            "3a6767a145356358",
+            "376d30bbc07b279e",
+        ],
+    )?;
+
+    let sig = proto.generate_signature(&shares).unwrap();
+
+    verify_data(
+        "signature".to_string(),
+        "ff747b71eb5cc045",
         &sig.serialize(),
     );
 
@@ -716,4 +811,68 @@ fn commitment_opening_p256_serialization_is_stable() -> Result<(), ThresholdEcds
                "a168506564657273656e82a1645032353698201853183d18b717183618db18b1181c182318fd189a186c18d70318d3187a18fd1851187318b9184318dc1893182d1838187d18c1187c188918aa18ad1884a1645032353698201843181f18b6141845184b187c181f182e18c218bd18761883182d18af184e18c618ca18da18a3188b18fb18fb1880181a186d1820189b1827185a18f2188d");
 
     Ok(())
+}
+
+#[test]
+fn commitment_opening_ed25519_serialization_is_stable() -> Result<(), ThresholdEcdsaError> {
+    let rng = &mut Seed::from_bytes(b"ic-crypto-commitment-opening-serialization-stability-test")
+        .into_rng();
+
+    let s1 = EccScalar::random(EccCurveType::Ed25519, rng);
+    let s2 = EccScalar::random(EccCurveType::Ed25519, rng);
+
+    assert_eq!(
+        hex::encode(s1.serialize()),
+        "7ca9cd1fdcffd3181170bf8c4829a2729f8b4b63d4ef4026b045bb95d82a020d"
+    );
+    assert_eq!(
+        hex::encode(s2.serialize()),
+        "4d31412bf594aab8202fa091aa8a1693a30217c9c5ce89129e7b00c0b1b2510c"
+    );
+
+    let s1_bytes = EccScalarBytes::try_from(&s1).expect("Serialization failed");
+    let s2_bytes = EccScalarBytes::try_from(&s2).expect("Serialization failed");
+
+    let simple = CommitmentOpeningBytes::Simple(s1_bytes.clone());
+
+    assert_eq!(hex::encode(serde_cbor::to_vec(&simple).unwrap()),
+               "a16653696d706c65a167456432353531399820187c18a918cd181f18dc18ff18d3181811187018bf188c1848182918a21872189f188b184b186318d418ef1840182618b0184518bb189518d8182a020d");
+
+    let pedersen = CommitmentOpeningBytes::Pedersen(s1_bytes, s2_bytes);
+
+    assert_eq!(hex::encode(serde_cbor::to_vec(&pedersen).unwrap()),
+               "a168506564657273656e82a167456432353531399820187c18a918cd181f18dc18ff18d3181811187018bf188c1848182918a21872189f188b184b186318d418ef1840182618b0184518bb189518d8182a020da167456432353531399820184d18311841182b18f5189418aa18b81820182f18a0189118aa188a16189318a3021718c918c518ce188912189e187b0018c018b118b218510c");
+
+    Ok(())
+}
+
+#[test]
+fn bip340_combined_share_serialization_roundtrip_works_correctly() {
+    let nodes = 5;
+    let threshold = 2;
+    let seed = Seed::from_bytes(b"ic-crypto-tecdsa-fixed-seed");
+    let signed_message = seed.derive("message").into_rng().gen::<[u8; 32]>().to_vec();
+    let random_beacon =
+        ic_types::Randomness::from(seed.derive("beacon").into_rng().gen::<[u8; 32]>());
+    let derivation_path = DerivationPath::new_bip32(&[1, 2, 3]);
+
+    let cfg = TestConfig::new(EccCurveType::K256);
+
+    let setup =
+        SchnorrSignatureProtocolSetup::new(cfg, nodes, threshold, 0, seed.derive("setup")).unwrap();
+
+    let proto = Bip340SignatureProtocolExecution::new(
+        setup,
+        signed_message,
+        random_beacon,
+        derivation_path,
+    );
+    let shares = proto.generate_shares().unwrap();
+    let comb_share = proto.generate_signature(&shares).unwrap();
+
+    let serialized_comb_share = comb_share.serialize().unwrap();
+    let deserialized_comb_share =
+        ThresholdBip340CombinedSignatureInternal::deserialize(&serialized_comb_share).unwrap();
+
+    assert_eq!(comb_share, deserialized_comb_share);
 }

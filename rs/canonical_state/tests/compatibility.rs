@@ -15,7 +15,7 @@ use ic_canonical_state::{
 };
 use ic_protobuf::proxy::ProxyDecodeError;
 use ic_replicated_state::{metadata_state::SubnetMetrics, SystemMetadata};
-use ic_test_utilities::state::{arb_stream_header, arb_subnet_metrics};
+use ic_test_utilities_state::{arb_stream_header, arb_subnet_metrics};
 use ic_test_utilities_types::arbitrary;
 use ic_types::{
     crypto::CryptoHash, messages::RequestOrResponse, xnet::StreamHeader, CryptoHashOfPartialState,
@@ -91,7 +91,7 @@ pub(crate) fn arb_valid_versioned_stream_header(
             ),
             Just(CertificationVersion::V8..=CertificationVersion::V16)
         ),
-        // Stream headers may have the `StreamHeaderFlagBits::ResponsesOnly` flag set
+        // Stream headers may have the `StreamHeaderFlagBits::DeprecatedResponsesOnly` flag set
         // starting with certification version 17.
         (
             arb_stream_header(

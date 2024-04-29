@@ -5,7 +5,7 @@ use candid::{CandidType, Deserialize, Nat, Principal};
 #[derive(CandidType, Deserialize)]
 pub struct WithdrawErc20Arg {
     pub amount: Nat,
-    pub ckerc20_token_symbol: String,
+    pub ckerc20_ledger_id: Principal,
     pub recipient: String,
 }
 
@@ -24,13 +24,34 @@ impl From<Erc20WithdrawalRequest> for RetrieveErc20Request {
     }
 }
 
-#[derive(CandidType, Deserialize, Debug, PartialEq)]
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq)]
 pub enum WithdrawErc20Error {
     TokenNotSupported {
-        supported_tokens: Vec<String>,
+        supported_tokens: Vec<crate::endpoints::CkErc20Token>,
     },
+    RecipientAddressBlocked {
+        address: String,
+    },
+    CkEthLedgerError {
+        error: LedgerError,
+    },
+    CkErc20LedgerError {
+        cketh_block_index: Nat,
+        error: LedgerError,
+    },
+    TemporarilyUnavailable(String),
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq)]
+pub enum LedgerError {
     InsufficientFunds {
         balance: Nat,
+        failed_burn_amount: Nat,
+        token_symbol: String,
+        ledger_id: Principal,
+    },
+    AmountTooLow {
+        minimum_burn_amount: Nat,
         failed_burn_amount: Nat,
         token_symbol: String,
         ledger_id: Principal,
@@ -41,23 +62,20 @@ pub enum WithdrawErc20Error {
         token_symbol: String,
         ledger_id: Principal,
     },
-    RecipientAddressBlocked {
-        address: String,
-    },
     TemporarilyUnavailable(String),
 }
 
-impl From<LedgerBurnError> for WithdrawErc20Error {
+impl From<LedgerBurnError> for LedgerError {
     fn from(error: LedgerBurnError) -> Self {
         match error {
             LedgerBurnError::TemporarilyUnavailable { message, .. } => {
-                WithdrawErc20Error::TemporarilyUnavailable(message)
+                LedgerError::TemporarilyUnavailable(message)
             }
             LedgerBurnError::InsufficientFunds {
                 balance,
                 failed_burn_amount,
                 ledger,
-            } => WithdrawErc20Error::InsufficientFunds {
+            } => LedgerError::InsufficientFunds {
                 balance,
                 failed_burn_amount,
                 token_symbol: ledger.token_symbol.to_string(),
@@ -67,8 +85,18 @@ impl From<LedgerBurnError> for WithdrawErc20Error {
                 allowance,
                 failed_burn_amount,
                 ledger,
-            } => WithdrawErc20Error::InsufficientAllowance {
+            } => LedgerError::InsufficientAllowance {
                 allowance,
+                failed_burn_amount,
+                token_symbol: ledger.token_symbol.to_string(),
+                ledger_id: ledger.id,
+            },
+            LedgerBurnError::AmountTooLow {
+                minimum_burn_amount,
+                failed_burn_amount,
+                ledger,
+            } => LedgerError::AmountTooLow {
+                minimum_burn_amount,
                 failed_burn_amount,
                 token_symbol: ledger.token_symbol.to_string(),
                 ledger_id: ledger.id,

@@ -169,9 +169,11 @@ fn load_configuration_and_validate_or_exit(
 ) -> Proposal {
     // Read the file.
     let init_config_file = std::fs::read_to_string(configuration_file_path).unwrap_or_else(|err| {
+        let current_dir = std::env::current_dir().expect("cannot read env::current_dir");
         eprintln!(
-            "Unable to read the SNS configuration file ({:?}):\n{}",
-            configuration_file_path, err,
+            "Unable to read the SNS configuration file {:?}:\n{}",
+            current_dir.join(configuration_file_path),
+            err,
         );
         std::process::exit(1);
     });
@@ -353,7 +355,12 @@ impl Display for SaveToErrors {
 /// Ensure that a path to a file exists (by creating it if it does not) and is writeable.
 fn ensure_file_exists_and_is_writeable(path: &Path) -> Result<(), SaveToErrors> {
     // Make sure the file is writeable. Create it if it does not exist.
-    match OpenOptions::new().create(true).write(true).open(path) {
+    match OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+    {
         Ok(_) => (),
         Err(e) => {
             return Err(SaveToErrors::FileOpenFailed(

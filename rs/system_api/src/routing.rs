@@ -15,6 +15,9 @@ use ic_management_canister_types::{
 use ic_replicated_state::NetworkTopology;
 
 #[derive(Debug)]
+#[allow(dead_code)]
+// The fields are only read by the `Debug` implementation.
+// The `dead_code` lint ignores `Debug` impls, see: https://github.com/rust-lang/rust/issues/88900.
 pub(super) enum ResolveDestinationError {
     UserError(UserError),
     MethodNotFound(String),
@@ -178,11 +181,10 @@ pub(super) fn resolve_destination(
             Ok(NodeMetricsHistoryArgs::decode(payload)?.subnet_id)
         }
         Ok(Ic00Method::FetchCanisterLogs) => {
-            // TODO(IC-272).
             Err(ResolveDestinationError::UserError(UserError::new(
                 ic_error_types::ErrorCode::CanisterRejectedMessage,
                 format!(
-                    "{} API is not yet implemented",
+                    "{} API is only accessible to end users in non-replicated mode",
                     Ic00Method::FetchCanisterLogs
                 ),
             )))

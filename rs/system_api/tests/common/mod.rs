@@ -16,7 +16,7 @@ use ic_system_api::{
     sandbox_safe_system_state::SandboxSafeSystemState, ApiType, DefaultOutOfInstructionsHandler,
     ExecutionParameters, InstructionLimits, SystemApiImpl,
 };
-use ic_test_utilities::state::SystemStateBuilder;
+use ic_test_utilities_state::SystemStateBuilder;
 use ic_test_utilities_types::ids::{
     call_context_test_id, canister_test_id, subnet_test_id, user_test_id,
 };
@@ -41,6 +41,7 @@ pub fn execution_parameters() -> ExecutionParameters {
             NumInstructions::from(5_000_000_000),
         ),
         canister_memory_limit: NumBytes::new(4 << 30),
+        wasm_memory_limit: None,
         memory_allocation: MemoryAllocation::default(),
         compute_allocation: ComputeAllocation::default(),
         subnet_type: SubnetType::Application,

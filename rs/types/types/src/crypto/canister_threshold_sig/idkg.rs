@@ -505,8 +505,9 @@ impl IDkgTranscriptParams {
 
     fn ensure_algorithm_id_supported(&self) -> Result<(), IDkgParamsValidationError> {
         match self.algorithm_id {
-            AlgorithmId::ThresholdEcdsaSecp256k1 => Ok(()),
-            AlgorithmId::ThresholdEcdsaSecp256r1 => Ok(()),
+            AlgorithmId::ThresholdEcdsaSecp256k1
+            | AlgorithmId::ThresholdEcdsaSecp256r1
+            | AlgorithmId::ThresholdSchnorrBip340 => Ok(()),
             _ => Err(IDkgParamsValidationError::UnsupportedAlgorithmId {
                 algorithm_id: self.algorithm_id,
             }),
@@ -672,6 +673,7 @@ impl<'de> Deserialize<'de> for InitialIDkgDealings {
 /// When the transcript derives from earlier transcripts, these are included
 /// in this enum.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[cfg_attr(test, derive(ExhaustiveSet))]
 pub enum IDkgMaskedTranscriptOrigin {
     Random,
     UnmaskedTimesMasked(IDkgTranscriptId, IDkgTranscriptId),
@@ -682,6 +684,7 @@ pub enum IDkgMaskedTranscriptOrigin {
 /// The earlier transcripts used to derive this transcript are included in this
 /// enum.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[cfg_attr(test, derive(ExhaustiveSet))]
 pub enum IDkgUnmaskedTranscriptOrigin {
     ReshareMasked(IDkgTranscriptId),
     ReshareUnmasked(IDkgTranscriptId),
@@ -690,6 +693,7 @@ pub enum IDkgUnmaskedTranscriptOrigin {
 
 /// Type and origin of an IDkg transcript.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[cfg_attr(test, derive(ExhaustiveSet))]
 pub enum IDkgTranscriptType {
     /// Masked transcripts contain dealings based on Pedersen verifiable secret sharing which
     /// perfectly hides the value shared in the dealing. This means that the commitment to the
@@ -713,6 +717,7 @@ pub enum IDkgTranscriptType {
 /// * [`Unmasked`][`IDkgTranscriptType::Unmasked`] if the commitment is not perfectly hiding and
 /// may reveal some information about the shared value.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[cfg_attr(test, derive(ExhaustiveSet))]
 pub struct IDkgTranscript {
     pub transcript_id: IDkgTranscriptId,
     pub receivers: IDkgReceivers,
@@ -759,7 +764,7 @@ pub enum IDkgTranscriptOperation {
     /// to produce a `masked` transcript.
     ///
     /// Useful to compute the product transcripts in
-    /// [`PreSignatureQuadruple`][`crate::crypto::canister_threshold_sig::PreSignatureQuadruple`]:
+    /// [`EcdsaPreSignatureQuadruple`][`crate::crypto::canister_threshold_sig::EcdsaPreSignatureQuadruple`]:
     /// * Given a unmasked transcript for sharing a random value `kappa` and a masked transcript
     /// for sharing a random value `lambda`, compute the masked transcript for sharing the value
     /// `kappa * lambda`.
@@ -994,6 +999,7 @@ impl_display_using_debug!(IDkgTranscript);
 
 /// Dealing of an IDkg sharing.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[cfg_attr(test, derive(ExhaustiveSet))]
 pub struct IDkgDealing {
     pub transcript_id: IDkgTranscriptId,
     #[serde(with = "serde_bytes")]
@@ -1269,4 +1275,76 @@ fn context_data(
     ret.push(algorithm_id as u8);
 
     ret
+}
+
+#[test]
+fn should_fail_deserializing_invalid_initial_idkg_dealings() {
+    use crate::crypto::canister_threshold_sig::IDkgUnmaskedTranscriptOrigin;
+    use crate::{PrincipalId, SubnetId};
+    use ic_crypto_test_utils_canister_threshold_sigs::set_of_nodes;
+    use ic_crypto_test_utils_reproducible_rng::{reproducible_rng, ReproducibleRng};
+    use ic_protobuf::proxy::ProxyDecodeError;
+    use ic_protobuf::registry::subnet::v1::InitialIDkgDealings as InitialIDkgDealingsProto;
+    use rand::Rng;
+
+    fn random_transcript_id(rng: &mut ReproducibleRng) -> IDkgTranscriptId {
+        let id = rng.gen();
+        let subnet = SubnetId::from(PrincipalId::new_subnet_test_id(rng.gen::<u64>()));
+        let height = Height::from(rng.gen::<u64>());
+
+        IDkgTranscriptId::new(subnet, id, height)
+    }
+
+    let rng = &mut reproducible_rng();
+
+    let receivers = IDkgReceivers::new(set_of_nodes(&[1])).expect("failed to create IDkgReceivers");
+    let dummy_transcript_unmasked = IDkgTranscript {
+        transcript_id: random_transcript_id(rng),
+        receivers,
+        registry_version: RegistryVersion::from(314),
+        verified_dealings: BTreeMap::new(),
+        transcript_type: IDkgTranscriptType::Unmasked(IDkgUnmaskedTranscriptOrigin::Random),
+        algorithm_id: AlgorithmId::ThresholdEcdsaSecp256k1,
+        internal_transcript_raw: vec![],
+    };
+
+    let dummy_transcript_masked = {
+        let mut tmp = dummy_transcript_unmasked.clone();
+        tmp.transcript_type = IDkgTranscriptType::Masked(IDkgMaskedTranscriptOrigin::Random);
+        tmp
+    };
+
+    let invalid_transcript_operations = vec![
+        IDkgTranscriptOperation::Random,
+        IDkgTranscriptOperation::RandomUnmasked,
+        IDkgTranscriptOperation::ReshareOfMasked(dummy_transcript_masked.clone()),
+        IDkgTranscriptOperation::UnmaskedTimesMasked(
+            dummy_transcript_unmasked,
+            dummy_transcript_masked,
+        ),
+    ];
+
+    for invalid_transcript_operation in invalid_transcript_operations {
+        let params = IDkgTranscriptParams {
+            transcript_id: random_transcript_id(rng),
+            dealers: IDkgDealers::new(set_of_nodes(&[1])).expect("failed to create IDkgDealers"),
+            receivers: IDkgReceivers::new(set_of_nodes(&[2]))
+                .expect("failed to create IDkgReceivers"),
+            registry_version: RegistryVersion::new(0),
+            algorithm_id: AlgorithmId::ThresholdEcdsaSecp256k1,
+            operation_type: invalid_transcript_operation.clone(),
+        };
+        let initial_dealings = InitialIDkgDealings {
+            params,
+            dealings: vec![],
+        };
+
+        let invalid_serialization = InitialIDkgDealingsProto::from(&initial_dealings);
+
+        assert_matches::assert_matches!(
+            InitialIDkgDealings::try_from(&invalid_serialization),
+            Err(ProxyDecodeError::Other(s))
+            if s == "InvalidTranscriptOperation" || s == "Unspecified transcript operation in IDkgTranscriptParams"
+        );
+    }
 }

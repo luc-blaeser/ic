@@ -1,4 +1,4 @@
-use crate::eth_logs::{report_transaction_error, ReceivedEventError};
+use crate::eth_logs::{report_transaction_error, ReceivedEvent, ReceivedEventError};
 use crate::eth_rpc::{BlockSpec, HttpOutcallError};
 use crate::eth_rpc_client::EthRpcClient;
 use crate::guard::TimerGuard;
@@ -11,6 +11,7 @@ use hex_literal::hex;
 use ic_canister_log::log;
 use ic_ethereum_types::Address;
 use num_traits::ToPrimitive;
+use scopeguard::ScopeGuard;
 use std::cmp::{min, Ordering};
 use std::time::Duration;
 
@@ -20,39 +21,68 @@ pub(crate) const RECEIVED_ETH_EVENT_TOPIC: [u8; 32] =
 pub(crate) const RECEIVED_ERC20_EVENT_TOPIC: [u8; 32] =
     hex!("4d69d0bd4287b7f66c548f90154dc81bc98f65a1b362775df5ae171a2ccd262b");
 
-async fn mint_cketh() {
+async fn mint() {
     use icrc_ledger_client_cdk::{CdkRuntime, ICRC1Client};
     use icrc_ledger_types::icrc1::transfer::TransferArg;
 
-    let _guard = match TimerGuard::new(TaskType::MintCkEth) {
+    let _guard = match TimerGuard::new(TaskType::Mint) {
         Ok(guard) => guard,
         Err(_) => return,
     };
 
-    let (ledger_canister_id, events) = read_state(|s| (s.ledger_id, s.eth_events_to_mint()));
-    let client = ICRC1Client {
-        runtime: CdkRuntime,
-        ledger_canister_id,
-    };
-
+    let (eth_ledger_canister_id, events) = read_state(|s| (s.ledger_id, s.events_to_mint()));
     let mut error_count = 0;
 
     for event in events {
+        // Ensure that even if we were to panic in the callback, after having contacted the ledger to mint the tokens,
+        // this event will not be processed again.
+        let prevent_double_minting_guard = scopeguard::guard(event.clone(), |event| {
+            mutate_state(|s| {
+                process_event(
+                    s,
+                    EventType::QuarantinedDeposit {
+                        event_source: event.source(),
+                    },
+                )
+            });
+        });
+        let (token_symbol, ledger_canister_id) = match &event {
+            ReceivedEvent::Eth(_) => ("ckETH".to_string(), eth_ledger_canister_id),
+            ReceivedEvent::Erc20(event) => {
+                if let Some(result) = read_state(|s| {
+                    s.ckerc20_tokens
+                        .get_entry_alt(&event.erc20_contract_address)
+                        .map(|(symbol, principal)| (symbol.to_string(), *principal))
+                }) {
+                    result
+                } else {
+                    panic!(
+                        "Failed to mint ckERC20: {event:?} Unsupported ERC20 contract address. (This should have already been filtered out by process_event)"
+                    )
+                }
+            }
+        };
+        let client = ICRC1Client {
+            runtime: CdkRuntime,
+            ledger_canister_id,
+        };
         let block_index = match client
             .transfer(TransferArg {
                 from_subaccount: None,
-                to: event.principal.into(),
+                to: (event.principal()).into(),
                 fee: None,
                 created_at_time: None,
-                memo: Some(event.clone().into()),
-                amount: candid::Nat::from(event.value),
+                memo: Some((&event).into()),
+                amount: event.value(),
             })
             .await
         {
             Ok(Ok(block_index)) => block_index.0.to_u64().expect("nat does not fit into u64"),
             Ok(Err(err)) => {
-                log!(INFO, "Failed to mint ckETH: {event:?} {err}");
+                log!(INFO, "Failed to mint {token_symbol}: {event:?} {err}");
                 error_count += 1;
+                // minting failed, defuse guard
+                ScopeGuard::into_inner(prevent_double_minting_guard);
                 continue;
             }
             Err(err) => {
@@ -61,24 +91,37 @@ async fn mint_cketh() {
                     "Failed to send a message to the ledger ({ledger_canister_id}): {err:?}"
                 );
                 error_count += 1;
+                // minting failed, defuse guard
+                ScopeGuard::into_inner(prevent_double_minting_guard);
                 continue;
             }
         };
         mutate_state(|s| {
             process_event(
                 s,
-                EventType::MintedCkEth {
-                    event_source: event.source(),
-                    mint_block_index: LedgerMintIndex::new(block_index),
+                match &event {
+                    ReceivedEvent::Eth(event) => EventType::MintedCkEth {
+                        event_source: event.source(),
+                        mint_block_index: LedgerMintIndex::new(block_index),
+                    },
+
+                    ReceivedEvent::Erc20(event) => EventType::MintedCkErc20 {
+                        event_source: event.source(),
+                        mint_block_index: LedgerMintIndex::new(block_index),
+                        erc20_contract_address: event.erc20_contract_address,
+                        ckerc20_token_symbol: token_symbol.clone(),
+                    },
                 },
             )
         });
         log!(
             INFO,
-            "Minted {} ckWei to {} in block {block_index}",
-            event.value,
-            event.principal
+            "Minted {} {token_symbol} to {} in block {block_index}",
+            event.value(),
+            event.principal()
         );
+        // minting succeeded, defuse guard
+        ScopeGuard::into_inner(prevent_double_minting_guard);
     }
 
     if error_count > 0 {
@@ -86,7 +129,7 @@ async fn mint_cketh() {
             INFO,
             "Failed to mint {error_count} events, rescheduling the minting"
         );
-        ic_cdk_timers::set_timer(crate::MINT_RETRY_DELAY, || ic_cdk::spawn(mint_cketh()));
+        ic_cdk_timers::set_timer(crate::MINT_RETRY_DELAY, || ic_cdk::spawn(mint()));
     }
 }
 
@@ -98,6 +141,7 @@ async fn scrape_logs_range_inclusive<F>(
     topic: &[u8; 32],
     topic_name: &str,
     helper_contract_address: Address,
+    token_contract_addresses: &[Address],
     from: BlockNumber,
     to: BlockNumber,
     update_last_scraped_block_number: &F,
@@ -125,6 +169,7 @@ where
                 match crate::eth_logs::last_received_events(
                     topic,
                     helper_contract_address,
+                    token_contract_addresses,
                     from,
                     last_block_number,
                 )
@@ -169,7 +214,7 @@ where
                     event.value(),
                     event.principal()
                 );
-                if crate::blocklist::is_blocked(event.from_address()) {
+                if crate::blocklist::is_blocked(&event.from_address()) {
                     log!(
                         INFO,
                         "Received event from a blocked address: {} for {} {topic_name}",
@@ -190,7 +235,7 @@ where
                 }
             }
             if read_state(State::has_events_to_mint) {
-                ic_cdk_timers::set_timer(Duration::from_secs(0), || ic_cdk::spawn(mint_cketh()));
+                ic_cdk_timers::set_timer(Duration::from_secs(0), || ic_cdk::spawn(mint()));
             }
             for error in errors {
                 if let ReceivedEventError::InvalidEventSource { source, error } = &error {
@@ -222,6 +267,7 @@ async fn scrape_contract_logs<F>(
     topic: &[u8; 32],
     topic_name: &str,
     helper_contract_address: Option<Address>,
+    token_contract_addresses: &[Address],
     last_block_number: BlockNumber,
     mut last_scraped_block_number: BlockNumber,
     update_last_scraped_block_number: F,
@@ -247,6 +293,7 @@ async fn scrape_contract_logs<F>(
             topic,
             topic_name,
             helper_contract_address,
+            token_contract_addresses,
             next_block_to_query,
             last_block_number,
             &update_last_scraped_block_number,
@@ -266,6 +313,7 @@ async fn scrape_eth_logs(last_block_number: BlockNumber) {
         &RECEIVED_ETH_EVENT_TOPIC,
         "ETH",
         read_state(|s| s.eth_helper_contract_address),
+        &[],
         last_block_number,
         read_state(|s| s.last_scraped_block_number),
         &|last_block_number| mutate_state(|s| s.last_scraped_block_number = last_block_number),
@@ -278,6 +326,7 @@ async fn scrape_erc20_logs(last_block_number: BlockNumber) {
         &RECEIVED_ERC20_EVENT_TOPIC,
         "ERC-20",
         read_state(|s| s.erc20_helper_contract_address),
+        &read_state(|s| s.ckerc20_tokens.alt_keys().cloned().collect::<Vec<_>>()),
         last_block_number,
         read_state(|s| s.last_erc20_scraped_block_number),
         &|last_block_number| {

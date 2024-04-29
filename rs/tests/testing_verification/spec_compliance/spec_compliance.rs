@@ -1,7 +1,7 @@
+use canister_http::get_universal_vm_address;
 use ic_registry_routing_table::canister_id_into_u64;
 use ic_registry_subnet_features::SubnetFeatures;
 use ic_registry_subnet_type::SubnetType;
-use ic_tests::canister_http::lib::get_universal_vm_address;
 use ic_tests::driver::boundary_node::{BoundaryNode, BoundaryNodeVm};
 use ic_tests::driver::ic::{InternetComputer, NrOfVCPUs, Subnet, VmResources};
 use ic_tests::driver::test_env::TestEnv;
@@ -11,6 +11,7 @@ use ic_tests::driver::test_env_api::{
     TopologySnapshot,
 };
 use ic_tests::driver::universal_vm::UniversalVm;
+use ic_tests::retry_with_msg;
 use ic_types::SubnetId;
 use slog::{info, Logger};
 use std::path::PathBuf;
@@ -95,42 +96,53 @@ pub fn config_impl(env: TestEnv, deploy_bn_and_nns_canisters: bool, http_request
     if http_requests {
         env::set_var(
             "SSL_CERT_FILE",
-            env.get_dependency_path("ic-os/guestos/rootfs/dev-certs/canister_http_test_ca.cert"),
+            env.get_dependency_path("ic-os/rootfs/guestos/dev-certs/canister_http_test_ca.cert"),
         );
         env::remove_var("NIX_SSL_CERT_FILE");
 
         // Set up Universal VM for httpbin testing service
         UniversalVm::new(String::from(UNIVERSAL_VM_NAME))
-            .with_config_img(env.get_dependency_path("rs/tests/http_uvm_config_image.zst"))
+            .with_config_img(
+                env.get_dependency_path(
+                    "rs/tests/networking/canister_http/http_uvm_config_image.zst",
+                ),
+            )
             .start(&env)
             .expect("failed to set up universal VM");
+        canister_http::start_httpbin_on_uvm(&env);
         let log = env.logger();
-        retry(log.clone(), secs(300), secs(10), || {
-            block_on(async {
-                let https_connector = HttpsConnectorBuilder::new()
-                    .with_native_roots()
-                    .https_only()
-                    .enable_http1()
-                    .build();
-                let client = Client::builder().build::<_, hyper::Body>(https_connector);
+        retry_with_msg!(
+            "check if httpbin is responding to requests",
+            log.clone(),
+            secs(300),
+            secs(10),
+            || {
+                block_on(async {
+                    let https_connector = HttpsConnectorBuilder::new()
+                        .with_native_roots()
+                        .https_only()
+                        .enable_http1()
+                        .build();
+                    let client = Client::builder().build::<_, hyper::Body>(https_connector);
 
-                let webserver_ipv6 = get_universal_vm_address(&env);
-                let httpbin = format!("https://[{webserver_ipv6}]:20443");
-                let req = hyper::Request::builder()
-                    .method(hyper::Method::GET)
-                    .uri(httpbin)
-                    .body(hyper::Body::from(""))?;
+                    let webserver_ipv6 = get_universal_vm_address(&env);
+                    let httpbin = format!("https://[{webserver_ipv6}]:20443");
+                    let req = hyper::Request::builder()
+                        .method(hyper::Method::GET)
+                        .uri(httpbin)
+                        .body(hyper::Body::from(""))?;
 
-                let resp = client.request(req).await?;
+                    let resp = client.request(req).await?;
 
-                let body_bytes = hyper::body::to_bytes(resp.into_body()).await?;
-                let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+                    let body_bytes = hyper::body::to_bytes(resp.into_body()).await?;
+                    let body = String::from_utf8(body_bytes.to_vec()).unwrap();
 
-                info!(log, "response body from httpbin: {}", body);
+                    info!(log, "response body from httpbin: {}", body);
 
-                Ok(())
-            })
-        })
+                    Ok(())
+                })
+            }
+        )
         .expect("Httpbin server should respond to incoming requests!");
     }
     if deploy_bn_and_nns_canisters {

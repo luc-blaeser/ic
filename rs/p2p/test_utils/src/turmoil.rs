@@ -13,11 +13,11 @@ use crate::{
     RegistryConsensusHandle,
 };
 use axum::Router;
+use bytes::BytesMut;
 use either::Either;
 use futures::{future::BoxFuture, FutureExt};
 use ic_artifact_manager::run_artifact_processor;
-use ic_crypto_tls_interfaces::{TlsConfig, TlsStream};
-use ic_icos_sev::{Sev, ValidateAttestedStream};
+use ic_crypto_tls_interfaces::TlsConfig;
 use ic_interfaces::{
     p2p::artifact_manager::{ArtifactProcessorEvent, JoinGuard},
     p2p::state_sync::StateSyncClient,
@@ -29,7 +29,6 @@ use ic_quic_transport::SubnetTopology;
 use ic_quic_transport::{QuicTransport, Transport};
 use ic_state_manager::state_sync::types::StateSyncMessage;
 use ic_types::{artifact::UnvalidatedArtifactMutation, NodeId, RegistryVersion};
-use ic_types_test_utils::ids::SUBNET_1;
 use quinn::{
     self,
     udp::{EcnCodepoint, Transmit},
@@ -72,15 +71,19 @@ impl AsyncUdpSocket for CustomUdp {
 
         match fut.poll(cx) {
             Poll::Ready(x) => x?,
-            Poll::Pending => return Poll::Pending,
+            Poll::Pending => {
+                return Poll::Pending;
+            }
         };
 
         let mut transmits_sent = 0;
         for transmit in transmits {
-            let buffer: &[u8] = &transmit.contents;
+            let mut buffer = BytesMut::new();
+            buffer.extend_from_slice(&transmit.segment_size.unwrap_or_default().to_le_bytes());
+            buffer.extend_from_slice(&transmit.contents);
             let mut bytes_sent = 0;
             loop {
-                match self.inner.try_send_to(buffer, transmit.destination) {
+                match self.inner.try_send_to(&buffer, transmit.destination) {
                     Ok(x) => bytes_sent += x,
                     Err(e) => {
                         if matches!(e.kind(), io::ErrorKind::WouldBlock) {
@@ -113,22 +116,27 @@ impl AsyncUdpSocket for CustomUdp {
 
         match fut.poll(cx) {
             Poll::Ready(x) => x?,
-            Poll::Pending => {
-                return Poll::Pending;
-            }
+            Poll::Pending => return Poll::Pending,
         };
 
         assert!(bufs.len() == meta.len());
-
         let mut packets_received = 0;
-        for (m, b) in meta.iter_mut().zip(bufs) {
-            match self.inner.try_recv_from(b) {
-                Ok((bytes_received, addr)) => {
-                    m.addr = addr;
-                    m.len = bytes_received;
-                    m.stride = bytes_received;
-                    m.ecn = Some(Self::ECN);
-                    m.dst_ip = Some(self.ip);
+        for (packet_meta, packet_buf) in meta.iter_mut().zip(bufs) {
+            let mut turmoil_udp_buffer = vec![0; packet_buf.len() + 8];
+            match self.inner.try_recv_from(&mut turmoil_udp_buffer) {
+                Ok((bytes_received, addr)) if !turmoil_udp_buffer.is_empty() => {
+                    let stride = usize::from_le_bytes(turmoil_udp_buffer[..8].try_into().unwrap());
+                    // First 8 bytes are strid
+                    packet_buf.copy_from_slice(&turmoil_udp_buffer[8..]);
+                    packet_meta.addr = addr;
+                    packet_meta.len = bytes_received - 8;
+                    packet_meta.stride = if stride == 0 {
+                        bytes_received - 8
+                    } else {
+                        stride
+                    };
+                    packet_meta.ecn = Some(Self::ECN);
+                    packet_meta.dst_ip = Some(self.ip);
                 }
                 Err(e) => {
                     if matches!(e.kind(), io::ErrorKind::WouldBlock) {
@@ -136,6 +144,7 @@ impl AsyncUdpSocket for CustomUdp {
                     }
                     return Poll::Ready(Err(e));
                 }
+                _ => continue,
             }
             packets_received += 1;
         }
@@ -153,9 +162,9 @@ impl AsyncUdpSocket for CustomUdp {
 }
 /// Runs the tokio simulation until provided closure evaluates to true.
 /// If Ok(true) is returned all clients have completed.
-pub fn wait_for<F>(sim: &mut Sim, f: F) -> turmoil::Result
+pub fn wait_for<F>(sim: &mut Sim, mut f: F) -> turmoil::Result
 where
-    F: Fn() -> bool,
+    F: FnMut() -> bool,
 {
     while !f() {
         if sim.step()? {
@@ -272,7 +281,6 @@ pub fn add_transport_to_sim<F>(
     topology_watcher: watch::Receiver<SubnetTopology>,
     conn_checker: Option<Router>,
     crypto: Option<Arc<dyn TlsConfig + Send + Sync>>,
-    sev: Option<Arc<dyn ValidateAttestedStream<Box<dyn TlsStream>> + Send + Sync>>,
     state_sync_client: Option<Arc<dyn StateSyncClient<Message = StateSyncMessage>>>,
     consensus_manager: Option<TestConsensus<U64Artifact>>,
     post_setup_future: F,
@@ -284,21 +292,12 @@ pub fn add_transport_to_sim<F>(
 
     let node_crypto =
         crypto.unwrap_or_else(|| temp_crypto_component_with_tls_keys(&registry_handler, peer));
-    let sev_handshake = sev.unwrap_or_else(|| {
-        Arc::new(Sev::new(
-            peer,
-            SUBNET_1,
-            registry_handler.registry_client.clone(),
-            log.clone(),
-        ))
-    });
     registry_handler.registry_client.update_to_latest_version();
 
     sim.host(peer.to_string(), move || {
         let log = log.clone();
         let registry_client = registry_handler.registry_client.clone();
         let node_crypto_clone = node_crypto.clone();
-        let sev_handshake_clone = sev_handshake.clone();
         let conn_checker_clone = conn_checker.clone();
         let topology_watcher_clone = topology_watcher.clone();
         let post_setup_future_clone = post_setup_future.clone();
@@ -356,7 +355,6 @@ pub fn add_transport_to_sim<F>(
                 &tokio::runtime::Handle::current(),
                 node_crypto_clone,
                 registry_client,
-                sev_handshake_clone,
                 peer,
                 topology_watcher_clone.clone(),
                 Either::Right(custom_udp),

@@ -1,4 +1,4 @@
-type AccountIdentifier = record { hash : vec nat8 };
+type AccountIdentifier = record { hash : blob };
 type Action = variant {
   RegisterKnownNeuron : KnownNeuron;
   ManageNeuron : ManageNeuron;
@@ -33,7 +33,7 @@ type CanisterStatusResultV2 = record {
   memory_size : opt nat64;
   cycles : opt nat64;
   idle_cycles_burned_per_day : opt nat64;
-  module_hash : vec nat8;
+  module_hash : blob;
 };
 type CanisterSummary = record {
   status : opt CanisterStatusResultV2;
@@ -147,7 +147,7 @@ type DissolveState = variant {
   WhenDissolvedTimestampSeconds : nat64;
 };
 type Duration = record { seconds : opt nat64 };
-type ExecuteNnsFunction = record { nns_function : int32; payload : vec nat8 };
+type ExecuteNnsFunction = record { nns_function : int32; payload : blob };
 type Follow = record { topic : int32; followees : vec NeuronId };
 type Followees = record { followees : vec NeuronId };
 type Followers = record { followers : vec NeuronId };
@@ -166,6 +166,7 @@ type Governance = record {
   node_providers : vec NodeProvider;
   cached_daily_maturity_modulation_basis_points : opt int32;
   economics : opt NetworkEconomics;
+  restore_aging_summary : opt RestoreAgingSummary;
   spawning_neurons : opt bool;
   latest_reward_event : opt RewardEvent;
   to_claim_transfers : vec NeuronStakeTransfer;
@@ -343,7 +344,7 @@ type Neuron = record {
   auto_stake_maturity : opt bool;
   aging_since_timestamp_seconds : nat64;
   hot_keys : vec principal;
-  account : vec nat8;
+  account : blob;
   joined_community_fund_timestamp_seconds : opt nat64;
   dissolve_state : opt DissolveState;
   followees : vec record { int32; Followees };
@@ -368,10 +369,7 @@ type NeuronDistribution = record {
   stake : opt Tokens;
 };
 type NeuronId = record { id : nat64 };
-type NeuronIdOrSubaccount = variant {
-  Subaccount : vec nat8;
-  NeuronId : NeuronId;
-};
+type NeuronIdOrSubaccount = variant { Subaccount : blob; NeuronId : NeuronId };
 type NeuronInFlightCommand = record {
   command : opt Command_2;
   timestamp : nat64;
@@ -390,11 +388,11 @@ type NeuronInfo = record {
   age_seconds : nat64;
 };
 type NeuronStakeTransfer = record {
-  to_subaccount : vec nat8;
+  to_subaccount : blob;
   neuron_stake_e8s : nat64;
   from : opt principal;
   memo : nat64;
-  from_subaccount : vec nat8;
+  from_subaccount : blob;
   transfer_timestamp : nat64;
   block_height : nat64;
 };
@@ -529,6 +527,16 @@ type ProposalInfo = record {
 };
 type RegisterVote = record { vote : int32; proposal : opt NeuronId };
 type RemoveHotKey = record { hot_key_to_remove : opt principal };
+type RestoreAgingNeuronGroup = record {
+  count : opt nat64;
+  previous_total_stake_e8s : opt nat64;
+  current_total_stake_e8s : opt nat64;
+  group_type : int32;
+};
+type RestoreAgingSummary = record {
+  groups : vec RestoreAgingNeuronGroup;
+  timestamp_seconds : opt nat64;
+};
 type Result = variant { Ok; Err : GovernanceError };
 type Result_1 = variant { Error : GovernanceError; NeuronId : NeuronId };
 type Result_10 = variant { Ok : Ok_1; Err : GovernanceError };
@@ -677,6 +685,7 @@ service : (Governance) -> {
   get_node_provider_by_caller : (null) -> (Result_7) query;
   get_pending_proposals : () -> (vec ProposalInfo) query;
   get_proposal_info : (nat64) -> (opt ProposalInfo) query;
+  get_restore_aging_summary : () -> (RestoreAgingSummary) query;
   list_known_neurons : () -> (ListKnownNeuronsResponse) query;
   list_neurons : (ListNeurons) -> (ListNeuronsResponse) query;
   list_node_providers : () -> (ListNodeProvidersResponse) query;

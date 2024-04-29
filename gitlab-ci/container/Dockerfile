@@ -1,6 +1,6 @@
 # https://hub.docker.com/_/ubuntu
-# focal-20230605
-FROM ubuntu@sha256:554e40b15453c788ec799badf0f1ad05c3e5c735b53f940feb8f27cf2ec570c5
+# focal-20240216
+FROM ubuntu@sha256:48c35f3de33487442af224ed4aabac19fd9bfbd91ee90e9471d412706b20ba73
 ENV TZ=UTC
 
 COPY --chown=0700 ./gitlab-ci/container/files/known_hosts /etc/ssh/ssh_known_hosts
@@ -33,7 +33,7 @@ RUN curl -L "https://apt.llvm.org/llvm-snapshot.gpg.key" | apt-key add - && \
     curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key --keyring /usr/share/keyrings/cloud.google.gpg  add - && \
     apt -yq update && \
     apt -yqq install --no-install-recommends lld-17 llvm-17 llvm-17-dev clang-17 libclang-rt-17-dev google-cloud-cli \
-        gcc-$(gcc --version|head -n1|sed 's/\..*//'|sed 's/.* //')-plugin-dev libstdc++-$(gcc --version|head -n1|sed 's/\..*//'|sed 's/.* //')-dev
+    gcc-$(gcc --version|head -n1|sed 's/\..*//'|sed 's/.* //')-plugin-dev libstdc++-$(gcc --version|head -n1|sed 's/\..*//'|sed 's/.* //')-dev
 
 ARG sdk_version=0.12.0
 ARG sdk_sha=40da56ad27774d5e1b2cbc35f94c17368be8c8da557aca19878940264bd82a0a
@@ -48,8 +48,8 @@ RUN curl -fsSL https://github.com/FiloSottile/mkcert/releases/download/v${mkcert
     echo "$mkcert_sha /usr/local/bin/mkcert" | sha256sum --check && \
     chmod +x /usr/local/bin/mkcert
 
-ARG bazelisk_sha=8b739ac23a189b70d51a98041e90ba16f6559d5f991d83bbc031c740f8796310
-RUN curl -fsSL https://github.com/bazelbuild/bazelisk/releases/download/v1.12.2/bazelisk-linux-amd64 -o /usr/bin/bazel && \
+ARG bazelisk_sha=d28b588ac0916abd6bf02defb5433f6eddf7cba35ffa808eabb65a44aab226f7
+RUN curl -fsSL https://github.com/bazelbuild/bazelisk/releases/download/v1.19.0/bazelisk-linux-amd64 -o /usr/bin/bazel && \
     echo "$bazelisk_sha /usr/bin/bazel" | sha256sum --check && \
     chmod 777 /usr/bin/bazel
 
@@ -109,12 +109,16 @@ ENV PYTHONPATH=/ic/gitlab-ci/src:/ic/gitlab-ci/src/dependencies:$PYTHONPATH
 RUN cd /tmp/bazel && bazel version
 
 # Add Rust/Cargo support
-ARG RUST_VERSION=1.76.0
+ARG RUST_VERSION=1.77.1
 RUN curl --fail https://sh.rustup.rs -sSf \
     | sh -s -- -y --default-toolchain ${RUST_VERSION}-x86_64-unknown-linux-gnu --no-modify-path && \
     rustup default ${RUST_VERSION}-x86_64-unknown-linux-gnu && \
     rustup target add wasm32-unknown-unknown && \
     rustup component add clippy
+
+# Add cargo-audit
+ARG CARGO_AUDIT_VERSION=0.20.0
+RUN cargo install cargo-audit --version ${CARGO_AUDIT_VERSION}
 
 # Add buf
 ARG BUF_BIN="/usr/local/bin/buf"
@@ -145,9 +149,9 @@ COPY ./gitlab-ci/container/files/entrypoint.sh /entrypoint.sh
 
 # Add mold linker
 ARG MOLD_BIN="/usr/local/bin/mold"
-ARG MOLD_VERSION=2.0.0
+ARG MOLD_VERSION=2.4.1
 RUN curl -sSL "https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/mold-${MOLD_VERSION}-$(uname -m)-linux.tar.gz" | tar -C /usr/local --strip-components=1 -xzf - && \
-    echo "4d17d89e0c6a7c4c08ba5e0d3bbe9fd9c01ba227212307e157722c910e9a88be  ${MOLD_BIN}" | shasum -a 256 -c - && \
+    echo "4d34b489a0810e71a937103f38e4b6c951abac36b5b60c58bc07b73efa7139cd  ${MOLD_BIN}" | shasum -a 256 -c - && \
     ln -sf "${MOLD_BIN}" "$(realpath /usr/bin/ld)"
 
 

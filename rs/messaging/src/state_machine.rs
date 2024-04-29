@@ -36,7 +36,6 @@ pub(crate) struct StateMachineImpl {
     stream_builder: Box<dyn StreamBuilder>,
     log: ReplicaLogger,
     metrics: MessageRoutingMetrics,
-    query_stats_epoch_length: u64,
 }
 
 impl StateMachineImpl {
@@ -46,7 +45,6 @@ impl StateMachineImpl {
         stream_builder: Box<dyn StreamBuilder>,
         log: ReplicaLogger,
         metrics: MessageRoutingMetrics,
-        query_stats_epoch_length: u64,
     ) -> Self {
         Self {
             scheduler,
@@ -54,7 +52,6 @@ impl StateMachineImpl {
             stream_builder,
             log,
             metrics,
-            query_stats_epoch_length,
         }
     }
 
@@ -86,9 +83,7 @@ impl StateMachine for StateMachineImpl {
             deliver_query_stats(
                 query_stats,
                 &mut state,
-                batch.batch_number,
                 &self.log,
-                self.query_stats_epoch_length,
                 &self.metrics.query_stats_metrics,
             );
         }
@@ -112,14 +107,6 @@ impl StateMachine for StateMachineImpl {
         if let Err(message) = state.metadata.init_allocation_ranges_if_empty() {
             self.metrics
                 .observe_no_canister_allocation_range(&self.log, message);
-        }
-
-        if !state.consensus_queue.is_empty() {
-            fatal!(
-                self.log,
-                "Consensus queue not empty at the beginning of round {:?}.",
-                batch.batch_number
-            )
         }
 
         // Time out requests.
@@ -148,15 +135,28 @@ impl StateMachine for StateMachineImpl {
 
         let since = Instant::now();
         // Process messages from the induction pool through the Scheduler.
+        let next_checkpoint_round = batch
+            .next_checkpoint_height
+            .map(|h| ExecutionRound::from(h.get()));
         let state_after_execution = self.scheduler.execute_round(
             state_with_messages,
             batch.randomness,
             batch.ecdsa_subnet_public_keys,
             batch.ecdsa_quadruple_ids,
             ExecutionRound::from(batch.batch_number.get()),
+            next_checkpoint_round,
             execution_round_type,
             registry_settings,
         );
+
+        if !state_after_execution.consensus_queue.is_empty() {
+            fatal!(
+                self.log,
+                "Consensus queue not empty at the end of round {:?}.",
+                batch.batch_number
+            )
+        }
+
         self.observe_phase_duration(PHASE_EXECUTION, &since);
 
         let since = Instant::now();

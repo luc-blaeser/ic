@@ -137,34 +137,34 @@ impl ReceivedEvent {
             ReceivedEvent::Erc20(evt) => evt.source(),
         }
     }
-    pub fn from_address(&self) -> &Address {
+    pub fn from_address(&self) -> Address {
         match self {
-            ReceivedEvent::Eth(evt) => &evt.from_address,
-            ReceivedEvent::Erc20(evt) => &evt.from_address,
+            ReceivedEvent::Eth(evt) => evt.from_address,
+            ReceivedEvent::Erc20(evt) => evt.from_address,
         }
     }
-    pub fn principal(&self) -> &Principal {
+    pub fn principal(&self) -> Principal {
         match self {
-            ReceivedEvent::Eth(evt) => &evt.principal,
-            ReceivedEvent::Erc20(evt) => &evt.principal,
+            ReceivedEvent::Eth(evt) => evt.principal,
+            ReceivedEvent::Erc20(evt) => evt.principal,
         }
     }
-    pub fn block_number(&self) -> &BlockNumber {
+    pub fn block_number(&self) -> BlockNumber {
         match self {
-            ReceivedEvent::Eth(evt) => &evt.block_number,
-            ReceivedEvent::Erc20(evt) => &evt.block_number,
+            ReceivedEvent::Eth(evt) => evt.block_number,
+            ReceivedEvent::Erc20(evt) => evt.block_number,
         }
     }
-    pub fn log_index(&self) -> &LogIndex {
+    pub fn log_index(&self) -> LogIndex {
         match self {
-            ReceivedEvent::Eth(evt) => &evt.log_index,
-            ReceivedEvent::Erc20(evt) => &evt.log_index,
+            ReceivedEvent::Eth(evt) => evt.log_index,
+            ReceivedEvent::Erc20(evt) => evt.log_index,
         }
     }
-    pub fn transaction_hash(&self) -> &Hash {
+    pub fn transaction_hash(&self) -> Hash {
         match self {
-            ReceivedEvent::Eth(evt) => &evt.transaction_hash,
-            ReceivedEvent::Erc20(evt) => &evt.transaction_hash,
+            ReceivedEvent::Eth(evt) => evt.transaction_hash,
+            ReceivedEvent::Erc20(evt) => evt.transaction_hash,
         }
     }
     pub fn value(&self) -> candid::Nat {
@@ -178,6 +178,7 @@ impl ReceivedEvent {
 pub async fn last_received_events(
     topic: &[u8; 32],
     contract_address: Address,
+    token_contract_addresses: &[Address],
     from: BlockNumber,
     to: BlockNumber,
 ) -> Result<(Vec<ReceivedEvent>, Vec<ReceivedEventError>), MultiCallError<Vec<LogEntry>>> {
@@ -189,13 +190,25 @@ pub async fn last_received_events(
             from, to
         ));
     }
+    let mut topics: Vec<_> = vec![FixedSizeData(*topic).into()];
+    // We add token contract addresses as additional topics to match.
+    // It has a disjunction semantics, so it will match if event matches any one of these addresses.
+    if !token_contract_addresses.is_empty() {
+        topics.push(
+            token_contract_addresses
+                .iter()
+                .map(|address| FixedSizeData(address.into()))
+                .collect::<Vec<_>>()
+                .into(),
+        )
+    }
 
     let result = read_state(EthRpcClient::from_state)
         .eth_get_logs(GetLogsParam {
             from_block: from.into(),
             to_block: to.into(),
             address: vec![contract_address],
-            topics: vec![FixedSizeData(*topic).into()],
+            topics,
         })
         .await?;
 

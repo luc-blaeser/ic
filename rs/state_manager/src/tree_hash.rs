@@ -78,7 +78,7 @@ mod tests {
         testing::ReplicatedStateTesting,
         ExecutionState, ExportedFunctions, Global, Memory, NumWasmPages, PageMap, ReplicatedState,
     };
-    use ic_test_utilities::state::new_canister_state;
+    use ic_test_utilities_state::new_canister_state;
     use ic_test_utilities_types::ids::{
         canister_test_id, message_test_id, node_test_id, subnet_test_id, user_test_id,
     };
@@ -237,7 +237,7 @@ mod tests {
             }
             if certification_version >= CertificationVersion::V17 {
                 stream.set_reverse_stream_flags(StreamFlags {
-                    responses_only: true,
+                    deprecated_responses_only: true,
                 });
             }
             state.modify_streams(|streams| {

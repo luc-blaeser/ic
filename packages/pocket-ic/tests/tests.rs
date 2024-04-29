@@ -7,7 +7,7 @@ use icp_ledger::{
     Symbol, Tokens, TransferArgs, TransferError,
 };
 use pocket_ic::{
-    common::rest::{BlobCompression, SubnetConfigSet, SubnetKind},
+    common::rest::{BlobCompression, DtsFlag, SubnetConfigSet, SubnetKind},
     PocketIc, PocketIcBuilder, UserError, WasmResult,
 };
 use std::{
@@ -19,162 +19,6 @@ use std::{
 
 // 2T cycles
 const INIT_CYCLES: u128 = 2_000_000_000_000;
-
-// Canister code incrementing a counter in every heartbeat
-// and exporting a query method to read the counter.
-const AUTO_PROGRESS_WAT: &str = r#"
-    (module
-        (import "ic0" "msg_reply" (func $msg_reply))
-        (import "ic0" "msg_reply_data_append"
-            (func $msg_reply_data_append (param i32 i32)))
-        (func $inc
-            ;; Increment a counter.
-            (i32.store
-                (i32.const 0)
-                (i32.add (i32.load (i32.const 0)) (i32.const 1))))
-        (func $read
-            (call $msg_reply_data_append
-                (i32.const 0) ;; the counter from heap[0]
-                (i32.const 4)) ;; length
-            (call $msg_reply))
-        (memory $memory 1)
-        (export "canister_query read" (func $read))
-        (export "canister_heartbeat" (func $inc))
-    )
-"#;
-
-#[test]
-fn test_auto_progress() {
-    let pic = PocketIc::new();
-
-    // Create a canister and charge it with 2T cycles.
-    let can_id = pic.create_canister();
-    pic.add_cycles(can_id, INIT_CYCLES);
-
-    // Install the auto progress canister wasm file on the canister.
-    let auto_progress_wasm = wat::parse_str(AUTO_PROGRESS_WAT).unwrap();
-    pic.install_canister(can_id, auto_progress_wasm, vec![], None);
-
-    // Capture the original value of the counter.
-    let old_counter = match pic.query_call(can_id, Principal::anonymous(), "read", vec![]) {
-        Ok(WasmResult::Reply(data)) => u32::from_le_bytes(data.try_into().unwrap()),
-        _ => panic!("could not read counter"),
-    };
-
-    // Starting auto progress on the IC.
-    // Consequently, heartbeats should be executed on the auto progress canister automatically
-    // and its counter should increase.
-    pic.auto_progress();
-
-    let mut ok = false;
-    for _ in 0..100 {
-        let counter = match pic.query_call(can_id, Principal::anonymous(), "read", vec![]) {
-            Ok(WasmResult::Reply(data)) => u32::from_le_bytes(data.try_into().unwrap()),
-            _ => panic!("could not read counter"),
-        };
-        if counter > old_counter {
-            ok = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    if !ok {
-        panic!("did not observe a counter increase")
-    }
-
-    // Stopping auto progress on the IC.
-    // The counter should not increase anymore.
-    pic.stop_progress();
-
-    // Capture the current value of the counter.
-    let cur_counter = match pic.query_call(can_id, Principal::anonymous(), "read", vec![]) {
-        Ok(WasmResult::Reply(data)) => u32::from_le_bytes(data.try_into().unwrap()),
-        _ => panic!("could not read counter"),
-    };
-
-    for _ in 0..100 {
-        let counter = match pic.query_call(can_id, Principal::anonymous(), "read", vec![]) {
-            Ok(WasmResult::Reply(data)) => u32::from_le_bytes(data.try_into().unwrap()),
-            _ => panic!("could not read counter"),
-        };
-        assert_eq!(counter, cur_counter);
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-// Canister code with a very slow method.
-const VERY_SLOW_WAT: &str = r#"
-    (module
-        (import "ic0" "msg_reply" (func $msg_reply))
-        (import "ic0" "msg_reply_data_append"
-            (func $msg_reply_data_append (param i32 i32)))
-        (func $inc
-            ;; Increment a counter.
-            (i32.store
-                (i32.const 0)
-                (i32.add (i32.load (i32.const 0)) (i32.const 1))))
-        (func $run
-            ;; create a local variable and initialize it to 0
-            (local $i i32)
-            (local $j i32)
-            (loop $my_loop
-                i32.const 0
-                local.set $j
-                (loop $my_inner_loop
-                    ;; add one to $j
-                    local.get $j
-                    i32.const 1
-                    i32.add
-                    local.set $j
-                    ;; if $j is less than 100000 branch to loop
-                    local.get $j
-                    i32.const 100000
-                    i32.lt_s
-                    br_if $my_inner_loop
-                )
-                ;; add one to $i
-                local.get $i
-                i32.const 1
-                i32.add
-                local.set $i
-                ;; if $i is less than 100000 branch to loop
-                local.get $i
-                i32.const 100000
-                i32.lt_s
-                br_if $my_loop
-            )
-            (call $msg_reply))
-        (memory $memory 1)
-        (export "canister_update run" (func $run))
-        (export "canister_heartbeat" (func $inc))
-    )
-"#;
-
-fn run_very_slow_method(pic: &PocketIc) -> Result<WasmResult, UserError> {
-    // Create a canister and charge it with 2T cycles.
-    let can_id = pic.create_canister();
-    pic.add_cycles(can_id, 100 * INIT_CYCLES);
-
-    // Install the very slow canister wasm file on the canister.
-    let very_slow_wasm = wat::parse_str(VERY_SLOW_WAT).unwrap();
-    pic.install_canister(can_id, very_slow_wasm, vec![], None);
-
-    pic.update_call(can_id, Principal::anonymous(), "run", vec![])
-}
-
-#[test]
-fn test_benchmarking_subnet() {
-    let pic = PocketIcBuilder::new()
-        .with_benchmarking_application_subnet()
-        .build();
-    run_very_slow_method(&pic).unwrap();
-}
-
-#[test]
-fn very_slow_method_on_application_subnet() {
-    let pic = PocketIcBuilder::new().with_application_subnet().build();
-    run_very_slow_method(&pic).unwrap_err();
-}
 
 #[test]
 fn test_counter_canister() {
@@ -358,6 +202,203 @@ where
         unreachable!()
     };
     decode_one(&reply).unwrap()
+}
+
+// Canister code incrementing a counter in every heartbeat
+// and exporting a query method to read the counter.
+const AUTO_PROGRESS_WAT: &str = r#"
+    (module
+        (import "ic0" "msg_reply" (func $msg_reply))
+        (import "ic0" "msg_reply_data_append"
+            (func $msg_reply_data_append (param i32 i32)))
+        (func $inc
+            ;; Increment a counter.
+            (i32.store
+                (i32.const 0)
+                (i32.add (i32.load (i32.const 0)) (i32.const 1))))
+        (func $read
+            (call $msg_reply_data_append
+                (i32.const 0) ;; the counter from heap[0]
+                (i32.const 4)) ;; length
+            (call $msg_reply))
+        (memory $memory 1)
+        (export "canister_query read" (func $read))
+        (export "canister_heartbeat" (func $inc))
+    )
+"#;
+
+#[test]
+fn test_auto_progress() {
+    let pic = PocketIc::new();
+
+    // Create a canister and charge it with 2T cycles.
+    let can_id = pic.create_canister();
+    pic.add_cycles(can_id, INIT_CYCLES);
+
+    // Install the auto progress canister wasm file on the canister.
+    let auto_progress_wasm = wat::parse_str(AUTO_PROGRESS_WAT).unwrap();
+    pic.install_canister(can_id, auto_progress_wasm, vec![], None);
+
+    // Capture the original value of the counter.
+    let old_counter = match pic.query_call(can_id, Principal::anonymous(), "read", vec![]) {
+        Ok(WasmResult::Reply(data)) => u32::from_le_bytes(data.try_into().unwrap()),
+        _ => panic!("could not read counter"),
+    };
+
+    // Starting auto progress on the IC.
+    // Consequently, heartbeats should be executed on the auto progress canister automatically
+    // and its counter should increase.
+    pic.auto_progress();
+
+    let mut ok = false;
+    for _ in 0..100 {
+        let counter = match pic.query_call(can_id, Principal::anonymous(), "read", vec![]) {
+            Ok(WasmResult::Reply(data)) => u32::from_le_bytes(data.try_into().unwrap()),
+            _ => panic!("could not read counter"),
+        };
+        if counter > old_counter {
+            ok = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    if !ok {
+        panic!("did not observe a counter increase")
+    }
+
+    // Stopping auto progress on the IC.
+    // The counter should not increase anymore.
+    pic.stop_progress();
+
+    // Capture the current value of the counter.
+    let cur_counter = match pic.query_call(can_id, Principal::anonymous(), "read", vec![]) {
+        Ok(WasmResult::Reply(data)) => u32::from_le_bytes(data.try_into().unwrap()),
+        _ => panic!("could not read counter"),
+    };
+
+    for _ in 0..100 {
+        let counter = match pic.query_call(can_id, Principal::anonymous(), "read", vec![]) {
+            Ok(WasmResult::Reply(data)) => u32::from_le_bytes(data.try_into().unwrap()),
+            _ => panic!("could not read counter"),
+        };
+        assert_eq!(counter, cur_counter);
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+// Canister code with a very slow method.
+fn very_slow_wasm(n: u64) -> Vec<u8> {
+    let wat = format!(
+        r#"
+    (module
+        (import "ic0" "msg_reply" (func $msg_reply))
+        (import "ic0" "msg_reply_data_append"
+            (func $msg_reply_data_append (param i32 i32)))
+        (func $inc
+            ;; Increment a counter.
+            (i32.store
+                (i32.const 0)
+                (i32.add (i32.load (i32.const 0)) (i32.const 1))))
+        (func $run
+            ;; create a local variable and initialize it to 0
+            (local $i i32)
+            (local $j i32)
+            (loop $my_loop
+                i32.const 0
+                local.set $j
+                (loop $my_inner_loop
+                    ;; add one to $j
+                    local.get $j
+                    i32.const 1
+                    i32.add
+                    local.set $j
+                    ;; if $j is less than 200000 branch to loop
+                    local.get $j
+                    i32.const {}
+                    i32.lt_s
+                    br_if $my_inner_loop
+                )
+                ;; add one to $i
+                local.get $i
+                i32.const 1
+                i32.add
+                local.set $i
+                ;; if $i is less than 200000 branch to loop
+                local.get $i
+                i32.const {}
+                i32.lt_s
+                br_if $my_loop
+            )
+            (call $msg_reply))
+        (memory $memory 1)
+        (export "canister_update run" (func $run))
+        (export "canister_heartbeat" (func $inc))
+    )
+"#,
+        n, n
+    );
+    wat::parse_str(wat).unwrap()
+}
+
+fn run_very_slow_method(
+    pic: &PocketIc,
+    loop_iterations: u64,
+    dts_flag: DtsFlag,
+) -> Result<WasmResult, UserError> {
+    // Create a canister.
+    let t0 = pic.get_time();
+    let can_id = pic.create_canister();
+    let t1 = pic.get_time();
+    assert_eq!(t1, t0 + Duration::from_nanos(1)); // canister creation should take one round, i.e., 1ns
+
+    // Charge the canister with 2T cycles.
+    pic.add_cycles(can_id, 100 * INIT_CYCLES);
+
+    // Install the very slow canister wasm file on the canister.
+    pic.install_canister(can_id, very_slow_wasm(loop_iterations), vec![], None);
+
+    let t0 = pic.get_time();
+    let res = pic.update_call(can_id, Principal::anonymous(), "run", vec![]);
+    let t1 = pic.get_time();
+    if let DtsFlag::Enabled = dts_flag {
+        assert!(t1 >= t0 + Duration::from_nanos(10)); // DTS takes at least 10 rounds
+    } else {
+        assert_eq!(t1, t0 + Duration::from_nanos(1)); // update call should take one round, i.e., 1ns without DTS
+    }
+
+    res
+}
+
+#[test]
+fn test_benchmarking_subnet() {
+    let pic = PocketIcBuilder::new()
+        .with_benchmarking_application_subnet()
+        .build();
+    run_very_slow_method(&pic, 200_000, DtsFlag::Disabled).unwrap();
+}
+
+#[test]
+fn very_slow_method_on_application_subnet() {
+    let pic = PocketIcBuilder::new().with_application_subnet().build();
+    run_very_slow_method(&pic, 200_000, DtsFlag::Enabled).unwrap_err();
+}
+
+fn test_dts(dts_flag: DtsFlag) {
+    let pic = PocketIcBuilder::new()
+        .with_application_subnet()
+        .with_dts_flag(dts_flag)
+        .build();
+    run_very_slow_method(&pic, 60_000, dts_flag).unwrap();
+}
+
+#[test]
+fn test_dts_enabled() {
+    test_dts(DtsFlag::Enabled);
+}
+
+#[test]
+fn test_dts_disabled() {
+    test_dts(DtsFlag::Disabled);
 }
 
 #[test]
@@ -829,4 +870,138 @@ fn test_set_and_get_stable_memory_compressed() {
 
     let read_data = pic.get_stable_memory(canister_id);
     assert_eq!(data, read_data[..8]);
+}
+
+#[test]
+fn test_parallel_calls() {
+    let wat = r#"
+    (module
+        (import "ic0" "time" (func $ic0_time (result i64)))
+        (import "ic0" "msg_reply" (func $msg_reply))
+        (import "ic0" "msg_reply_data_append"
+            (func $msg_reply_data_append (param i32 i32)))
+        (func $time
+            (i64.store (i32.const 0) (call $ic0_time))
+            (call $msg_reply_data_append (i32.const 0) (i32.const 8))
+            (call $msg_reply))
+        (memory $memory 1)
+        (export "canister_update time" (func $time))
+    )
+"#;
+
+    let pic = PocketIc::new();
+    let canister_id = pic.create_canister();
+    pic.add_cycles(canister_id, INIT_CYCLES);
+    let time_wasm = wat::parse_str(wat).unwrap();
+    pic.install_canister(canister_id, time_wasm, vec![], None);
+
+    let msg_id1 = pic
+        .submit_call(
+            canister_id,
+            Principal::anonymous(),
+            "time",
+            encode_one(()).unwrap(),
+        )
+        .unwrap();
+    let msg_id2 = pic
+        .submit_call(
+            canister_id,
+            Principal::anonymous(),
+            "time",
+            encode_one(()).unwrap(),
+        )
+        .unwrap();
+
+    let time1 = pic.await_call(msg_id1).unwrap();
+    let time2 = pic.await_call(msg_id2).unwrap();
+
+    // times should be equal since the update calls are parallel
+    // and should be executed in the same round
+    assert_eq!(time1, time2);
+
+    let time3 = pic
+        .update_call(
+            canister_id,
+            Principal::anonymous(),
+            "time",
+            encode_one(()).unwrap(),
+        )
+        .unwrap();
+
+    // now times should not be equal since the last update call
+    // was executed in a separate round and round times are strictly
+    // monotone
+    assert!(time1 != time3);
+}
+
+#[test]
+fn test_inspect_message() {
+    let wat = r#"
+    (module
+        (import "ic0" "accept_message" (func $accept_message))
+        (import "ic0" "msg_reply" (func $msg_reply))
+        (func $inspect
+            (i32.load (i32.const 0))
+            (if
+              (then)
+              (else
+                (call $accept_message)
+              )
+            )
+        )
+        (func $inc
+            ;; Increment a counter.
+            (i32.store
+                (i32.const 0)
+                (i32.add (i32.load (i32.const 0)) (i32.const 1)))
+            (call $msg_reply))
+        (memory $memory 1)
+        (export "canister_inspect_message" (func $inspect))
+        (export "canister_update inc" (func $inc))
+    )
+"#;
+
+    let pic = PocketIc::new();
+    let canister_id = pic.create_canister();
+    pic.add_cycles(canister_id, INIT_CYCLES);
+    let inspect_wasm = wat::parse_str(wat).unwrap();
+    pic.install_canister(canister_id, inspect_wasm, vec![], None);
+
+    // the first call succeeds because the inspect_message accepts for counter = 0
+    pic.update_call(
+        canister_id,
+        Principal::anonymous(),
+        "inc",
+        encode_one(()).unwrap(),
+    )
+    .unwrap();
+
+    // the second call fails because the first (successful) call incremented the counter
+    // and the inspect_message does not accept for counter > 0
+    pic.update_call(
+        canister_id,
+        Principal::anonymous(),
+        "inc",
+        encode_one(()).unwrap(),
+    )
+    .unwrap_err();
+}
+
+#[should_panic]
+#[test]
+fn test_too_large_call() {
+    let pic = PocketIc::new();
+
+    let canister_id = pic.create_canister();
+    pic.add_cycles(canister_id, INIT_CYCLES);
+    let counter_wasm = counter_wasm();
+    pic.install_canister(canister_id, counter_wasm, vec![], None);
+
+    pic.update_call(
+        canister_id,
+        Principal::anonymous(),
+        "inc",
+        vec![42; 16_000_000],
+    )
+    .unwrap_err();
 }

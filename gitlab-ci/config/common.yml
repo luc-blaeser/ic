@@ -22,7 +22,7 @@ default:
     expire_in: 3 days
     when: always
   image:
-    name: "registry.gitlab.com/dfinity-lab/core/docker/ic-build:b4c69bc09c7128dc2b1ba13e9dc20e2839a31c9957580ff36f41a6b89f5e6af5"
+    name: "registry.gitlab.com/dfinity-lab/core/docker/ic-build:e3ca31c9688e13fd6caec30a0cec5d9a2b3ff424db4f4243ebab4c30f9f5e869"
   tags:
     - dfinity-ic
 
@@ -67,6 +67,10 @@ before_script:
     if [ "$(uname)" == "Linux" ]; then
       docker login -u "$DOCKER_HUB_USER" -p "$DOCKER_HUB_PASSWORD_RO"
       docker-bin login -u "$DOCKER_HUB_USER" -p "$DOCKER_HUB_PASSWORD_RO"
+
+      if [ "${NODE_NAME:-}" != "" ]; then
+          echo "NODE: $NODE_NAME"
+      fi
 
       # set ownership to ic-build container's user,
       # but ignore errors that happen due to git gc:
@@ -134,6 +138,7 @@ after_script:
         - "**/*.lock"
         - "**/*.rs"
         - "**/*.toml"
+        - "gitlab-ci/container/Dockerfile"
     - if: '$CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"'
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^(rc--|hotfix-.+-rc--).+/'
 

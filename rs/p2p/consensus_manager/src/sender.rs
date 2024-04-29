@@ -12,7 +12,8 @@ use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
 use bytes::Bytes;
 use ic_base_types::NodeId;
 use ic_interfaces::p2p::{
-    artifact_manager::ArtifactProcessorEvent, consensus::ValidatedPoolReader,
+    artifact_manager::ArtifactProcessorEvent,
+    consensus::{ArtifactWithOpt, ValidatedPoolReader},
 };
 use ic_logger::{error, warn, ReplicaLogger};
 use ic_protobuf::{p2p::v1 as pb, proxy::ProtoProxy};
@@ -30,6 +31,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     metrics::ConsensusManagerMetrics, uri_prefix, CommitId, SlotNumber, SlotUpdate, Update,
 };
+
+use self::available_slot_set::{AvailableSlot, AvailableSlotSet};
 
 /// The size threshold for an artifact to be pushed. Artifacts smaller than this constant
 /// in size are pushed.
@@ -65,7 +68,7 @@ pub(crate) struct ConsensusManagerSender<Artifact: ArtifactKind> {
     adverts_to_send: Receiver<ArtifactProcessorEvent<Artifact>>,
     slot_manager: AvailableSlotSet,
     current_commit_id: CommitId,
-    active_adverts: HashMap<Artifact::Id, (CancellationToken, SlotNumber)>,
+    active_adverts: HashMap<Artifact::Id, (CancellationToken, AvailableSlot)>,
     join_set: JoinSet<()>,
     cancellation_token: CancellationToken,
 }
@@ -105,14 +108,15 @@ impl<Artifact: ArtifactKind> ConsensusManagerSender<Artifact> {
         // This can for example happen if the node restarts.
         let artifacts_in_validated_pool: Vec<Artifact::Message> = {
             let pool_read_lock = self.pool_reader.read().unwrap();
-            pool_read_lock
-                .get_all_validated_by_filter(&Artifact::Filter::default())
-                .collect()
+            pool_read_lock.get_all_validated().collect()
         };
 
         for artifact in artifacts_in_validated_pool {
             let advert = Artifact::message_to_advert(&artifact);
-            self.handle_send_advert(advert);
+            self.handle_send_advert(ArtifactWithOpt {
+                advert,
+                is_latency_sensitive: false,
+            });
         }
 
         loop {
@@ -127,7 +131,7 @@ impl<Artifact: ArtifactKind> ConsensusManagerSender<Artifact> {
                 }
                 Some(advert) = self.adverts_to_send.recv() => {
                     match advert {
-                        ArtifactProcessorEvent::Advert(advert) => self.handle_send_advert(advert),
+                        ArtifactProcessorEvent::Artifact(new_artifact) => self.handle_send_advert(new_artifact),
                         ArtifactProcessorEvent::Purge(id) => self.handle_purge_advert(&id),
                     }
 
@@ -141,7 +145,7 @@ impl<Artifact: ArtifactKind> ConsensusManagerSender<Artifact> {
 
             #[cfg(debug_assertions)]
             {
-                if !(self.join_set.len() >= self.active_adverts.len()) {
+                if self.join_set.len() < self.active_adverts.len() {
                     // This invariant can be violated if the root cancellation token is cancelled.
                     // It can be violated because the active_adverts HashMap is only cleared
                     // when purging artifacts, and not when the tasks join due to a cancellation
@@ -177,13 +181,13 @@ impl<Artifact: ArtifactKind> ConsensusManagerSender<Artifact> {
         }
     }
 
-    fn handle_send_advert(&mut self, advert: Advert<Artifact>) {
-        let entry = self.active_adverts.entry(advert.id.clone());
+    fn handle_send_advert(&mut self, new_artifact: ArtifactWithOpt<Artifact>) {
+        let entry = self.active_adverts.entry(new_artifact.advert.id.clone());
 
         if let Entry::Vacant(entry) = entry {
             self.metrics.send_view_consensus_new_adverts_total.inc();
 
-            let slot = self.slot_manager.pop();
+            let used_slot = self.slot_manager.pop();
 
             let child_token = self.cancellation_token.child_token();
             let child_token_clone = child_token.clone();
@@ -194,14 +198,14 @@ impl<Artifact: ArtifactKind> ConsensusManagerSender<Artifact> {
                 self.metrics.clone(),
                 self.transport.clone(),
                 self.current_commit_id,
-                slot,
-                advert,
+                used_slot.slot_number(),
+                new_artifact,
                 self.pool_reader.clone(),
                 child_token_clone,
             );
 
             self.join_set.spawn_on(send_future, &self.rt_handle);
-            entry.insert((child_token, slot));
+            entry.insert((child_token, used_slot));
         } else {
             self.metrics.send_view_consensus_dup_adverts_total.inc();
         }
@@ -215,24 +219,24 @@ impl<Artifact: ArtifactKind> ConsensusManagerSender<Artifact> {
         transport: Arc<dyn Transport>,
         commit_id: CommitId,
         slot_number: SlotNumber,
-        Advert {
-            id,
-            attribute,
-            size,
-            ..
-        }: Advert<Artifact>,
+        ArtifactWithOpt {
+            advert:
+                Advert {
+                    id,
+                    attribute,
+                    size,
+                    ..
+                },
+            is_latency_sensitive,
+        }: ArtifactWithOpt<Artifact>,
         pool_reader: Arc<RwLock<dyn ValidatedPoolReader<Artifact> + Send + Sync>>,
         cancellation_token: CancellationToken,
     ) {
-        // Try to push artifact if size below threshold && the artifact is not a relay.
-        let push_artifact = size < ARTIFACT_PUSH_THRESHOLD_BYTES;
-
-        let artifact = if push_artifact {
+        // Try to push artifact if size below threshold or it is latency sensitive.
+        let artifact = if size < ARTIFACT_PUSH_THRESHOLD_BYTES || is_latency_sensitive {
             let id = id.clone();
-            let artifact = tokio::task::spawn_blocking(move || {
-                pool_reader.read().unwrap().get_validated_by_identifier(&id)
-            })
-            .await;
+            let artifact =
+                tokio::task::spawn_blocking(move || pool_reader.read().unwrap().get(&id)).await;
 
             match artifact {
                 Ok(Some(artifact)) => Some(artifact),
@@ -306,6 +310,7 @@ impl<Artifact: ArtifactKind> ConsensusManagerSender<Artifact> {
                 }
                 _ = cancellation_token.cancelled() => {
                     while let Some(result) = in_progress_transmissions.join_next().await {
+                        metrics.send_view_send_to_peer_cancelled_total.inc();
                         panic_on_join_err(result);
                     }
                     break;
@@ -345,55 +350,67 @@ async fn send_advert_to_peer(
     }
 }
 
-struct AvailableSlotSet {
-    next_free_slot: SlotNumber,
-    free_slots: Vec<SlotNumber>,
-    log: ReplicaLogger,
-    metrics: ConsensusManagerMetrics,
-    service_name: &'static str,
-}
+mod available_slot_set {
+    use super::*;
 
-impl AvailableSlotSet {
-    fn new(
-        log: ReplicaLogger,
-        metrics: ConsensusManagerMetrics,
-        service_name: &'static str,
-    ) -> Self {
-        Self {
-            next_free_slot: 0.into(),
-            free_slots: vec![],
-            log,
-            metrics,
-            service_name,
+    pub struct AvailableSlot(u64);
+
+    impl AvailableSlot {
+        pub fn slot_number(&self) -> SlotNumber {
+            self.0.into()
         }
     }
 
-    fn push(&mut self, slot: SlotNumber) {
-        self.free_slots.push(slot);
-        self.metrics.slot_set_in_use_slots.dec();
+    pub struct AvailableSlotSet {
+        next_free_slot: u64,
+        free_slots: Vec<AvailableSlot>,
+        log: ReplicaLogger,
+        metrics: ConsensusManagerMetrics,
+        service_name: &'static str,
     }
 
-    /// Returns available slot.
-    fn pop(&mut self) -> SlotNumber {
-        self.metrics.slot_set_in_use_slots.inc();
-        match self.free_slots.pop() {
-            Some(slot) => slot,
-            None => {
-                if self.next_free_slot.get() > SLOT_TABLE_THRESHOLD {
-                    warn!(
-                        self.log,
-                        "Slot table threshold exceeded for service {}. Slots in use = {}.",
-                        self.service_name,
-                        self.next_free_slot
-                    );
+    impl AvailableSlotSet {
+        pub fn new(
+            log: ReplicaLogger,
+            metrics: ConsensusManagerMetrics,
+            service_name: &'static str,
+        ) -> Self {
+            Self {
+                next_free_slot: 0,
+                free_slots: vec![],
+                log,
+                metrics,
+                service_name,
+            }
+        }
+
+        pub fn push(&mut self, slot: AvailableSlot) {
+            self.free_slots.push(slot);
+            self.metrics.slot_set_in_use_slots.dec();
+        }
+
+        /// Returns available slot.
+        pub fn pop(&mut self) -> AvailableSlot {
+            self.metrics.slot_set_in_use_slots.inc();
+            match self.free_slots.pop() {
+                Some(slot) => slot,
+                None => {
+                    if self.next_free_slot > SLOT_TABLE_THRESHOLD {
+                        warn!(
+                            self.log,
+                            "Slot table threshold exceeded for service {}. Slots in use = {}.",
+                            self.service_name,
+                            self.next_free_slot
+                        );
+                    }
+
+                    let new_slot = AvailableSlot(self.next_free_slot);
+                    self.next_free_slot += 1;
+
+                    self.metrics.slot_set_allocated_slots_total.inc();
+
+                    new_slot
                 }
-
-                let new_slot = self.next_free_slot;
-                self.next_free_slot.inc_assign();
-
-                self.metrics.slot_set_allocated_slots_total.inc();
-
-                new_slot
             }
         }
     }
@@ -424,7 +441,8 @@ mod tests {
         let cancel_token_clone = cancel_token.clone();
 
         let consensus_sender_join_handle = with_test_replica_logger(move |log| {
-            let mut mock_reader = MockValidatedPoolReader::new();
+            let mut mock_reader: MockValidatedPoolReader<U64Artifact> =
+                MockValidatedPoolReader::new();
             let mut mock_transport = MockTransport::new();
             mock_transport
                 .expect_peers()
@@ -438,11 +456,11 @@ mod tests {
                 });
             // Initial validated pool contains one element.
             mock_reader
-                .expect_get_all_validated_by_filter()
-                .returning(|_| Box::new(std::iter::once(1)));
+                .expect_get_all_validated()
+                .returning(|| Box::new(std::iter::once(U64Artifact::id_to_msg(1, 1024))));
             mock_reader
-                .expect_get_validated_by_identifier()
-                .returning(|id| Some(*id));
+                .expect_get()
+                .returning(|id| Some(U64Artifact::id_to_msg(*id, 1024)));
 
             let (_tx, rx) = tokio::sync::mpsc::channel(100);
             ConsensusManagerSender::run(
@@ -475,7 +493,8 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(100);
 
         let consensus_sender_join_handle = with_test_replica_logger(|log| {
-            let mut mock_reader = MockValidatedPoolReader::new();
+            let mut mock_reader: MockValidatedPoolReader<U64Artifact> =
+                MockValidatedPoolReader::new();
             let mut mock_transport = MockTransport::new();
             mock_transport
                 .expect_peers()
@@ -488,11 +507,11 @@ mod tests {
                     Ok(())
                 });
             mock_reader
-                .expect_get_all_validated_by_filter()
-                .returning(|_| Box::new(std::iter::empty()));
+                .expect_get_all_validated()
+                .returning(|| Box::new(std::iter::empty()));
             mock_reader
-                .expect_get_validated_by_identifier()
-                .returning(|id| Some(*id));
+                .expect_get()
+                .returning(|id| Some(U64Artifact::id_to_msg(*id, 1024)));
 
             ConsensusManagerSender::run(
                 log,
@@ -505,9 +524,10 @@ mod tests {
             )
         });
 
-        tx.send(ArtifactProcessorEvent::Advert(
-            U64Artifact::message_to_advert(&1),
-        ))
+        tx.send(ArtifactProcessorEvent::Artifact(ArtifactWithOpt {
+            advert: U64Artifact::message_to_advert(&U64Artifact::id_to_msg(1, 1024)),
+            is_latency_sensitive: false,
+        }))
         .await
         .unwrap();
 
@@ -538,7 +558,8 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(100);
 
         let consensus_sender_join_handle = with_test_replica_logger(|log| {
-            let mut mock_reader = MockValidatedPoolReader::new();
+            let mut mock_reader: MockValidatedPoolReader<U64Artifact> =
+                MockValidatedPoolReader::new();
             let mut mock_transport = MockTransport::new();
             let mut seq = Sequence::new();
 
@@ -561,11 +582,11 @@ mod tests {
                     Ok(())
                 });
             mock_reader
-                .expect_get_all_validated_by_filter()
-                .returning(|_| Box::new(std::iter::empty()));
+                .expect_get_all_validated()
+                .returning(|| Box::new(std::iter::empty()));
             mock_reader
-                .expect_get_validated_by_identifier()
-                .returning(|id| Some(*id));
+                .expect_get()
+                .returning(|id| Some(U64Artifact::id_to_msg(*id, 1024)));
 
             ConsensusManagerSender::run(
                 log,
@@ -578,9 +599,10 @@ mod tests {
             )
         });
 
-        tx.send(ArtifactProcessorEvent::Advert(
-            U64Artifact::message_to_advert(&1),
-        ))
+        tx.send(ArtifactProcessorEvent::Artifact(ArtifactWithOpt {
+            advert: U64Artifact::message_to_advert(&U64Artifact::id_to_msg(1, 1024)),
+            is_latency_sensitive: false,
+        }))
         .await
         .unwrap();
 
@@ -609,7 +631,8 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(100);
 
         let consensus_sender_join_handle = with_test_replica_logger(|log| {
-            let mut mock_reader = MockValidatedPoolReader::new();
+            let mut mock_reader: MockValidatedPoolReader<U64Artifact> =
+                MockValidatedPoolReader::new();
             let mut mock_transport = MockTransport::new();
             let mut seq = Sequence::new();
 
@@ -630,11 +653,11 @@ mod tests {
                     Ok(())
                 });
             mock_reader
-                .expect_get_all_validated_by_filter()
-                .returning(|_| Box::new(std::iter::empty()));
+                .expect_get_all_validated()
+                .returning(|| Box::new(std::iter::empty()));
             mock_reader
-                .expect_get_validated_by_identifier()
-                .returning(|id| Some(*id));
+                .expect_get()
+                .returning(|id| Some(U64Artifact::id_to_msg(*id, 1024)));
 
             ConsensusManagerSender::run(
                 log,
@@ -646,9 +669,10 @@ mod tests {
                 cancel_token_clone,
             )
         });
-        tx.send(ArtifactProcessorEvent::Advert(
-            U64Artifact::message_to_advert(&1),
-        ))
+        tx.send(ArtifactProcessorEvent::Artifact(ArtifactWithOpt {
+            advert: U64Artifact::message_to_advert(&U64Artifact::id_to_msg(1, 1024)),
+            is_latency_sensitive: false,
+        }))
         .await
         .unwrap();
         // Verify that we successfully retried.
@@ -670,7 +694,8 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(100);
 
         let consensus_sender_join_handle = with_test_replica_logger(|log| {
-            let mut mock_reader = MockValidatedPoolReader::new();
+            let mut mock_reader: MockValidatedPoolReader<U64Artifact> =
+                MockValidatedPoolReader::new();
             let mut mock_transport = MockTransport::new();
 
             mock_transport
@@ -686,11 +711,11 @@ mod tests {
                     Ok(())
                 });
             mock_reader
-                .expect_get_all_validated_by_filter()
-                .returning(|_| Box::new(std::iter::empty()));
+                .expect_get_all_validated()
+                .returning(|| Box::new(std::iter::empty()));
             mock_reader
-                .expect_get_validated_by_identifier()
-                .returning(|id| Some(*id));
+                .expect_get()
+                .returning(|id| Some(U64Artifact::id_to_msg(*id, 1024)));
 
             ConsensusManagerSender::run(
                 log,
@@ -703,25 +728,28 @@ mod tests {
             )
         });
         // Send advert and verify commit it.
-        tx.send(ArtifactProcessorEvent::Advert(
-            U64Artifact::message_to_advert(&1),
-        ))
+        tx.send(ArtifactProcessorEvent::Artifact(ArtifactWithOpt {
+            advert: U64Artifact::message_to_advert(&U64Artifact::id_to_msg(1, 1024)),
+            is_latency_sensitive: false,
+        }))
         .await
         .unwrap();
         assert_eq!(commit_id_rx.recv().await.unwrap().get(), 0);
 
         // Send second advert and observe commit id bump.
-        tx.send(ArtifactProcessorEvent::Advert(
-            U64Artifact::message_to_advert(&2),
-        ))
+        tx.send(ArtifactProcessorEvent::Artifact(ArtifactWithOpt {
+            advert: U64Artifact::message_to_advert(&U64Artifact::id_to_msg(2, 1024)),
+            is_latency_sensitive: false,
+        }))
         .await
         .unwrap();
         assert_eq!(commit_id_rx.recv().await.unwrap().get(), 1);
         // Send purge and new advert and observe commit id increase by 2.
         tx.send(ArtifactProcessorEvent::Purge(2)).await.unwrap();
-        tx.send(ArtifactProcessorEvent::Advert(
-            U64Artifact::message_to_advert(&3),
-        ))
+        tx.send(ArtifactProcessorEvent::Artifact(ArtifactWithOpt {
+            advert: U64Artifact::message_to_advert(&U64Artifact::id_to_msg(3, 1024)),
+            is_latency_sensitive: false,
+        }))
         .await
         .unwrap();
 
@@ -743,7 +771,8 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(100);
 
         let consensus_sender_join_handle = with_test_replica_logger(|log| {
-            let mut mock_reader = MockValidatedPoolReader::new();
+            let mut mock_reader: MockValidatedPoolReader<U64Artifact> =
+                MockValidatedPoolReader::new();
             let mut mock_transport = MockTransport::new();
 
             mock_transport
@@ -759,11 +788,11 @@ mod tests {
                     Ok(())
                 });
             mock_reader
-                .expect_get_all_validated_by_filter()
-                .returning(|_| Box::new(std::iter::empty()));
+                .expect_get_all_validated()
+                .returning(|| Box::new(std::iter::empty()));
             mock_reader
-                .expect_get_validated_by_identifier()
-                .returning(|id| Some(*id));
+                .expect_get()
+                .returning(|id| Some(U64Artifact::id_to_msg(*id, 1024)));
 
             ConsensusManagerSender::run(
                 log,
@@ -776,24 +805,27 @@ mod tests {
             )
         });
         // Send advert and verify commit id.
-        tx.send(ArtifactProcessorEvent::Advert(
-            U64Artifact::message_to_advert(&1),
-        ))
+        tx.send(ArtifactProcessorEvent::Artifact(ArtifactWithOpt {
+            advert: U64Artifact::message_to_advert(&U64Artifact::id_to_msg(1, 1024)),
+            is_latency_sensitive: false,
+        }))
         .await
         .unwrap();
         assert_eq!(commit_id_rx.recv().await.unwrap().get(), 0);
 
         // Send same advert again. This should be noop.
-        tx.send(ArtifactProcessorEvent::Advert(
-            U64Artifact::message_to_advert(&1),
-        ))
+        tx.send(ArtifactProcessorEvent::Artifact(ArtifactWithOpt {
+            advert: U64Artifact::message_to_advert(&U64Artifact::id_to_msg(1, 1024)),
+            is_latency_sensitive: false,
+        }))
         .await
         .unwrap();
 
         // Check that new advert is advertised with correct commit id.
-        tx.send(ArtifactProcessorEvent::Advert(
-            U64Artifact::message_to_advert(&2),
-        ))
+        tx.send(ArtifactProcessorEvent::Artifact(ArtifactWithOpt {
+            advert: U64Artifact::message_to_advert(&U64Artifact::id_to_msg(2, 1024)),
+            is_latency_sensitive: false,
+        }))
         .await
         .unwrap();
 
@@ -834,11 +866,11 @@ mod tests {
                 });
 
             mock_reader
-                .expect_get_all_validated_by_filter()
-                .returning(|_| Box::new(std::iter::empty()));
+                .expect_get_all_validated()
+                .returning(|| Box::new(std::iter::empty()));
             mock_reader
-                .expect_get_validated_by_identifier()
-                .returning(|id| Some(*id));
+                .expect_get()
+                .returning(|id| Some(U64Artifact::id_to_msg(*id, 1024)));
 
             ConsensusManagerSender::run(
                 log,
@@ -851,9 +883,10 @@ mod tests {
             )
         });
 
-        tx.send(ArtifactProcessorEvent::Advert(
-            U64Artifact::message_to_advert(&1),
-        ))
+        tx.send(ArtifactProcessorEvent::Artifact(ArtifactWithOpt {
+            advert: U64Artifact::message_to_advert(&U64Artifact::id_to_msg(1, 1024)),
+            is_latency_sensitive: false,
+        }))
         .await
         .unwrap();
 
@@ -875,14 +908,20 @@ mod tests {
         );
 
         // Take more than SLOT_TABLE_THRESHOLD number of slots
+        let mut used_slots = Vec::new();
         for i in 0..(SLOT_TABLE_THRESHOLD * 5) {
-            assert_eq!(sm.pop().get(), i);
+            let new_slot = sm.pop();
+            assert_eq!(new_slot.slot_number(), SlotNumber::from(i));
+            used_slots.push(new_slot);
         }
         // Give back all the slots.
-        for i in 0..(SLOT_TABLE_THRESHOLD * 5) {
-            sm.push(SlotNumber::from(i));
+        for slot in used_slots {
+            sm.push(slot);
         }
         // Check that we get the slot that was returned last
-        assert_eq!(sm.pop().get(), SLOT_TABLE_THRESHOLD * 5 - 1);
+        assert_eq!(
+            sm.pop().slot_number(),
+            SlotNumber::from(SLOT_TABLE_THRESHOLD * 5 - 1)
+        );
     }
 }

@@ -14,6 +14,7 @@ MACRO_DEPENDENCIES = [
 
 DEV_DEPENDENCIES = [
     "//packages/icrc-ledger-types",
+    "//rs/nervous_system/common",
     "//rs/types/base_types",
     "@crate_index//:candid",
     "@crate_index//:lazy_static",
@@ -41,7 +42,6 @@ rust_library(
 rust_test(
     name = "proposals_amount_total_limit_test",
     srcs = glob(["src/**"]),
-    crate = ":proposals_amount_total_limit",
     proc_macro_deps = MACRO_DEPENDENCIES + MACRO_DEV_DEPENDENCIES,
     deps = DEPENDENCIES + DEV_DEPENDENCIES,
 )

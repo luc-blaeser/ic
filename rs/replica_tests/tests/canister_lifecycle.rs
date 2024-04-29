@@ -719,6 +719,7 @@ fn can_get_canister_information() {
                 0u128,
                 0u128,
                 0u128,
+                Some(0),
             )
         );
 
@@ -735,7 +736,6 @@ fn can_get_canister_information() {
                         canister_b,
                         UNIVERSAL_CANISTER_WASM.to_vec(),
                         vec![],
-                        None,
                         None,
                         None,
                     )
@@ -777,6 +777,7 @@ fn can_get_canister_information() {
                     0u128,
                     0u128,
                     0u128,
+                    Some(0)
                 ),
                 CanisterStatusResultV2::decode(&res).unwrap(),
                 2 * BALANCE_EPSILON,
@@ -794,7 +795,7 @@ fn cannot_run_method_on_empty_canister() {
                 assert_eq!(err.code(), ErrorCode::CanisterWasmModuleNotFound);
                 assert_eq!(
                     err.description(),
-                    "Attempt to execute a message on canister rwlgt-iiaaa-aaaaa-aaaaa-cai which contains no Wasm module"
+                    "Error from Canister rwlgt-iiaaa-aaaaa-aaaaa-cai: Attempt to execute a message, but the canister contains no Wasm module"
                 );
             }
             rest => panic!("Unexpected behaviour {:?}", rest),
@@ -821,7 +822,6 @@ fn installing_a_canister_with_lower_memory_allocation_than_it_uses_fails() {
                     None,
                     // Set memory allocation to 42 bytes (i.e. something ridiculously small).
                     Some(42),
-                    None,
                 )
                 .encode(),
             ),
@@ -837,7 +837,6 @@ fn installing_a_canister_with_lower_memory_allocation_than_it_uses_fails() {
                 canister_id,
                 UNIVERSAL_CANISTER_WASM.to_vec(),
                 vec![],
-                None,
                 None,
                 None,
             )
@@ -858,7 +857,6 @@ fn installing_a_canister_with_lower_memory_allocation_than_it_uses_fails() {
                     None,
                     // Set memory allocation to 10 bytes.
                     Some(10),
-                    None,
                 )
                 .encode(),
             ),
@@ -894,7 +892,6 @@ fn upgrading_a_canister_with_lower_memory_allocation_than_it_needs_fails() {
                 vec![],
                 None,
                 None,
-                None,
             )
             .encode(),
         )
@@ -912,7 +909,6 @@ fn upgrading_a_canister_with_lower_memory_allocation_than_it_needs_fails() {
                     vec![],
                     None,
                     Some(10),
-                    None,
                 )
                 .encode(),
             ),

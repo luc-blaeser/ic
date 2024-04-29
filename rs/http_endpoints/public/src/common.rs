@@ -1,11 +1,11 @@
 use crate::{state_reader_executor::StateReaderExecutor, HttpError};
-use axum::{body::Body, response::IntoResponse};
+use axum::{body::Body, extract::FromRequest, response::IntoResponse};
+use bytes::Bytes;
 use http::{
     header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
-    request::Parts,
-    HeaderValue, Method,
+    HeaderMap, HeaderValue, Method,
 };
-use http_body_util::{BodyExt, Empty, Full};
+use http_body_util::BodyExt;
 use hyper::{header, Response, StatusCode};
 use ic_crypto_tree_hash::{sparse_labeled_tree_from_paths, Label, Path, TooLongPathError};
 use ic_error_types::UserError;
@@ -14,20 +14,19 @@ use ic_logger::{info, warn, ReplicaLogger};
 use ic_registry_client_helpers::crypto::CryptoRegistry;
 use ic_replicated_state::ReplicatedState;
 use ic_types::{
-    crypto::threshold_sig::ThresholdSigPublicKey, messages::MessageId, PrincipalId,
-    RegistryVersion, SubnetId,
+    crypto::threshold_sig::ThresholdSigPublicKey, messages::MessageId, RegistryVersion, SubnetId,
 };
 use ic_validator::RequestValidationError;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_cbor::value::Value as CBOR;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tower::{load_shed::error::Overloaded, timeout::error::Elapsed, BoxError};
 use tower_http::cors::{CorsLayer, Vary};
 
-pub const CONTENT_TYPE_HTML: &str = "text/html";
 pub const CONTENT_TYPE_CBOR: &str = "application/cbor";
 pub const CONTENT_TYPE_PROTOBUF: &str = "application/x-protobuf";
+pub const CONTENT_TYPE_SVG: &str = "image/svg+xml";
 pub const CONTENT_TYPE_TEXT: &str = "text/plain";
 
 pub(crate) fn get_root_threshold_public_key(
@@ -57,39 +56,6 @@ pub(crate) fn make_plaintext_response(status: StatusCode, message: String) -> Re
         header::HeaderValue::from_static(CONTENT_TYPE_TEXT),
     );
     resp
-}
-
-/// Converts a user error into an HTTP response.
-///
-/// We need this conversion because we validate user requests twice:
-///
-///   1. Ingress filter checks user messages before including them in blocks
-///      so that we don't have to reach a consensus on payloads that we will
-///      throw away in the execution.
-///      We cannot put UserErrors produced at this stage in the state tree;
-///      We have to return them in the  HTTP body.
-///
-///   2. Once messages reach execution, we include UserErrors into the state tree.
-///      Users can fetch the details via the read_state endpoint.
-///
-/// make_response conversion applies the first case.
-pub(crate) fn make_response(user_error: UserError) -> Response<Body> {
-    let reject_response: CBOR = CBOR::Map(BTreeMap::from([
-        (
-            CBOR::Text("error_code".to_string()),
-            CBOR::Text(user_error.code().to_string()),
-        ),
-        (
-            CBOR::Text("reject_message".to_string()),
-            CBOR::Text(user_error.description().to_string()),
-        ),
-        (
-            CBOR::Text("reject_code".to_string()),
-            CBOR::Integer(user_error.reject_code() as i128),
-        ),
-    ]));
-
-    cbor_response(&reject_response).0
 }
 
 pub(crate) async fn map_box_error_to_response(err: BoxError) -> Response<Body> {
@@ -165,24 +131,80 @@ where
     }
 }
 
-/// Write the "self describing" CBOR tag and serialize the response
-pub(crate) fn cbor_response<R: Serialize>(r: &R) -> (Response<Body>, usize) {
-    let cbor = into_cbor(r);
-    let body_size_bytes = cbor.len();
-    let mut response = Response::new(Body::new(Full::from(cbor).map_err(BoxError::from)));
-    *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static(CONTENT_TYPE_CBOR),
-    );
-    (response, body_size_bytes)
+fn cbor_content_type(headers: &HeaderMap) -> bool {
+    let Some(content_type) = headers.get(header::CONTENT_TYPE) else {
+        return false;
+    };
+
+    let Ok(content_type) = content_type.to_str() else {
+        return false;
+    };
+
+    content_type.to_lowercase() == "application/cbor"
 }
 
-/// Empty response.
-pub(crate) fn empty_response() -> Response<Body> {
-    let mut response = Response::new(Body::new(Empty::new().map_err(BoxError::from)));
-    *response.status_mut() = StatusCode::NO_CONTENT;
-    response
+#[async_trait::async_trait]
+impl<T, S> FromRequest<S> for Cbor<T>
+where
+    T: for<'a> Deserialize<'a>,
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, String);
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        if cbor_content_type(req.headers()) {
+            let bytes = Bytes::from_request(req, state)
+                .await
+                .map_err(|e| (e.status(), e.body_text()))?;
+            match serde_cbor::from_slice(&bytes) {
+                Ok(value) => Ok(Cbor(value)),
+                Err(err) => Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to deserialize cbor request: {err}"),
+                )),
+            }
+        } else {
+            Err((
+                StatusCode::BAD_REQUEST,
+                format!("Unexpected content-type, expected {}.", CONTENT_TYPE_CBOR),
+            ))
+        }
+    }
+}
+
+/// Converts a user error into an HTTP response.
+///
+/// We need this conversion because we validate user requests twice:
+///
+///   1. Ingress filter checks user messages before including them in blocks
+///      so that we don't have to reach a consensus on payloads that we will
+///      throw away in the execution.
+///      We cannot put UserErrors produced at this stage in the state tree;
+///      We have to return them in the  HTTP body.
+///
+///   2. Once messages reach execution, we include UserErrors into the state tree.
+///      Users can fetch the details via the read_state endpoint.
+///
+/// make_response conversion applies the first case.
+pub struct CborUserError(pub UserError);
+
+impl IntoResponse for CborUserError {
+    fn into_response(self) -> axum::response::Response {
+        let reject_response: CBOR = CBOR::Map(BTreeMap::from([
+            (
+                CBOR::Text("error_code".to_string()),
+                CBOR::Text(self.0.code().to_string()),
+            ),
+            (
+                CBOR::Text("reject_message".to_string()),
+                CBOR::Text(self.0.description().to_string()),
+            ),
+            (
+                CBOR::Text("reject_code".to_string()),
+                CBOR::Integer(self.0.reject_code() as i128),
+            ),
+        ]));
+        Cbor(reject_response).into_response()
+    }
 }
 
 pub(crate) fn validation_error_to_http_error(
@@ -228,21 +250,6 @@ pub(crate) async fn get_latest_certified_state(
         .map(|r| r.0)
 }
 
-/// Remove the effective principal id from the request parts.
-/// The effective principal id is added to the request during routing by looking at the url.
-/// Returns an BAD_REQUEST response if the effective principal id is not found in the request parts.
-pub(crate) fn remove_effective_principal_id(
-    parts: &mut Parts,
-) -> Result<PrincipalId, Response<Body>> {
-    match parts.extensions.remove::<PrincipalId>() {
-        Some(principal_id) => Ok(principal_id),
-        _ => Err(make_plaintext_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to get effective principal id from request. This is a bug.".to_string(),
-        )),
-    }
-}
-
 // A few test helpers, improving readability in the tests
 #[cfg(test)]
 pub(crate) mod test {
@@ -257,7 +264,7 @@ pub(crate) mod test {
 
     #[test]
     fn test_cbor_response() {
-        let response = cbor_response(b"").0;
+        let response = Cbor(b"").into_response();
         assert_eq!(response.headers().len(), 1);
         assert_eq!(
             response

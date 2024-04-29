@@ -1,4 +1,4 @@
-use crate::erc20::CkTokenSymbol;
+use crate::erc20::{CkErc20Token, CkTokenSymbol};
 use crate::logs::DEBUG;
 use crate::memo::BurnMemo;
 use crate::numeric::LedgerBurnIndex;
@@ -28,6 +28,11 @@ pub enum LedgerBurnError {
         message: String,
         ledger: CkLedger,
     },
+    AmountTooLow {
+        minimum_burn_amount: Nat,
+        failed_burn_amount: Nat,
+        ledger: CkLedger,
+    },
     InsufficientFunds {
         balance: Nat,
         failed_burn_amount: Nat,
@@ -51,16 +56,14 @@ impl LedgerClient {
         }
     }
 
-    pub fn ckerc20_ledger_from_state(state: &State, token_symbol: &CkTokenSymbol) -> Option<Self> {
-        state
-            .find_ck_erc20_ledger(token_symbol)
-            .map(|ledger_canister_id| Self {
-                token_symbol: token_symbol.clone(),
-                client: ICRC1Client {
-                    runtime: CdkRuntime,
-                    ledger_canister_id,
-                },
-            })
+    pub fn ckerc20_ledger(token: &CkErc20Token) -> Self {
+        Self {
+            token_symbol: token.ckerc20_token_symbol.clone(),
+            client: ICRC1Client {
+                runtime: CdkRuntime,
+                ledger_canister_id: token.ckerc20_ledger_id,
+            },
+        }
     }
 
     pub async fn burn_from<A: Into<Nat>>(
@@ -98,7 +101,11 @@ impl LedgerClient {
                         panic!("BUG: bad fee, expected fee: {expected_fee}")
                     }
                     TransferFromError::BadBurn { min_burn_amount } => {
-                        panic!("BUG: bad burn, minimum burn amount: {min_burn_amount}")
+                        LedgerBurnError::AmountTooLow {
+                            minimum_burn_amount: min_burn_amount,
+                            failed_burn_amount: amount.clone(),
+                            ledger: self.ck_ledger(),
+                        }
                     }
                     TransferFromError::InsufficientFunds { balance } => {
                         LedgerBurnError::InsufficientFunds {

@@ -128,7 +128,7 @@ pub struct CyclesAccount {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Global {
-    #[prost(oneof = "global::Global", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "global::Global", tags = "1, 2, 3, 4, 5")]
     pub global: ::core::option::Option<global::Global>,
 }
 /// Nested message and enum types in `Global`.
@@ -144,6 +144,8 @@ pub mod global {
         F32(f32),
         #[prost(double, tag = "4")]
         F64(f64),
+        #[prost(bytes, tag = "5")]
+        V128(::prost::alloc::vec::Vec<u8>),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -542,6 +544,12 @@ pub struct CanisterLogRecord {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SnapshotId {
+    #[prost(bytes = "vec", tag = "1")]
+    pub content: ::prost::alloc::vec::Vec<u8>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CanisterStateBits {
     #[prost(uint64, tag = "2")]
     pub last_full_execution_round: u64,
@@ -628,6 +636,15 @@ pub struct CanisterStateBits {
     /// The index of the next log record to be created.
     #[prost(uint64, tag = "44")]
     pub next_canister_log_record_idx: u64,
+    /// The Wasm memory limit. This is a field in developer-visible canister
+    /// settings that allows the developer to limit the usage of the Wasm memory
+    /// by the canister to leave some room in 4GiB for upgrade calls.
+    /// See the interface specification for more information.
+    #[prost(uint64, optional, tag = "45")]
+    pub wasm_memory_limit: ::core::option::Option<u64>,
+    /// The next local snapshot ID.
+    #[prost(uint64, tag = "46")]
+    pub next_snapshot_id: u64,
     #[prost(oneof = "canister_state_bits::CanisterStatus", tags = "11, 12, 13")]
     pub canister_status: ::core::option::Option<canister_state_bits::CanisterStatus>,
 }

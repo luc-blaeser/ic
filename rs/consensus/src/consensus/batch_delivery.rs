@@ -26,14 +26,14 @@ use ic_protobuf::{
 };
 use ic_types::crypto::threshold_sig::ThresholdSigPublicKey;
 use ic_types::{
-    batch::{Batch, BatchMessages, BlockmakerMetrics},
+    batch::{Batch, BatchMessages, BlockmakerMetrics, ConsensusResponse},
     consensus::{
-        ecdsa::{self, CompletedSignature},
+        idkg::{self, CompletedSignature},
         Block,
     },
     crypto::threshold_sig::ni_dkg::{NiDkgId, NiDkgTag, NiDkgTranscript},
-    messages::{CallbackId, Payload, RejectContext, Response, NO_DEADLINE},
-    CanisterId, Cycles, Height, PrincipalId, Randomness, ReplicaVersion, SubnetId,
+    messages::{CallbackId, Payload, RejectContext},
+    Height, PrincipalId, Randomness, ReplicaVersion, SubnetId,
 };
 use std::collections::BTreeMap;
 
@@ -202,8 +202,22 @@ pub fn deliver_batches(
             failed_blockmakers: blockmaker_ranking[0..(block.rank.0 as usize)].to_vec(),
         };
 
+        let Some(summary_block) = pool.dkg_summary_block_for_finalized_height(height) else {
+            warn!(
+                every_n_seconds => 30,
+                log,
+                "Do not deliver height {} because no summary block was found. \
+                Finalized height: {}",
+                height,
+                finalized_height
+            );
+            break;
+        };
+        let dkg_summary = &summary_block.payload.as_ref().as_summary().dkg;
+        let next_checkpoint_height = dkg_summary.get_next_start_height();
         let batch = Batch {
             batch_number: height,
+            next_checkpoint_height: Some(next_checkpoint_height),
             requires_full_state_hash,
             messages: batch_messages,
             randomness,
@@ -245,8 +259,8 @@ pub fn generate_responses_to_subnet_calls(
     block: &Block,
     stats: &mut BatchStats,
     log: &ReplicaLogger,
-) -> Vec<Response> {
-    let mut consensus_responses = Vec::<Response>::new();
+) -> Vec<ConsensusResponse> {
+    let mut consensus_responses = Vec::new();
     let block_payload = &block.payload;
     if block_payload.is_summary() {
         let summary = block_payload.as_ref().as_summary();
@@ -284,8 +298,8 @@ struct TranscriptResults {
 pub fn generate_responses_to_setup_initial_dkg_calls(
     transcripts_for_new_subnets: &[(NiDkgId, CallbackId, Result<NiDkgTranscript, String>)],
     log: &ReplicaLogger,
-) -> Vec<Response> {
-    let mut consensus_responses = Vec::<Response>::new();
+) -> Vec<ConsensusResponse> {
+    let mut consensus_responses = Vec::new();
 
     let mut transcripts: BTreeMap<CallbackId, TranscriptResults> = BTreeMap::new();
 
@@ -326,23 +340,14 @@ pub fn generate_responses_to_setup_initial_dkg_calls(
         };
     }
 
-    for (callback_id, transcript_results) in transcripts.into_iter() {
+    for (callback, transcript_results) in transcripts.into_iter() {
         let payload = generate_dkg_response_payload(
             transcript_results.low_threshold.as_ref(),
             transcript_results.high_threshold.as_ref(),
             log,
         );
-        if let Some(response_payload) = payload {
-            consensus_responses.push(Response {
-                originator: CanisterId::ic_00(),
-                respondent: CanisterId::ic_00(),
-                originator_reply_callback: callback_id,
-                refund: Cycles::zero(),
-                response_payload,
-                // Not relevant, the consensus queue is flushed every round by the
-                // scheduler, which uses only the payload and originator callback.
-                deadline: NO_DEADLINE,
-            });
+        if let Some(payload) = payload {
+            consensus_responses.push(ConsensusResponse::new(callback, payload));
         }
     }
     consensus_responses
@@ -423,9 +428,9 @@ fn generate_dkg_response_payload(
 /// Creates responses to `SignWithECDSA` system calls with the computed
 /// signature.
 pub fn generate_responses_to_sign_with_ecdsa_calls(
-    ecdsa_payload: &ecdsa::EcdsaPayload,
-) -> Vec<Response> {
-    let mut consensus_responses = Vec::<Response>::new();
+    ecdsa_payload: &idkg::EcdsaPayload,
+) -> Vec<ConsensusResponse> {
+    let mut consensus_responses = Vec::new();
     for completed in ecdsa_payload.signature_agreements.values() {
         if let CompletedSignature::Unreported(response) = completed {
             consensus_responses.push(response.clone());
@@ -437,11 +442,11 @@ pub fn generate_responses_to_sign_with_ecdsa_calls(
 /// Creates responses to `ComputeInitialEcdsaDealingsArgs` system calls with the initial
 /// dealings.
 fn generate_responses_to_initial_dealings_calls(
-    ecdsa_payload: &ecdsa::EcdsaPayload,
-) -> Vec<Response> {
-    let mut consensus_responses = Vec::<Response>::new();
+    ecdsa_payload: &idkg::EcdsaPayload,
+) -> Vec<ConsensusResponse> {
+    let mut consensus_responses = Vec::new();
     for agreement in ecdsa_payload.xnet_reshare_agreements.values() {
-        if let ecdsa::CompletedReshareRequest::Unreported(response) = agreement {
+        if let idkg::CompletedReshareRequest::Unreported(response) = agreement {
             consensus_responses.push(response.clone());
         }
     }

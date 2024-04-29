@@ -15,7 +15,7 @@ end::catalog[] */
 
 use super::utils::rw_message::install_nns_and_check_progress;
 use super::utils::ssh_access::execute_bash_command;
-use super::utils::upgrade::{bless_replica_version, update_subnet_replica_version};
+use super::utils::upgrade::{bless_replica_version, deploy_guestos_to_all_subnet_nodes};
 use crate::orchestrator::utils::rw_message::{
     can_read_msg_with_retries, cert_state_makes_no_progress_with_retries,
     store_message_with_retries,
@@ -29,6 +29,7 @@ use crate::{
         test_env_api::*,
     },
     orchestrator::utils::upgrade::get_assigned_replica_version,
+    retry_with_msg,
 };
 use anyhow::bail;
 use ic_registry_subnet_type::SubnetType;
@@ -82,7 +83,7 @@ pub fn test(test_env: TestEnv) {
     ));
 
     let subnet_id = test_env.topology_snapshot().root_subnet_id();
-    block_on(update_subnet_replica_version(
+    block_on(deploy_guestos_to_all_subnet_nodes(
         &nns_node,
         &ReplicaVersion::try_from(format!("{}-test", target_version))
             .expect("Wrong format of the version"),
@@ -94,15 +95,19 @@ pub fn test(test_env: TestEnv) {
         let session = nns_node
             .block_on_ssh_session()
             .expect("Failed to establish SSH session");
-
-        info!(logger, "Wait for 'hash mismatch' in the replica's log.");
-        retry(test_env.logger(), secs(600), secs(20), || {
-            if have_sha_errors(&session) {
-                Ok(())
-            } else {
-                bail!("Waiting for hash mismatch!")
+        retry_with_msg!(
+            "check for 'hash mismatch' in the replica's log",
+            test_env.logger(),
+            secs(600),
+            secs(20),
+            || {
+                if have_sha_errors(&session) {
+                    Ok(())
+                } else {
+                    bail!("Waiting for hash mismatch!")
+                }
             }
-        })
+        )
         .expect("No hash mismatch in the logs");
     }
 
@@ -154,7 +159,8 @@ pub fn test(test_env: TestEnv) {
     info!(logger, "Waiting for update to finish on all 3 nodes...");
     let updated_version = format!("{}-test", target_version);
     for n in &nodes {
-        retry(
+        retry_with_msg!(
+            format!("check if all 3 nodes have version {}", updated_version),
             test_env.logger(),
             secs(1800),
             secs(60),
@@ -171,7 +177,7 @@ pub fn test(test_env: TestEnv) {
                     }
                 }
                 Err(err) => bail!("Can't read version: {}", err),
-            },
+            }
         )
         .expect("Node hasn't upgraded");
     }

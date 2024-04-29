@@ -174,6 +174,10 @@ impl CanisterState {
         )
     }
 
+    pub fn new_local_snapshot_id(&mut self) -> u64 {
+        self.system_state.new_local_snapshot_id()
+    }
+
     /// See `SystemState::push_input` for documentation.
     ///
     /// The function is public as we push directly to the Canister state in
@@ -460,6 +464,11 @@ impl CanisterState {
         }
     }
 
+    /// Returns the Wasm memory limit from the canister settings.
+    pub fn wasm_memory_limit(&self) -> Option<NumBytes> {
+        self.system_state.wasm_memory_limit
+    }
+
     /// Returns the current compute allocation for the canister.
     pub fn compute_allocation(&self) -> ComputeAllocation {
         self.scheduler_state.compute_allocation
@@ -566,6 +575,10 @@ impl CanisterState {
 
     pub fn append_log(&mut self, other: &mut CanisterLog) {
         self.system_state.canister_log.append(other);
+    }
+
+    pub fn clear_log(&mut self) {
+        self.system_state.canister_log.clear();
     }
 }
 

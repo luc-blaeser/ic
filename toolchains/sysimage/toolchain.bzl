@@ -12,11 +12,9 @@ def _build_container_base_image_impl(ctx):
     args.extend(["--output", output_tar_file.path])
     outputs.append(output_tar_file)
 
-    # All files in the rootfs are inputs.
-    # But only the directory is passed to the script
-    context_dir = ctx.files.context_files[0].dirname
     inputs += ctx.files.context_files
-    args.extend(["--context_dir", context_dir])
+    for context_file in ctx.files.context_files:
+        args.extend(["--context-file", context_file.path])
 
     args.extend(["--image_tag", ctx.attr.image_tag])
 
@@ -51,7 +49,6 @@ def _build_container_base_image_impl(ctx):
 build_container_base_image = rule(
     implementation = _build_container_base_image_impl,
     attrs = {
-        # Glob of files from the rootfs
         "context_files": attr.label_list(
             allow_files = True,
         ),
@@ -77,11 +74,13 @@ def _build_container_filesystem_impl(ctx):
     args.extend(["--output", output_tar_file.path])
     outputs.append(output_tar_file)
 
-    # All files in the rootfs are inputs.
-    # But only the directory is passed to the script
-    context_dir = ctx.files.context_files[0].dirname
     inputs += ctx.files.context_files
-    args.extend(["--context-dir", context_dir])
+    for context_file in ctx.files.context_files:
+        args.extend(["--context-file", context_file.path])
+
+    for input_target, install_target in ctx.attr.rootfs_files.items():
+        args.extend(["--rootfs-file", input_target.files.to_list()[0].path + ":" + install_target])
+        inputs += input_target.files.to_list()
 
     config_file = ctx.file.config_file
     inputs.append(config_file)
@@ -118,8 +117,10 @@ def _build_container_filesystem_impl(ctx):
 build_container_filesystem = rule(
     implementation = _build_container_filesystem_impl,
     attrs = {
-        # Glob of files from the rootfs
         "context_files": attr.label_list(
+            allow_files = True,
+        ),
+        "rootfs_files": attr.label_keyed_string_dict(
             allow_files = True,
         ),
         "config_file": attr.label(
@@ -142,6 +143,7 @@ build_container_filesystem = rule(
 
 def _vfat_image_impl(ctx):
     tool = ctx.files._build_vfat_image[0]
+    dflate = ctx.files._dflate[0]
 
     if len(ctx.files.src) > 0:
         args = ["-i", ctx.files.src[0].path]
@@ -158,6 +160,8 @@ def _vfat_image_impl(ctx):
         ctx.attr.partition_size,
         "-p",
         ctx.attr.subdir,
+        "-d",
+        dflate.path,
     ]
 
     for input_target, install_target in ctx.attr.extra_files.items():
@@ -169,7 +173,7 @@ def _vfat_image_impl(ctx):
         arguments = args,
         inputs = inputs,
         outputs = [out],
-        tools = [tool],
+        tools = [tool, dflate],
     )
 
     return [DefaultInfo(files = depset([out]))]
@@ -194,11 +198,16 @@ vfat_image = rule(
             allow_files = True,
             default = ":build_vfat_image.py",
         ),
+        "_dflate": attr.label(
+            allow_files = True,
+            default = "//rs/ic_os/dflate",
+        ),
     },
 )
 
 def _fat32_image_impl(ctx):
     tool = ctx.files._build_fat32_image[0]
+    dflate = ctx.files._dflate[0]
 
     if len(ctx.files.src) > 0:
         args = ["-i", ctx.files.src[0].path]
@@ -215,6 +224,8 @@ def _fat32_image_impl(ctx):
         ctx.attr.partition_size,
         "-p",
         ctx.attr.subdir,
+        "-d",
+        dflate.path,
     ]
 
     for input_target, install_target in ctx.attr.extra_files.items():
@@ -229,7 +240,7 @@ def _fat32_image_impl(ctx):
         arguments = args,
         inputs = inputs,
         outputs = [out],
-        tools = [tool],
+        tools = [tool, dflate],
     )
 
     return [DefaultInfo(files = depset([out]))]
@@ -255,11 +266,16 @@ fat32_image = rule(
             allow_files = True,
             default = ":build_fat32_image.py",
         ),
+        "_dflate": attr.label(
+            allow_files = True,
+            default = "//rs/ic_os/dflate",
+        ),
     },
 )
 
 def _ext4_image_impl(ctx):
     tool = ctx.files._build_ext4_image[0]
+    dflate = ctx.files._dflate[0]
 
     out = ctx.actions.declare_file(ctx.label.name)
 
@@ -276,14 +292,12 @@ def _ext4_image_impl(ctx):
         ctx.attr.partition_size,
         "-p",
         ctx.attr.subdir,
+        "-d",
+        dflate.path,
     ]
     if len(ctx.files.file_contexts) > 0:
         args += ["-S", ctx.files.file_contexts[0].path]
         inputs += ctx.files.file_contexts
-
-    for input_target, install_target in ctx.attr.extra_files.items():
-        args.append(input_target.files.to_list()[0].path + ":" + install_target)
-        inputs += input_target.files.to_list()
 
     if len(ctx.attr.strip_paths) > 0:
         args += ["--strip-paths"] + ctx.attr.strip_paths
@@ -293,7 +307,7 @@ def _ext4_image_impl(ctx):
         arguments = args,
         inputs = inputs,
         outputs = [out],
-        tools = [tool],
+        tools = [tool, dflate],
     )
 
     return [DefaultInfo(files = depset([out]))]
@@ -308,10 +322,6 @@ ext4_image = rule(
             allow_files = True,
             mandatory = False,
         ),
-        "extra_files": attr.label_keyed_string_dict(
-            allow_files = True,
-            mandatory = False,
-        ),
         "strip_paths": attr.string_list(),
         "partition_size": attr.string(
             mandatory = True,
@@ -323,11 +333,83 @@ ext4_image = rule(
             allow_files = True,
             default = ":build_ext4_image.py",
         ),
+        "_dflate": attr.label(
+            allow_files = True,
+            default = "//rs/ic_os/dflate",
+        ),
+    },
+)
+
+def _inject_files_impl(ctx):
+    tool = ctx.files._inject_files[0]
+    dflate = ctx.files._dflate[0]
+
+    out = ctx.actions.declare_file(ctx.label.name)
+
+    inputs = [ctx.files.base[0]]
+
+    args = [
+        "--input",
+        ctx.files.base[0].path,
+        "--output",
+        out.path,
+        "-d",
+        dflate.path,
+    ]
+
+    if len(ctx.files.file_contexts) > 0:
+        args += ["--file-contexts", ctx.files.file_contexts[0].path]
+        inputs += ctx.files.file_contexts
+
+    if ctx.attr.prefix:
+        args += ["--prefix", ctx.attr.prefix]
+
+    for input_target, install_target in ctx.attr.extra_files.items():
+        args.append(input_target.files.to_list()[0].path + ":" + install_target)
+        inputs += input_target.files.to_list()
+
+    ctx.actions.run(
+        executable = tool.path,
+        arguments = args,
+        inputs = inputs,
+        outputs = [out],
+        tools = [tool, dflate],
+    )
+
+    return [DefaultInfo(files = depset([out]))]
+
+inject_files = rule(
+    implementation = _inject_files_impl,
+    attrs = {
+        "base": attr.label(
+            allow_files = True,
+            mandatory = True,
+        ),
+        "extra_files": attr.label_keyed_string_dict(
+            allow_files = True,
+            mandatory = True,
+        ),
+        "file_contexts": attr.label(
+            allow_files = True,
+            mandatory = False,
+        ),
+        "prefix": attr.string(
+            mandatory = False,
+        ),
+        "_inject_files": attr.label(
+            allow_files = True,
+            default = "//rs/ic_os/inject_files:inject-files",
+        ),
+        "_dflate": attr.label(
+            allow_files = True,
+            default = "//rs/ic_os/dflate",
+        ),
     },
 )
 
 def _disk_image_impl(ctx):
     tool_file = ctx.files._build_disk_image_tool[0]
+    dflate = ctx.files._dflate[0]
 
     in_layout = ctx.files.layout[0]
     partitions = ctx.files.partitions
@@ -338,21 +420,19 @@ def _disk_image_impl(ctx):
     for p in partitions:
         partition_files.append(p.path)
 
-    args = "python3 %s -p %s -o %s" % (
-        tool_file.path,
-        in_layout.path,
-        out.path,
-    )
+    args = ["-p", in_layout.path, "-o", out.path, "-d", dflate.path]
 
     if expanded_size:
-        args += " -s %s" % expanded_size
+        args += ["-s", expanded_size]
 
-    args += " " + " ".join(partition_files)
+    args += partition_files
 
-    ctx.actions.run_shell(
+    ctx.actions.run(
+        executable = tool_file.path,
+        arguments = args,
         inputs = [in_layout] + partitions,
         outputs = [out],
-        command = args,
+        tools = [tool_file, dflate],
     )
 
     return [DefaultInfo(files = depset([out]))]
@@ -372,11 +452,16 @@ disk_image = rule(
             allow_files = True,
             default = ":build_disk_image.py",
         ),
+        "_dflate": attr.label(
+            allow_files = True,
+            default = "//rs/ic_os/dflate",
+        ),
     },
 )
 
 def _lvm_image_impl(ctx):
     tool_file = ctx.files._build_lvm_image_tool[0]
+    dflate = ctx.files._dflate[0]
 
     in_layout = ctx.files.layout[0]
     vg_name = ctx.attr.vg_name
@@ -389,21 +474,16 @@ def _lvm_image_impl(ctx):
     for p in partitions:
         partition_files.append(p.path)
 
-    args = "python3 %s -v %s -n %s -u %s -p %s -o %s" % (
-        tool_file.path,
-        in_layout.path,
-        vg_name,
-        vg_uuid,
-        pv_uuid,
-        out.path,
-    )
+    args = ["-v", in_layout.path, "-n", vg_name, "-u", vg_uuid, "-p", pv_uuid, "-o", out.path, "-d", dflate.path]
 
-    args += " " + " ".join(partition_files)
+    args += partition_files
 
-    ctx.actions.run_shell(
+    ctx.actions.run(
+        executable = tool_file.path,
+        arguments = args,
         inputs = [in_layout] + partitions,
         outputs = [out],
-        command = args,
+        tools = [tool_file, dflate],
     )
 
     return [DefaultInfo(files = depset([out]))]
@@ -425,32 +505,32 @@ lvm_image = rule(
             allow_files = True,
             default = ":build_lvm_image.py",
         ),
+        "_dflate": attr.label(
+            allow_files = True,
+            default = "//rs/ic_os/dflate",
+        ),
     },
 )
 
 def _upgrade_image_impl(ctx):
     tool_file = ctx.files._build_upgrade_image_tool[0]
+    dflate = ctx.files._dflate[0]
 
     in_boot_partition = ctx.files.boot_partition[0]
     in_root_partition = ctx.files.root_partition[0]
     in_version_file = ctx.files.version_file[0]
     out = ctx.actions.declare_file(ctx.label.name)
 
-    if ctx.attr.compression:
-        compress = "-c %s" % ctx.attr.compression
-    else:
-        compress = ""
-
     ctx.actions.run_shell(
         inputs = [in_boot_partition, in_root_partition, in_version_file],
         outputs = [out],
-        command = "python3 %s -b %s -r %s -v %s %s -o %s" % (
+        command = "python3 %s -b %s -r %s -v %s -o %s -d %s" % (
             tool_file.path,
             in_boot_partition.path,
             in_root_partition.path,
             in_version_file.path,
-            compress,
             out.path,
+            dflate.path,
         ),
     )
 
@@ -471,12 +551,13 @@ upgrade_image = rule(
             allow_files = True,
             mandatory = True,
         ),
-        "compression": attr.string(
-            default = "",
-        ),
         "_build_upgrade_image_tool": attr.label(
             allow_files = True,
             default = ":build_upgrade_image.py",
+        ),
+        "_dflate": attr.label(
+            allow_files = True,
+            default = "//rs/ic_os/dflate",
         ),
     },
 )
@@ -537,32 +618,3 @@ sha256sum = rule(
         ),
     },
 )
-
-def summary_sha256sum(name, inputs, suffix = ""):
-    """Compute summary sha256 of image inputs.
-
-    Args:
-      name: Name of the target to be built
-      inputs: Input files to hash
-      suffix: Suffix string to append to hash (only chars, numbers and dash allowed)
-
-    This macro expands to individual rules that compute the sha256 of the
-    individual inputs into the filesystem image artifacts, and computes
-    a summary sha256 combining all into a single hash.
-    """
-    all_deps = {}
-    for _, deps in inputs.items():
-        all_deps.update(deps)
-    labels = []
-    for dep in all_deps.keys():
-        label = name + "@" + dep.split(":")[1] + ".sha256"
-        sha256sum(
-            name = label,
-            srcs = [dep],
-        )
-        labels.append(":" + label)
-    sha256sum(
-        name = name,
-        srcs = labels,
-        suffix = suffix,
-    )

@@ -38,6 +38,7 @@ use std::{
 };
 use std::{collections::BTreeSet, sync::Arc};
 use std::{collections::VecDeque, str::FromStr};
+use strum_macros::EnumIter;
 
 lazy_static! {
     static ref DEFAULT_PRINCIPAL_MULTIPLE_CONTROLLERS: PrincipalId =
@@ -50,20 +51,20 @@ lazy_static! {
 pub const MAX_CANISTER_HISTORY_CHANGES: u64 = 20;
 
 /// Enumerates use cases of consumed cycles.
-#[derive(Clone, Copy, Debug, PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize, EnumIter)]
 pub enum CyclesUseCase {
-    Memory,
-    ComputeAllocation,
-    IngressInduction,
-    Instructions,
-    RequestAndResponseTransmission,
-    Uninstall,
-    CanisterCreation,
-    ECDSAOutcalls,
-    HTTPOutcalls,
-    DeletedCanisters,
-    NonConsumed,
-    BurnedCycles,
+    Memory = 1,
+    ComputeAllocation = 2,
+    IngressInduction = 3,
+    Instructions = 4,
+    RequestAndResponseTransmission = 5,
+    Uninstall = 6,
+    CanisterCreation = 7,
+    ECDSAOutcalls = 8,
+    HTTPOutcalls = 9,
+    DeletedCanisters = 10,
+    NonConsumed = 11,
+    BurnedCycles = 12,
 }
 
 impl CyclesUseCase {
@@ -87,41 +88,49 @@ impl CyclesUseCase {
     }
 }
 
-impl From<CyclesUseCase> for i32 {
+impl From<CyclesUseCase> for pb::CyclesUseCase {
     fn from(item: CyclesUseCase) -> Self {
         match item {
-            CyclesUseCase::Memory => 1,
-            CyclesUseCase::ComputeAllocation => 2,
-            CyclesUseCase::IngressInduction => 3,
-            CyclesUseCase::Instructions => 4,
-            CyclesUseCase::RequestAndResponseTransmission => 5,
-            CyclesUseCase::Uninstall => 6,
-            CyclesUseCase::CanisterCreation => 7,
-            CyclesUseCase::ECDSAOutcalls => 8,
-            CyclesUseCase::HTTPOutcalls => 9,
-            CyclesUseCase::DeletedCanisters => 10,
-            CyclesUseCase::NonConsumed => 11,
-            CyclesUseCase::BurnedCycles => 12,
+            CyclesUseCase::Memory => pb::CyclesUseCase::Memory,
+            CyclesUseCase::ComputeAllocation => pb::CyclesUseCase::ComputeAllocation,
+            CyclesUseCase::IngressInduction => pb::CyclesUseCase::IngressInduction,
+            CyclesUseCase::Instructions => pb::CyclesUseCase::Instructions,
+            CyclesUseCase::RequestAndResponseTransmission => {
+                pb::CyclesUseCase::RequestAndResponseTransmission
+            }
+            CyclesUseCase::Uninstall => pb::CyclesUseCase::Uninstall,
+            CyclesUseCase::CanisterCreation => pb::CyclesUseCase::CanisterCreation,
+            CyclesUseCase::ECDSAOutcalls => pb::CyclesUseCase::EcdsaOutcalls,
+            CyclesUseCase::HTTPOutcalls => pb::CyclesUseCase::HttpOutcalls,
+            CyclesUseCase::DeletedCanisters => pb::CyclesUseCase::DeletedCanisters,
+            CyclesUseCase::NonConsumed => pb::CyclesUseCase::NonConsumed,
+            CyclesUseCase::BurnedCycles => pb::CyclesUseCase::BurnedCycles,
         }
     }
 }
 
-impl From<i32> for CyclesUseCase {
-    fn from(item: i32) -> Self {
+impl TryFrom<pb::CyclesUseCase> for CyclesUseCase {
+    type Error = ProxyDecodeError;
+    fn try_from(item: pb::CyclesUseCase) -> Result<Self, Self::Error> {
         match item {
-            1 => Self::Memory,
-            2 => Self::ComputeAllocation,
-            3 => Self::IngressInduction,
-            4 => Self::Instructions,
-            5 => Self::RequestAndResponseTransmission,
-            6 => Self::Uninstall,
-            7 => Self::CanisterCreation,
-            8 => Self::ECDSAOutcalls,
-            9 => Self::HTTPOutcalls,
-            10 => Self::DeletedCanisters,
-            11 => Self::NonConsumed,
-            12 => Self::BurnedCycles,
-            _ => panic!("Unsupported value"),
+            pb::CyclesUseCase::Unspecified => Err(ProxyDecodeError::ValueOutOfRange {
+                typ: "CyclesUseCase",
+                err: format!("Unexpected value of cycles use case: {:?}", item),
+            }),
+            pb::CyclesUseCase::Memory => Ok(Self::Memory),
+            pb::CyclesUseCase::ComputeAllocation => Ok(Self::ComputeAllocation),
+            pb::CyclesUseCase::IngressInduction => Ok(Self::IngressInduction),
+            pb::CyclesUseCase::Instructions => Ok(Self::Instructions),
+            pb::CyclesUseCase::RequestAndResponseTransmission => {
+                Ok(Self::RequestAndResponseTransmission)
+            }
+            pb::CyclesUseCase::Uninstall => Ok(Self::Uninstall),
+            pb::CyclesUseCase::CanisterCreation => Ok(Self::CanisterCreation),
+            pb::CyclesUseCase::EcdsaOutcalls => Ok(Self::ECDSAOutcalls),
+            pb::CyclesUseCase::HttpOutcalls => Ok(Self::HTTPOutcalls),
+            pb::CyclesUseCase::DeletedCanisters => Ok(Self::DeletedCanisters),
+            pb::CyclesUseCase::NonConsumed => Ok(Self::NonConsumed),
+            pb::CyclesUseCase::BurnedCycles => Ok(Self::BurnedCycles),
         }
     }
 }
@@ -281,7 +290,7 @@ pub struct SystemState {
     /// empty blob.
     ///
     /// See also:
-    ///   * https://sdk.dfinity.org/docs/interface-spec/index.html#system-api-certified-data
+    ///   * https://internetcomputer.org/docs/current/references/ic-interface-spec#system-api-certified-data
     pub certified_data: Vec<u8>,
     pub canister_metrics: CanisterMetrics,
 
@@ -339,6 +348,15 @@ pub struct SystemState {
 
     /// Log records of the canister.
     pub canister_log: CanisterLog,
+
+    /// The Wasm memory limit. This is a field in developer-visible canister
+    /// settings that allows the developer to limit the usage of the Wasm memory
+    /// by the canister to leave some room in 4GiB for upgrade calls.
+    /// See the interface specification for more information.
+    pub wasm_memory_limit: Option<NumBytes>,
+
+    /// Next local snapshot id.
+    pub next_snapshot_id: u64,
 }
 
 /// A wrapper around the different canister statuses.
@@ -500,11 +518,8 @@ impl From<&ExecutionTask> for pb::ExecutionTask {
                     CanisterMessageOrTask::Message(CanisterMessage::Ingress(v)) => {
                         PbInput::Ingress(v.as_ref().into())
                     }
-                    CanisterMessageOrTask::Task(CanisterTask::Heartbeat) => {
-                        PbInput::Task(PbCanisterTask::Heartbeat as i32)
-                    }
-                    CanisterMessageOrTask::Task(CanisterTask::GlobalTimer) => {
-                        PbInput::Task(PbCanisterTask::Timer as i32)
+                    CanisterMessageOrTask::Task(task) => {
+                        PbInput::Task(PbCanisterTask::from(task).into())
                     }
                 };
                 Self {
@@ -566,22 +581,12 @@ impl TryFrom<pb::ExecutionTask> for ExecutionTask {
                         CanisterMessage::Ingress(Arc::new(v.try_into()?)),
                     ),
                     PbInput::Task(val) => {
-                        let task = PbCanisterTask::try_from(val).map_err(|_| {
-                            ProxyDecodeError::ValueOutOfRange {
+                        let task = CanisterTask::try_from(PbCanisterTask::try_from(val).map_err(
+                            |_| ProxyDecodeError::ValueOutOfRange {
                                 typ: "CanisterTask",
                                 err: format!("Unexpected value of canister task: {}", val),
-                            }
-                        })?;
-                        let task = match task {
-                            PbCanisterTask::Unspecified => {
-                                return Err(ProxyDecodeError::ValueOutOfRange {
-                                    typ: "CanisterTask",
-                                    err: "Unexpected value: Unspecified".to_string(),
-                                });
-                            }
-                            PbCanisterTask::Heartbeat => CanisterTask::Heartbeat,
-                            PbCanisterTask::Timer => CanisterTask::GlobalTimer,
-                        };
+                            },
+                        )?)?;
                         CanisterMessageOrTask::Task(task)
                     }
                 };
@@ -710,27 +715,9 @@ impl SystemState {
             wasm_chunk_store,
             log_visibility: LogVisibility::default(),
             canister_log: Default::default(),
+            wasm_memory_limit: None,
+            next_snapshot_id: 0,
         }
-    }
-
-    /// Create a SystemState only having a canister_id -- this is the
-    /// state that is expected when the "start" method of the wasm
-    /// module is run. There is nothing interesting in the system state
-    /// that can be accessed at that point in time, hence this
-    /// "slightly" fake system state.
-    pub fn new_for_start(
-        canister_id: CanisterId,
-        fd_factory: Arc<dyn PageAllocatorFileDescriptor>,
-    ) -> Self {
-        let controller = *canister_id.get_ref();
-        Self::new_internal(
-            canister_id,
-            controller,
-            Cycles::zero(),
-            NumSeconds::from(0),
-            CanisterStatus::Stopped,
-            WasmChunkStore::new(fd_factory),
-        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -755,6 +742,8 @@ impl SystemState {
         wasm_chunk_store_metadata: WasmChunkStoreMetadata,
         log_visibility: LogVisibility,
         canister_log: CanisterLog,
+        wasm_memory_limit: Option<NumBytes>,
+        next_snapshot_id: u64,
     ) -> Self {
         Self {
             controllers,
@@ -779,6 +768,8 @@ impl SystemState {
             ),
             log_visibility,
             canister_log,
+            wasm_memory_limit,
+            next_snapshot_id,
         }
     }
 
@@ -894,6 +885,13 @@ impl SystemState {
     /// Sets `reserved_balance_limit` to `None` for testing.
     pub fn clear_reserved_balance_limit_for_testing(&mut self) {
         self.reserved_balance_limit = None;
+    }
+
+    /// Get new local snapshot ID.
+    pub fn new_local_snapshot_id(&mut self) -> u64 {
+        let local_snapshot_id = self.next_snapshot_id;
+        self.next_snapshot_id += 1;
+        local_snapshot_id
     }
 
     /// Records the given amount as debit that will be charged from the balance

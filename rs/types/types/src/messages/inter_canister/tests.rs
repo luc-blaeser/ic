@@ -1,3 +1,8 @@
+use crate::messages::{
+    MAX_INTER_CANISTER_PAYLOAD_IN_BYTES, MAX_INTER_CANISTER_PAYLOAD_IN_BYTES_U64,
+    MAX_RESPONSE_COUNT_BYTES,
+};
+
 use super::*;
 use ic_types_test_utils::ids::canister_test_id;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -60,4 +65,56 @@ fn hash<T: Hash>(value: &T) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Checks that a response with a maximum size payload (reply or reject) has
+/// exactly `MAX_RESPONSE_COUNT_BYTES`.
+#[test]
+fn max_response_count_bytes() {
+    // Sanity check.
+    assert_eq!(
+        MAX_INTER_CANISTER_PAYLOAD_IN_BYTES_U64,
+        MAX_INTER_CANISTER_PAYLOAD_IN_BYTES.get()
+    );
+
+    // A reply with a maximum size payload.
+    let response = Response {
+        originator: canister_test_id(1),
+        respondent: canister_test_id(2),
+        originator_reply_callback: CallbackId::new(3),
+        refund: Cycles::new(4),
+        response_payload: Payload::Data(vec![5; MAX_INTER_CANISTER_PAYLOAD_IN_BYTES_U64 as usize]),
+        deadline: NO_DEADLINE,
+    };
+    // Its payload size must be exactly `MAX_INTER_CANISTER_PAYLOAD_IN_BYTES`.
+    assert_eq!(
+        MAX_INTER_CANISTER_PAYLOAD_IN_BYTES,
+        response.payload_size_bytes()
+    );
+    // And its total size must be exactly `MAX_RESPONSE_COUNT_BYTES`.
+    assert_eq!(MAX_RESPONSE_COUNT_BYTES, response.count_bytes());
+
+    // A reject response with a maximum size payload.
+    let max_reject_payload_size =
+        MAX_INTER_CANISTER_PAYLOAD_IN_BYTES_U64 as usize - std::mem::size_of::<RejectCode>();
+    let reject = Response {
+        originator: canister_test_id(1),
+        respondent: canister_test_id(2),
+        originator_reply_callback: CallbackId::new(3),
+        refund: Cycles::new(4),
+        response_payload: Payload::Reject(RejectContext {
+            code: RejectCode::CanisterError,
+            message: (0..max_reject_payload_size)
+                .map(|_| 'A')
+                .collect::<String>(),
+        }),
+        deadline: NO_DEADLINE,
+    };
+    // Its payload size must be exactly `MAX_INTER_CANISTER_PAYLOAD_IN_BYTES`.
+    assert_eq!(
+        MAX_INTER_CANISTER_PAYLOAD_IN_BYTES,
+        reject.payload_size_bytes()
+    );
+    // And its total size must be exactly `MAX_RESPONSE_COUNT_BYTES`.
+    assert_eq!(MAX_RESPONSE_COUNT_BYTES, reject.count_bytes());
 }

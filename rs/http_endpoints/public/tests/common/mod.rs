@@ -40,10 +40,8 @@ use ic_replicated_state::{
     canister_snapshots::CanisterSnapshots, CanisterQueues, NetworkTopology, ReplicatedState,
     SystemMetadata,
 };
-use ic_test_utilities::{
-    crypto::{temp_crypto_component_with_fake_registry, CryptoReturningOk},
-    state::ReplicatedStateBuilder,
-};
+use ic_test_utilities::crypto::{temp_crypto_component_with_fake_registry, CryptoReturningOk};
+use ic_test_utilities_state::ReplicatedStateBuilder;
 use ic_test_utilities_types::ids::{node_test_id, subnet_test_id};
 use ic_types::{
     artifact::UnvalidatedArtifactMutation,
@@ -468,7 +466,6 @@ impl HttpEndpointBuilder {
         ingress_pool_throtller
             .expect_exceeds_threshold()
             .returning(|| false);
-
         start_server(
             self.rt_handle,
             &metrics,
@@ -492,6 +489,7 @@ impl HttpEndpointBuilder {
             MaliciousFlags::default(),
             self.delegation_from_nns,
             self.pprof_collector,
+            ic_tracing::ReloadHandles::new(tracing_subscriber::reload::Layer::new(vec![]).1),
         );
         (ingress_filter_handle, ingress_rx, query_exe_handler)
     }

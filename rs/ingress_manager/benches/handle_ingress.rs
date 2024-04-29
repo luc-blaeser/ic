@@ -17,7 +17,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use ic_artifact_pool::ingress_pool::IngressPoolImpl;
 use ic_config::artifact_pool::ArtifactPoolConfig;
 use ic_constants::MAX_INGRESS_TTL;
-use ic_ingress_manager::{CustomRandomState, IngressManager};
+use ic_ingress_manager::{IngressManager, RandomStateKind};
 use ic_interfaces::{
     p2p::consensus::{ChangeSetProducer, MutablePool, UnvalidatedArtifact},
     time_source::TimeSource,
@@ -37,10 +37,10 @@ use ic_replicated_state::{
 };
 use ic_test_utilities::{
     crypto::temp_crypto_component_with_fake_registry,
-    cycles_account_manager::CyclesAccountManagerBuilder, history::MockIngressHistory,
-    state::ReplicatedStateBuilder,
+    cycles_account_manager::CyclesAccountManagerBuilder,
 };
 use ic_test_utilities_registry::test_subnet_record;
+use ic_test_utilities_state::{MockIngressHistory, ReplicatedStateBuilder};
 use ic_test_utilities_time::FastForwardTimeSource;
 use ic_test_utilities_types::{
     ids::{canister_test_id, node_test_id, subnet_test_id, user_test_id},
@@ -239,7 +239,7 @@ where
                 Arc::new(state_manager),
                 cycles_account_manager,
                 MaliciousFlags::default(),
-                CustomRandomState::default(),
+                RandomStateKind::Random,
             );
             test(
                 time_source,

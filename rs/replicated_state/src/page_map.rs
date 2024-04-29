@@ -1,7 +1,8 @@
 mod checkpoint;
 pub mod int_map;
 mod page_allocator;
-mod storage;
+pub mod storage;
+pub mod test_utils;
 
 use bit_vec::BitVec;
 pub use checkpoint::{CheckpointSerialization, MappingSerialization};
@@ -18,7 +19,7 @@ pub use page_allocator::{
 };
 pub use storage::{
     BaseFileSerialization, MergeCandidate, OverlayFileSerialization, Shard, StorageLayout,
-    StorageSerialization, MAX_NUMBER_OF_FILES,
+    StorageResult, StorageSerialization, MAX_NUMBER_OF_FILES,
 };
 use storage::{OverlayFile, OverlayVersion, Storage};
 
@@ -32,7 +33,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::ops::Range;
 use std::os::unix::io::RawFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 // When persisting data we expand dirty pages to an aligned bucket of given size.
@@ -401,18 +402,12 @@ impl PageMap {
     ///
     /// Note that the file is assumed to be read-only.
     pub fn open(
-        base_file: &Path,
-        overlays: &[PathBuf],
+        storage_layout: &dyn StorageLayout,
         base_height: Height,
         fd_factory: Arc<dyn PageAllocatorFileDescriptor>,
     ) -> Result<Self, PersistenceError> {
-        let base = if base_file.exists() {
-            Some(base_file)
-        } else {
-            None
-        };
         Ok(Self {
-            storage: Storage::load(base, overlays)?,
+            storage: Storage::load(storage_layout)?,
             base_height: Some(base_height),
             page_delta: Default::default(),
             unflushed_delta: Default::default(),
@@ -817,6 +812,7 @@ impl PageMap {
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(false)
             .open(dst)
             .map_err(|err| PersistenceError::FileSystemError {
                 path: dst.display().to_string(),

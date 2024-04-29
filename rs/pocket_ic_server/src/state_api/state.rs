@@ -1,12 +1,14 @@
 /// This module contains the core state of the PocketIc server.
 /// Axum handlers operate on a global state of type ApiState, whose
 /// interface guarantees consistency and determinism.
-use crate::pocket_ic::{AdvanceTimeAndTick, PocketIc};
+use crate::pocket_ic::{AdvanceTimeAndTick, EffectivePrincipal, PocketIc};
 use crate::InstanceId;
 use crate::{OpId, Operation};
 use base64;
+use ic_http_endpoints_public::cors_layer;
 use ic_types::{CanisterId, SubnetId};
-use ic_utils::thread::JoinOnDrop;
+use ic_utils_thread::JoinOnDrop;
+use pocket_ic::common::rest::{HttpGatewayBackend, HttpGatewayConfig};
 use pocket_ic::{ErrorCode, UserError, WasmResult};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -21,7 +23,7 @@ use tokio::{
     task::{spawn, spawn_blocking, JoinHandle},
     time::{self, sleep},
 };
-use tracing::trace;
+use tracing::{info, trace};
 
 // The maximum wait time for a computation to finish synchronously.
 const DEFAULT_SYNC_WAIT_DURATION: Duration = Duration::from_secs(10);
@@ -34,7 +36,7 @@ const POLL_TICK_STATUS_DELAY: Duration = Duration::from_millis(100);
 pub const STATE_LABEL_HASH_SIZE: usize = 32;
 
 /// Uniquely identifies a state.
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Default, Deserialize)]
 pub struct StateLabel(pub [u8; STATE_LABEL_HASH_SIZE]);
 
 // The only error condition is if the vector has the wrong size.
@@ -81,12 +83,17 @@ pub struct ApiState {
     // PocketIC instance to a background worker and drop it there.
     drop_sender: mpsc::UnboundedSender<PocketIc>,
     _drop_worker_handle: JoinOnDrop<()>,
+    // PocketIC server port
+    port: Option<u16>,
+    // status of HTTP gateway (true = running, false = stopped)
+    http_gateways: Arc<RwLock<Vec<bool>>>,
 }
 
 #[derive(Default)]
 pub struct PocketIcApiStateBuilder {
     initial_instances: Vec<PocketIc>,
     sync_wait_time: Option<Duration>,
+    port: Option<u16>,
 }
 
 impl PocketIcApiStateBuilder {
@@ -99,6 +106,13 @@ impl PocketIcApiStateBuilder {
     pub fn with_sync_wait_time(self, sync_wait_time: Duration) -> Self {
         Self {
             sync_wait_time: Some(sync_wait_time),
+            ..self
+        }
+    }
+
+    pub fn with_port(self, port: u16) -> Self {
+        Self {
+            port: Some(port),
             ..self
         }
     }
@@ -146,6 +160,8 @@ impl PocketIcApiStateBuilder {
             sync_wait_time,
             drop_sender,
             _drop_worker_handle: JoinOnDrop::new(drop_handle),
+            port: self.port,
+            http_gateways: Arc::new(RwLock::new(Vec::new())),
         })
     }
 }
@@ -158,9 +174,12 @@ pub enum OpOut {
     CanisterId(CanisterId),
     Cycles(u128),
     Bytes(Vec<u8>),
-    SubnetId(SubnetId),
+    StableMemBytes(Vec<u8>),
+    MaybeSubnetId(Option<SubnetId>),
     Error(PocketIcError),
     ApiV2Response((u16, BTreeMap<String, Vec<u8>>, Vec<u8>)),
+    Pruned,
+    MessageId((EffectivePrincipal, Vec<u8>)),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -227,7 +246,9 @@ impl std::fmt::Debug for OpOut {
                 write!(f, "RequestRoutingError({:?})", msg)
             }
             OpOut::Bytes(bytes) => write!(f, "Bytes({})", base64::encode(bytes)),
-            OpOut::SubnetId(subnet_id) => write!(f, "SubnetId({})", subnet_id),
+            OpOut::StableMemBytes(bytes) => write!(f, "StableMemory({})", base64::encode(bytes)),
+            OpOut::MaybeSubnetId(Some(subnet_id)) => write!(f, "SubnetId({})", subnet_id),
+            OpOut::MaybeSubnetId(None) => write!(f, "NoSubnetId"),
             OpOut::ApiV2Response((status, headers, bytes)) => {
                 write!(
                     f,
@@ -235,6 +256,15 @@ impl std::fmt::Debug for OpOut {
                     status,
                     headers,
                     base64::encode(bytes)
+                )
+            }
+            OpOut::Pruned => write!(f, "Pruned"),
+            OpOut::MessageId((effective_principal, message_id)) => {
+                write!(
+                    f,
+                    "MessageId({:?},{})",
+                    effective_principal,
+                    hex::encode(message_id)
                 )
             }
         }
@@ -269,7 +299,7 @@ pub type UpdateResult = std::result::Result<UpdateReply, UpdateError>;
 /// are returned.
 /// If the result can be read from a cache, or if the computation is a fast read, an Output is
 /// returned directly.
-/// If the computation can be run and takes longer, a Busy variant is returned, containing the
+/// If the computation can be run and takes longer, a Started variant is returned, containing the
 /// requested op and the initial state.
 #[derive(Debug, PartialEq, Eq)]
 pub enum UpdateReply {
@@ -305,7 +335,7 @@ pub trait HasStateLabel {
 
 impl ApiState {
     /// For polling:
-    /// The client lib dispatches a long running operation and gets a Busy {state_label, op_id}.
+    /// The client lib dispatches a long running operation and gets a Started {state_label, op_id}.
     /// It then polls on that via this state tree api function.
     pub fn read_result(
         graph: Arc<RwLock<HashMap<StateLabel, Computations>>>,
@@ -320,10 +350,14 @@ impl ApiState {
         }
     }
 
+    pub fn get_graph(&self) -> Arc<RwLock<HashMap<StateLabel, Computations>>> {
+        self.graph.clone()
+    }
+
     pub async fn add_instance(&self, instance: PocketIc) -> InstanceId {
         let mut instances = self.instances.write().await;
-        instances.push(Mutex::new(InstanceState::Available(instance)));
         let mut progress_threads = self.progress_threads.write().await;
+        instances.push(Mutex::new(InstanceState::Available(instance)));
         progress_threads.push(Mutex::new(None));
         instances.len() - 1
     }
@@ -341,6 +375,175 @@ impl ApiState {
         if let Some(t) = progress_thread.take() {
             t.sender.send(()).await.unwrap();
             t.handle.await.unwrap();
+        }
+    }
+
+    pub async fn create_http_gateway(
+        &self,
+        http_gateway_config: HttpGatewayConfig,
+    ) -> (InstanceId, u16) {
+        use crate::state_api::routes::verify_cbor_content_header;
+        use axum::extract::{DefaultBodyLimit, Path, State};
+        use axum::handler::Handler;
+        use axum::routing::{get, post};
+        use axum::Router;
+        use http_body_util::Full;
+        use hyper::body::{Bytes, Incoming};
+        use hyper::header::CONTENT_TYPE;
+        use hyper::{Method, Request, Response, StatusCode, Uri};
+        use hyper_util::client::legacy::{connect::HttpConnector, Client};
+        use icx_proxy::{agent_handler, AppState, DnsCanisterConfig, ResolverState, Validator};
+        use std::str::FromStr;
+
+        async fn handler_status(
+            State(replica_url): State<String>,
+            bytes: Bytes,
+        ) -> (StatusCode, Response<Incoming>) {
+            let client =
+                Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
+            let url = format!("{}/api/v2/status", replica_url);
+            let req = Request::builder()
+                .uri(url)
+                .header(CONTENT_TYPE, "application/cbor")
+                .body(Full::<Bytes>::new(bytes))
+                .unwrap();
+            let resp = client.request(req).await.unwrap();
+
+            (resp.status(), resp)
+        }
+
+        async fn handler_api_v2_canister(
+            replica_url: String,
+            effective_canister_id: CanisterId,
+            endpoint: &str,
+            bytes: Bytes,
+        ) -> (StatusCode, Response<Incoming>) {
+            let client =
+                Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
+            let url = format!(
+                "{}/api/v2/canister/{}/{}",
+                replica_url, effective_canister_id, endpoint
+            );
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(url)
+                .header(CONTENT_TYPE, "application/cbor")
+                .body(Full::<Bytes>::new(bytes))
+                .unwrap();
+            let resp = client.request(req).await.unwrap();
+
+            (resp.status(), resp)
+        }
+
+        async fn handler_call(
+            State(replica_url): State<String>,
+            Path(effective_canister_id): Path<CanisterId>,
+            bytes: Bytes,
+        ) -> (StatusCode, Response<Incoming>) {
+            handler_api_v2_canister(replica_url, effective_canister_id, "call", bytes).await
+        }
+
+        async fn handler_query(
+            State(replica_url): State<String>,
+            Path(effective_canister_id): Path<CanisterId>,
+            bytes: Bytes,
+        ) -> (StatusCode, Response<Incoming>) {
+            handler_api_v2_canister(replica_url, effective_canister_id, "query", bytes).await
+        }
+
+        async fn handler_read_state(
+            State(replica_url): State<String>,
+            Path(effective_canister_id): Path<CanisterId>,
+            bytes: Bytes,
+        ) -> (StatusCode, Response<Incoming>) {
+            handler_api_v2_canister(replica_url, effective_canister_id, "read_state", bytes).await
+        }
+
+        let port = http_gateway_config.listen_at.unwrap_or_default();
+        let addr = format!("127.0.0.1:{}", port);
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .unwrap_or_else(|_| panic!("Failed to start HTTP gateway on port {}", port));
+        let real_port = listener.local_addr().unwrap().port();
+
+        let mut http_gateways = self.http_gateways.write().await;
+        http_gateways.push(true);
+        let instance_id = http_gateways.len() - 1;
+        drop(http_gateways);
+
+        let http_gateways = self.http_gateways.clone();
+        let shutdown_signal = async move {
+            loop {
+                let guard = http_gateways.read().await;
+                if !guard[instance_id] {
+                    break;
+                }
+                drop(guard);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        };
+        let pocket_ic_server_port = self.port.unwrap();
+        spawn(async move {
+            let replica_url = match http_gateway_config.forward_to {
+                HttpGatewayBackend::Replica(replica_url) => replica_url,
+                HttpGatewayBackend::PocketIcInstance(instance_id) => {
+                    format!(
+                        "http://localhost:{}/instances/{}/",
+                        pocket_ic_server_port, instance_id
+                    )
+                }
+            };
+            let agent = ic_agent::Agent::builder()
+                .with_url(replica_url.clone())
+                .build()
+                .unwrap();
+            agent.fetch_root_key().await.unwrap();
+            let replicas = vec![(agent, Uri::from_str(&replica_url).unwrap())];
+            let aliases: Vec<String> = vec![];
+            let suffixes: Vec<String> = vec!["localhost".to_string()];
+            let resolver = ResolverState {
+                dns: DnsCanisterConfig::new(aliases, suffixes).unwrap(),
+            };
+            let validator = Validator::default();
+            let app_state = AppState::new_for_testing(replicas, resolver, validator);
+            let fallback_handler = agent_handler.with_state(app_state);
+
+            let router = Router::new()
+                .route("/api/v2/status", get(handler_status))
+                .route(
+                    "/api/v2/canister/:ecid/call",
+                    post(handler_call).layer(axum::middleware::from_fn(verify_cbor_content_header)),
+                )
+                .route(
+                    "/api/v2/canister/:ecid/query",
+                    post(handler_query)
+                        .layer(axum::middleware::from_fn(verify_cbor_content_header)),
+                )
+                .route(
+                    "/api/v2/canister/:ecid/read_state",
+                    post(handler_read_state)
+                        .layer(axum::middleware::from_fn(verify_cbor_content_header)),
+                )
+                .fallback_service(fallback_handler)
+                .layer(DefaultBodyLimit::disable())
+                .layer(cors_layer())
+                .with_state(replica_url.trim_end_matches('/').to_string())
+                .into_make_service();
+
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown_signal)
+                .await
+                .unwrap();
+
+            info!("Terminating HTTP gateway.");
+        });
+        (instance_id, real_port)
+    }
+
+    pub async fn stop_http_gateway(&self, instance_id: InstanceId) {
+        let mut http_gateways = self.http_gateways.write().await;
+        if instance_id < http_gateways.len() {
+            http_gateways[instance_id] = false;
         }
     }
 
@@ -364,6 +567,7 @@ impl ApiState {
                     let cur_op = AdvanceTimeAndTick(advance_time);
                     let retry_immediately = match Self::update_instances_with_timeout(
                         instances.clone(),
+                        graph.clone(),
                         drop_sender.clone(),
                         cur_op.into(),
                         instance_id,
@@ -464,6 +668,7 @@ impl ApiState {
         let sync_wait_time = sync_wait_time.unwrap_or(self.sync_wait_time);
         Self::update_instances_with_timeout(
             self.instances.clone(),
+            self.graph.clone(),
             self.drop_sender.clone(),
             op,
             instance_id,
@@ -476,6 +681,7 @@ impl ApiState {
     /// cases when clients want to enforce a long-running blocking call.
     async fn update_instances_with_timeout<O>(
         instances: Arc<RwLock<Vec<Mutex<InstanceState>>>>,
+        graph: Arc<RwLock<HashMap<StateLabel, Computations>>>,
         drop_sender: mpsc::UnboundedSender<PocketIc>,
         op: Arc<O>,
         instance_id: InstanceId,
@@ -529,6 +735,7 @@ impl ApiState {
                         let old_state_label = state_label.clone();
                         let op_id = op_id.clone();
                         let drop_sender = drop_sender.clone();
+                        let graph = graph.clone();
                         move || {
                             trace!(
                                 "bg_task::start instance_id={} state_label={:?} op_id={}",
@@ -537,7 +744,15 @@ impl ApiState {
                                 op_id.0,
                             );
                             let result = op.compute(&mut pocket_ic);
+                            let new_state_label = pocket_ic.get_state_label();
+                            // add result to graph, but grab instance lock first!
                             let instances = instances.blocking_read();
+                            let mut graph_guard = graph.blocking_write();
+                            let cached_computations =
+                                graph_guard.entry(old_state_label.clone()).or_default();
+                            cached_computations
+                                .insert(op_id.clone(), (new_state_label, result.clone()));
+                            drop(graph_guard);
                             let mut instance_state = instances[instance_id].blocking_lock();
                             if let InstanceState::Deleted = &*instance_state {
                                 drop_sender.send(pocket_ic).unwrap();
@@ -545,7 +760,8 @@ impl ApiState {
                                 *instance_state = InstanceState::Available(pocket_ic);
                             }
                             trace!("bg_task::end instance_id={} op_id={}", instance_id, op_id.0);
-                            result
+                            // also return old_state_label so we can prune graph if we return quickly
+                            (result, old_state_label)
                         }
                     };
 
@@ -578,13 +794,20 @@ impl ApiState {
         // note: this assumes that cancelling the JoinHandle does not stop the execution of the
         // background task. This only works because the background thread, in this case, is a
         // kernel thread.
-        if let Ok(op_out) = time::timeout(sync_wait_time, bg_handle).await {
+        if let Ok(Ok((op_out, old_state_label))) = time::timeout(sync_wait_time, bg_handle).await {
             trace!(
                 "update_with_timeout::synchronous instance_id={} op_id={}",
                 instance_id,
                 op_id,
             );
-            return Ok(UpdateReply::Output(op_out.expect("join failed!")));
+            // prune this sync computation from graph, but only the value
+            let mut graph_guard = graph.write().await;
+            let cached_computations = graph_guard.entry(old_state_label.clone()).or_default();
+            let (new_state_label, _) = cached_computations.get(&OpId(op_id.clone())).unwrap();
+            cached_computations.insert(OpId(op_id), (new_state_label.clone(), OpOut::Pruned));
+            drop(graph_guard);
+
+            return Ok(UpdateReply::Output(op_out));
         }
 
         trace!(

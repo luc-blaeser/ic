@@ -14,7 +14,6 @@ use ic_config::{
     transport::TransportConfig,
     Config,
 };
-use ic_icos_sev::{get_chip_id, SnpError};
 use ic_interfaces::crypto::IDkgKeyRotationResult;
 use ic_interfaces_registry::RegistryClient;
 use ic_logger::{info, warn, ReplicaLogger};
@@ -31,17 +30,18 @@ use ic_types::{crypto::KeyPurpose, messages::MessageId, NodeId, RegistryVersion,
 use prost::Message;
 use rand::prelude::*;
 use registry_canister::mutations::{
-    common::check_ipv4_config,
+    common::{check_ipv4_config, is_valid_domain},
+    do_update_node_directly::UpdateNodeDirectlyPayload,
     node_management::{
         do_add_node::AddNodePayload, do_update_node_ipv4_config_directly::IPv4Config,
     },
 };
-use registry_canister::mutations::{
-    common::is_valid_domain, do_update_node_directly::UpdateNodeDirectlyPayload,
+use std::{
+    net::IpAddr,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, SystemTime},
 };
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-use std::{net::IpAddr, str::FromStr};
 use url::Url;
 
 /// When calculating Gamma (frequency at which the registry accepts key updates from the subnet as a whole)
@@ -135,6 +135,8 @@ impl NodeRegistration {
         let add_node_payload = self.assemble_add_node_message().await;
 
         while !self.is_node_registered().await {
+            warn!(self.log, "Node registration failed. Trying again.");
+            UtilityCommand::notify_host("Node registration failed. Trying again.", 1);
             match self.signer.get() {
                 Ok(signer) => {
                     let nns_url = self
@@ -216,7 +218,7 @@ impl NodeRegistration {
             http_endpoint: http_config_to_endpoint(&self.log, &self.node_config.http_handler)
                 .expect("Invalid endpoints in http handler config."),
             p2p_flow_endpoints: vec![],
-            chip_id: get_snp_chip_id().expect("Failed to retrieve chip_id from snp firmware"),
+            chip_id: None,
             prometheus_metrics_endpoint: "".to_string(),
             public_ipv4_config: process_ipv4_config(
                 &self.log,
@@ -543,9 +545,10 @@ impl NodeRegistration {
         {
             Ok(_) => true,
             Err(e) => {
-                warn!(
-                    self.log,
-                    "Node keys are not setup at version {}: {:?}", latest_version, e
+                warn!(self.log, "Node keys are not setup: {:?}", e);
+                UtilityCommand::notify_host(
+                    format!("Node keys are not setup: {:?}", e).as_str(),
+                    1,
                 );
                 false
             }
@@ -707,27 +710,6 @@ fn generate_nonce() -> Vec<u8> {
         .to_vec()
 }
 
-/// Get a chip_id from SNP guest firmware via SEV library.
-/// If SEV-SNP in not enabled on the guest, return None.
-/// In other cases, return the error and notify the Node Provider.
-fn get_snp_chip_id() -> OrchestratorResult<Option<Vec<u8>>> {
-    match get_chip_id() {
-        // Chip_id returned successfully
-        Ok(chip_id) => Ok(Some(chip_id)),
-        // Snp is not enabled on the Guest, return None
-        Err(SnpError::SnpNotEnabled { .. }) => Ok(None),
-        // Propagate any other error
-        Err(error) => {
-            let snp_error = format!(
-                "Failed to retrieve chip_id from snp firmware, error: {}",
-                error
-            );
-            UtilityCommand::notify_host(&snp_error, 1);
-            Err(OrchestratorError::snp_error(snp_error))
-        }
-    }
-}
-
 fn protobuf_to_vec<M: Message>(entry: M) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
     entry.encode(&mut buf).expect("This must not fail");
@@ -818,17 +800,15 @@ mod tests {
         use super::*;
         use async_trait::async_trait;
         use ic_crypto_temp_crypto::EcdsaSubnetConfig;
-        use ic_crypto_tls_interfaces::AuthenticatedPeer;
-        use ic_crypto_tls_interfaces::SomeOrAllNodes;
-        use ic_crypto_tls_interfaces::TlsClientHandshakeError;
-        use ic_crypto_tls_interfaces::TlsHandshake;
-        use ic_crypto_tls_interfaces::TlsServerHandshakeError;
-        use ic_crypto_tls_interfaces::TlsStream;
-        use ic_interfaces::crypto::IDkgDealingEncryptionKeyRotationError;
-        use ic_interfaces::crypto::KeyManager;
-        use ic_interfaces::crypto::ThresholdSigVerifierByPublicKey;
-        use ic_interfaces::crypto::{BasicSigner, CheckKeysWithRegistryError};
-        use ic_interfaces::crypto::{CurrentNodePublicKeysError, KeyRotationOutcome};
+        use ic_crypto_tls_interfaces::{
+            AuthenticatedPeer, SomeOrAllNodes, TlsClientHandshakeError, TlsHandshake,
+            TlsServerHandshakeError, TlsStream,
+        };
+        use ic_interfaces::crypto::{
+            BasicSigner, CheckKeysWithRegistryError, CurrentNodePublicKeysError,
+            IDkgDealingEncryptionKeyRotationError, KeyManager, KeyRotationOutcome,
+            ThresholdSigVerifierByPublicKey,
+        };
         use ic_logger::replica_logger::no_op_logger;
         use ic_metrics::MetricsRegistry;
         use ic_protobuf::registry::subnet::v1::SubnetListRecord;
@@ -838,17 +818,19 @@ mod tests {
         };
         use ic_registry_local_store::LocalStoreImpl;
         use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
-        use ic_test_utilities_in_memory_logger::assertions::LogEntriesAssert;
-        use ic_test_utilities_in_memory_logger::InMemoryReplicaLogger;
-        use ic_types::consensus::CatchUpContentProtobufBytes;
-        use ic_types::crypto::CombinedThresholdSigOf;
-        use ic_types::crypto::CryptoResult;
-        use ic_types::crypto::CurrentNodePublicKeys;
-        use ic_types::crypto::{AlgorithmId, BasicSigOf};
-        use ic_types::registry::RegistryClientError;
-        use ic_types::PrincipalId;
-        use mockall::predicate::*;
-        use mockall::*;
+        use ic_test_utilities_in_memory_logger::{
+            assertions::LogEntriesAssert, InMemoryReplicaLogger,
+        };
+        use ic_types::{
+            consensus::CatchUpContentProtobufBytes,
+            crypto::{
+                AlgorithmId, BasicSigOf, CombinedThresholdSigOf, CryptoResult,
+                CurrentNodePublicKeys,
+            },
+            registry::RegistryClientError,
+            PrincipalId,
+        };
+        use mockall::{predicate::*, *};
         use slog::Level;
         use std::time::UNIX_EPOCH;
         use tempfile::TempDir;

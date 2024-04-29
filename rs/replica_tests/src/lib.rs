@@ -1,8 +1,7 @@
 use core::future::Future;
 use ic_base_types::{PrincipalId, SubnetId};
 use ic_canister_client_sender::Sender;
-use ic_config::Config;
-use ic_config::{crypto::CryptoConfig, transport::TransportConfig};
+use ic_config::{crypto::CryptoConfig, transport::TransportConfig, Config};
 use ic_error_types::{ErrorCode, RejectCode, UserError};
 use ic_execution_environment::IngressHistoryReaderImpl;
 use ic_interfaces::execution_environment::{
@@ -10,15 +9,16 @@ use ic_interfaces::execution_environment::{
 };
 use ic_interfaces_registry::RegistryClient;
 use ic_interfaces_state_manager::StateReader;
-use ic_management_canister_types::CanisterInstallMode;
 use ic_management_canister_types::{
-    CanisterIdRecord, InstallCodeArgs, Method, Payload, ProvisionalCreateCanisterWithCyclesArgs,
-    IC_00,
+    CanisterIdRecord, CanisterInstallMode, InstallCodeArgs, Method, Payload,
+    ProvisionalCreateCanisterWithCyclesArgs, IC_00,
 };
 use ic_metrics::MetricsRegistry;
-use ic_prep_lib::internet_computer::{IcConfig, TopologyConfig};
-use ic_prep_lib::node::{NodeConfiguration, NodeIndex, NodeSecretKeyStore};
-use ic_prep_lib::subnet_configuration::{SubnetConfig, SubnetRunningState};
+use ic_prep_lib::{
+    internet_computer::{IcConfig, TopologyConfig},
+    node::{NodeConfiguration, NodeIndex, NodeSecretKeyStore},
+    subnet_configuration::{SubnetConfig, SubnetRunningState},
+};
 use ic_registry_client_fake::FakeRegistryClient;
 use ic_registry_keys::make_subnet_list_record_key;
 use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
@@ -30,7 +30,8 @@ use ic_state_machine_tests::StateMachine;
 use ic_test_utilities::universal_canister::UNIVERSAL_CANISTER_WASM;
 use ic_test_utilities_logger::with_test_replica_logger;
 use ic_test_utilities_types::{
-    ids::node_test_id, ids::user_anonymous_id, messages::SignedIngressBuilder,
+    ids::{node_test_id, user_anonymous_id},
+    messages::SignedIngressBuilder,
 };
 use ic_types::{
     artifact::UnvalidatedArtifactMutation,
@@ -43,19 +44,18 @@ use ic_types::{
 };
 use prost::Message;
 use slog_scope::info;
-use std::collections::BTreeMap;
-use std::net::SocketAddr;
-use std::str::FromStr;
-use std::sync::{Arc, Mutex};
-use std::thread::sleep;
 use std::{
+    collections::BTreeMap,
     convert::TryFrom,
+    net::SocketAddr,
+    str::FromStr,
+    sync::{Arc, Mutex},
     thread,
+    thread::sleep,
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc::UnboundedSender;
-use tower::buffer::Buffer as TowerBuffer;
-use tower::ServiceExt;
+use tower::{buffer::Buffer as TowerBuffer, ServiceExt};
 
 const CYCLES_BALANCE: u128 = 1 << 120;
 
@@ -219,7 +219,6 @@ pub fn get_ic_config() -> IcConfig {
             public_api: SocketAddr::from_str("128.0.0.1:1").expect("can't fail"),
             node_operator_principal_id: None,
             secret_key_store: Some(node_sks),
-            chip_id: None,
         },
     );
 
@@ -247,6 +246,7 @@ pub fn get_ic_config() -> IcConfig {
             vec![],
             vec![],
             SubnetRunningState::Active,
+            None,
         ),
     );
 
@@ -267,7 +267,6 @@ pub fn get_ic_config() -> IcConfig {
         None,
         None,
         /* ssh_readonly_access_to_unassgined_nodes */ vec![],
-        /* guest_launch_measurement_sha256_hex= */ None,
     )
 }
 
@@ -347,6 +346,7 @@ where
                 registry.clone(),
                 crypto,
                 None,
+                ic_tracing::ReloadHandles::new(tracing_subscriber::reload::Layer::new(vec![]).1),
             )
             .expect("Failed to setup p2p");
 
@@ -409,7 +409,6 @@ impl LocalTestRuntime {
             payload,
             None,
             None,
-            None,
         ))
     }
 
@@ -468,7 +467,6 @@ impl LocalTestRuntime {
             payload,
             None,
             None,
-            None,
         )
     }
 
@@ -480,7 +478,6 @@ impl LocalTestRuntime {
         payload: Vec<u8>,
         compute_allocation: Option<u64>,
         memory_allocation: Option<u64>,
-        query_allocation: Option<u64>,
     ) -> Result<WasmResult, UserError> {
         let args = InstallCodeArgs::new(
             CanisterInstallMode::Install,
@@ -489,7 +486,6 @@ impl LocalTestRuntime {
             payload,
             compute_allocation,
             memory_allocation,
-            query_allocation,
         );
 
         self.install_canister_helper(args)
@@ -508,7 +504,6 @@ impl LocalTestRuntime {
         let (canister_id, res) = self.create_and_install_canister_wasm(
             UNIVERSAL_CANISTER_WASM.to_vec(),
             payload.into(),
-            None,
             None,
             None,
             num_cycles,
@@ -536,7 +531,6 @@ impl LocalTestRuntime {
         payload: Vec<u8>,
         compute_allocation: Option<u64>,
         memory_allocation: Option<u64>,
-        query_allocation: Option<u64>,
         num_cycles: u128,
     ) -> (CanisterId, Result<WasmResult, UserError>) {
         let canister_id = self.create_canister_with_cycles(num_cycles).unwrap();
@@ -548,7 +542,6 @@ impl LocalTestRuntime {
                 payload,
                 compute_allocation,
                 memory_allocation,
-                query_allocation,
             ),
         )
     }

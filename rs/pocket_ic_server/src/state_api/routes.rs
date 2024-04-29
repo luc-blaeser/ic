@@ -4,12 +4,13 @@
 /// body. This has to be canonicalized into a PocketIc Operation before we can
 /// deterministically update the PocketIc state machine.
 ///
-use super::state::{ApiState, OpOut, PocketIcError, UpdateReply};
+use super::state::{ApiState, OpOut, PocketIcError, StateLabel, UpdateReply};
 use crate::pocket_ic::{
-    AddCycles, CallRequest, ExecuteIngressMessage, GetCyclesBalance, GetStableMemory, GetSubnet,
-    GetTime, PubKey, Query, QueryRequest, ReadStateRequest, SetStableMemory, SetTime,
-    StatusRequest, Tick,
+    AddCycles, AwaitIngressMessage, CallRequest, ExecuteIngressMessage, GetCyclesBalance,
+    GetStableMemory, GetSubnet, GetTime, PubKey, Query, QueryRequest, ReadStateRequest,
+    SetStableMemory, SetTime, StatusRequest, SubmitIngressMessage, Tick,
 };
+use crate::OpId;
 use crate::{pocket_ic::PocketIc, BlobStore, InstanceId, Operation};
 use aide::{
     axum::routing::{delete, get, post, ApiMethodRouter},
@@ -21,7 +22,8 @@ use axum::{
     body::{Body, Bytes},
     extract::{self, Path, State},
     http::{self, HeaderMap, HeaderName, StatusCode},
-    response::Response,
+    middleware::Next,
+    response::{IntoResponse, Response},
     Json,
 };
 use axum_extra::headers;
@@ -32,15 +34,14 @@ use hyper::header;
 use ic_http_endpoints_public::cors_layer;
 use ic_types::CanisterId;
 use pocket_ic::common::rest::{
-    self, ApiResponse, ExtendedSubnetConfigSet, RawAddCycles, RawCanisterCall, RawCanisterId,
-    RawCanisterResult, RawCycles, RawSetStableMemory, RawStableMemory, RawSubnetId, RawTime,
-    RawWasmResult,
+    self, ApiResponse, ExtendedSubnetConfigSet, HttpGatewayConfig, HttpGatewayInfo, RawAddCycles,
+    RawCanisterCall, RawCanisterId, RawCanisterResult, RawCycles, RawMessageId, RawSetStableMemory,
+    RawStableMemory, RawSubmitIngressResult, RawSubnetId, RawTime, RawWasmResult,
 };
 use pocket_ic::WasmResult;
 use serde::Serialize;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::{runtime::Runtime, sync::RwLock, time::Instant};
-use tower::ServiceBuilder;
 use tracing::trace;
 
 type PocketHttpResponse = (BTreeMap<String, Vec<u8>>, Vec<u8>);
@@ -48,6 +49,7 @@ type PocketHttpResponse = (BTreeMap<String, Vec<u8>>, Vec<u8>);
 /// Name of a header that allows clients to specify for how long their are willing to wait for a
 /// response on a open http request.
 pub static TIMEOUT_HEADER_NAME: HeaderName = HeaderName::from_static("processing-timeout-ms");
+const RETRY_TIMEOUT_S: u64 = 300;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -78,6 +80,14 @@ where
 {
     ApiRouter::new()
         .directory_route(
+            "/submit_ingress_message",
+            post(handler_submit_ingress_message),
+        )
+        .directory_route(
+            "/await_ingress_message",
+            post(handler_await_ingress_message),
+        )
+        .directory_route(
             "/execute_ingress_message",
             post(handler_execute_ingress_message),
         )
@@ -92,11 +102,33 @@ where
     S: Clone + Send + Sync + 'static,
     AppState: extract::FromRef<S>,
 {
+    use tower_http::limit::RequestBodyLimitLayer;
     ApiRouter::new()
         .directory_route("/status", get(handler_status))
-        .directory_route("/canister/:ecid/call", post(handler_call))
-        .directory_route("/canister/:ecid/query", post(handler_query))
-        .directory_route("/canister/:ecid/read_state", post(handler_read_state))
+        .directory_route(
+            "/canister/:ecid/call",
+            post(handler_call)
+                .layer(RequestBodyLimitLayer::new(
+                    4 * 1024 * 1024, // MAX_REQUEST_BODY_SIZE in BN
+                ))
+                .layer(axum::middleware::from_fn(verify_cbor_content_header)),
+        )
+        .directory_route(
+            "/canister/:ecid/query",
+            post(handler_query)
+                .layer(RequestBodyLimitLayer::new(
+                    4 * 1024 * 1024, // MAX_REQUEST_BODY_SIZE in BN
+                ))
+                .layer(axum::middleware::from_fn(verify_cbor_content_header)),
+        )
+        .directory_route(
+            "/canister/:ecid/read_state",
+            post(handler_read_state)
+                .layer(RequestBodyLimitLayer::new(
+                    4 * 1024 * 1024, // MAX_REQUEST_BODY_SIZE in BN
+                ))
+                .layer(axum::middleware::from_fn(verify_cbor_content_header)),
+        )
 }
 
 pub fn instances_routes<S>() -> ApiRouter<S>
@@ -132,7 +164,20 @@ where
         // Stop automatic progress (see endpoint `auto_progress`)
         // on an IC instance.
         .api_route("/:id/stop_progress", post(stop_progress))
-        .layer(ServiceBuilder::new().layer(cors_layer()))
+        .layer(cors_layer())
+}
+
+pub fn http_gateway_routes<S>() -> ApiRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+    AppState: extract::FromRef<S>,
+{
+    ApiRouter::new()
+        // Create a new HTTP gateway instance. Takes a HttpGatewayConfig.
+        // Returns an InstanceId and the HTTP gateway's port.
+        .api_route("/", post(create_http_gateway))
+        // Stops an HTTP gateway.
+        .api_route("/:id/stop", post(stop_http_gateway))
 }
 
 async fn run_operation<T: Serialize>(
@@ -150,7 +195,7 @@ where
         .with_initial_interval(Duration::from_millis(10))
         .with_max_interval(Duration::from_secs(1))
         .with_multiplier(2.0)
-        .with_max_elapsed_time(Some(Duration::from_secs(60 * 5)))
+        .with_max_elapsed_time(Some(Duration::from_secs(RETRY_TIMEOUT_S)))
         .build();
     loop {
         match api_state
@@ -172,10 +217,10 @@ where
                         break (
                             StatusCode::ACCEPTED,
                             ApiResponse::Started {
-                                state_label: format!("{:?}", state_label),
-                                op_id: format!("{:?}", op_id),
+                                state_label: base64::encode_config(state_label.0, base64::URL_SAFE),
+                                op_id: op_id.0.to_string(),
                             },
-                        )
+                        );
                     }
                     // Otherwise, the instance is busy with a different computation, so we retry (if appliacable) or return 409.
                     UpdateReply::Busy { state_label, op_id } => {
@@ -197,8 +242,11 @@ where
                             break (
                                 StatusCode::CONFLICT,
                                 ApiResponse::Busy {
-                                    state_label: format!("{:?}", state_label),
-                                    op_id: format!("{:?}", op_id),
+                                    state_label: base64::encode_config(
+                                        state_label.0,
+                                        base64::URL_SAFE,
+                                    ),
+                                    op_id: op_id.0.to_string(),
                                 },
                             );
                         }
@@ -210,74 +258,82 @@ where
     }
 }
 
-impl From<OpOut> for (StatusCode, ApiResponse<RawTime>) {
+#[derive(Debug, Copy, Clone)]
+pub struct OpConversionError;
+
+impl<T: TryFrom<OpOut>> From<OpOut> for (StatusCode, ApiResponse<T>) {
     fn from(value: OpOut) -> Self {
+        // match errors explicitly to make sure they have a 4xx status code
         match value {
-            OpOut::Time(time) => (
-                StatusCode::OK,
-                ApiResponse::Success(RawTime {
-                    nanos_since_epoch: time,
-                }),
-            ),
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
+            OpOut::Error(e) => (
+                StatusCode::BAD_REQUEST,
                 ApiResponse::Error {
-                    message: "operation returned invalid type".into(),
+                    message: format!("{:?}", e),
                 },
             ),
+            val => {
+                if let Ok(t) = T::try_from(val) {
+                    (StatusCode::OK, ApiResponse::Success(t))
+                } else {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ApiResponse::Error {
+                            message: "operation returned invalid type".into(),
+                        },
+                    )
+                }
+            }
         }
     }
 }
 
-impl From<OpOut> for (StatusCode, ApiResponse<()>) {
-    fn from(value: OpOut) -> Self {
+impl TryFrom<OpOut> for RawTime {
+    type Error = OpConversionError;
+    fn try_from(value: OpOut) -> Result<Self, Self::Error> {
         match value {
-            OpOut::NoOutput => (StatusCode::OK, ApiResponse::Success(())),
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiResponse::Error {
-                    message: "operation returned invalid type".into(),
-                },
-            ),
+            OpOut::Time(time) => Ok(RawTime {
+                nanos_since_epoch: time,
+            }),
+            _ => Err(OpConversionError),
         }
     }
 }
 
-impl From<OpOut> for (StatusCode, ApiResponse<RawCycles>) {
-    fn from(value: OpOut) -> Self {
+impl TryFrom<OpOut> for () {
+    type Error = OpConversionError;
+    fn try_from(value: OpOut) -> Result<Self, Self::Error> {
         match value {
-            OpOut::Cycles(cycles) => (StatusCode::OK, ApiResponse::Success(RawCycles { cycles })),
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiResponse::Error {
-                    message: "operation returned invalid type".into(),
-                },
-            ),
+            OpOut::NoOutput => Ok(()),
+            _ => Err(OpConversionError),
         }
     }
 }
 
-impl From<OpOut> for (StatusCode, ApiResponse<RawStableMemory>) {
-    fn from(value: OpOut) -> Self {
+impl TryFrom<OpOut> for RawCycles {
+    type Error = OpConversionError;
+    fn try_from(value: OpOut) -> Result<Self, Self::Error> {
         match value {
-            OpOut::Bytes(stable_memory) => (
-                StatusCode::OK,
-                ApiResponse::Success(RawStableMemory {
-                    blob: stable_memory,
-                }),
-            ),
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiResponse::Error {
-                    message: "operation returned invalid type".into(),
-                },
-            ),
+            OpOut::Cycles(cycles) => Ok(RawCycles { cycles }),
+            _ => Err(OpConversionError),
         }
     }
 }
 
-impl From<OpOut> for (StatusCode, ApiResponse<RawCanisterResult>) {
-    fn from(value: OpOut) -> Self {
+impl TryFrom<OpOut> for RawStableMemory {
+    type Error = OpConversionError;
+    fn try_from(value: OpOut) -> Result<Self, Self::Error> {
+        match value {
+            OpOut::StableMemBytes(stable_memory) => Ok(RawStableMemory {
+                blob: stable_memory,
+            }),
+            _ => Err(OpConversionError),
+        }
+    }
+}
+
+impl TryFrom<OpOut> for RawCanisterResult {
+    type Error = OpConversionError;
+    fn try_from(value: OpOut) -> Result<Self, Self::Error> {
         match value {
             OpOut::CanisterResult(wasm_result) => {
                 let inner = match wasm_result {
@@ -289,104 +345,88 @@ impl From<OpOut> for (StatusCode, ApiResponse<RawCanisterResult>) {
                     }
                     Err(user_error) => RawCanisterResult::Err(user_error),
                 };
-                (StatusCode::OK, ApiResponse::Success(inner))
+                Ok(inner)
             }
-            OpOut::Error(e) => (
-                StatusCode::BAD_REQUEST,
-                ApiResponse::Error {
-                    message: format!("Canister call returned an error: {:?}", e),
-                },
-            ),
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiResponse::Error {
-                    message: "operation returned invalid type".into(),
-                },
-            ),
+            _ => Err(OpConversionError),
         }
     }
 }
 
-impl From<OpOut> for (StatusCode, ApiResponse<RawCanisterId>) {
-    fn from(value: OpOut) -> Self {
+impl TryFrom<OpOut> for PocketIcError {
+    type Error = OpConversionError;
+    fn try_from(value: OpOut) -> Result<Self, Self::Error> {
         match value {
-            OpOut::CanisterId(canister_id) => (
-                StatusCode::OK,
-                ApiResponse::Success(RawCanisterId {
-                    canister_id: canister_id.get().to_vec(),
-                }),
-            ),
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiResponse::Error {
-                    message: "operation returned invalid type".into(),
-                },
-            ),
+            OpOut::Error(e) => Ok(e),
+            _ => Err(OpConversionError),
         }
     }
 }
 
-impl From<OpOut> for (StatusCode, ApiResponse<Option<RawSubnetId>>) {
-    fn from(value: OpOut) -> Self {
+impl TryFrom<OpOut> for RawCanisterId {
+    type Error = OpConversionError;
+    fn try_from(value: OpOut) -> Result<Self, Self::Error> {
         match value {
-            OpOut::SubnetId(subnet_id) => (
-                StatusCode::OK,
-                ApiResponse::Success(Some(RawSubnetId {
+            OpOut::CanisterId(canister_id) => Ok(RawCanisterId {
+                canister_id: canister_id.get().to_vec(),
+            }),
+            _ => Err(OpConversionError),
+        }
+    }
+}
+
+impl TryFrom<OpOut> for Option<RawSubnetId> {
+    type Error = OpConversionError;
+    fn try_from(value: OpOut) -> Result<Self, Self::Error> {
+        match value {
+            OpOut::MaybeSubnetId(maybe_subnet_id) => {
+                Ok(maybe_subnet_id.map(|subnet_id| RawSubnetId {
                     subnet_id: subnet_id.get().to_vec(),
-                })),
-            ),
-            OpOut::Error(PocketIcError::CanisterNotFound(_)) => {
-                (StatusCode::OK, ApiResponse::Success(None))
+                }))
             }
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiResponse::Error {
-                    message: "operation returned invalid type".into(),
-                },
-            ),
+            _ => Err(OpConversionError),
         }
     }
 }
 
-impl From<OpOut> for (StatusCode, ApiResponse<Vec<u8>>) {
-    fn from(value: OpOut) -> Self {
+impl TryFrom<OpOut> for Vec<u8> {
+    type Error = OpConversionError;
+    fn try_from(value: OpOut) -> Result<Self, Self::Error> {
         match value {
-            OpOut::Bytes(bytes) => (StatusCode::OK, ApiResponse::Success(bytes)),
-            OpOut::Error(e) => (
-                StatusCode::BAD_REQUEST,
-                ApiResponse::Error {
-                    message: format!("Call returned an error: {:?}", e),
-                },
-            ),
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiResponse::Error {
-                    message: "operation returned invalid type".into(),
-                },
-            ),
+            OpOut::Bytes(bytes) => Ok(bytes),
+            _ => Err(OpConversionError),
         }
     }
 }
 
-#[derive(Debug, Serialize)]
+impl TryFrom<OpOut> for RawSubmitIngressResult {
+    type Error = OpConversionError;
+    fn try_from(value: OpOut) -> Result<Self, Self::Error> {
+        match value {
+            OpOut::MessageId((effective_principal, message_id)) => {
+                Ok(RawSubmitIngressResult::Ok(RawMessageId {
+                    effective_principal: effective_principal.into(),
+                    message_id,
+                }))
+            }
+            OpOut::CanisterResult(Err(user_error)) => Ok(RawSubmitIngressResult::Err(user_error)),
+            _ => Err(OpConversionError),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ApiV2Error(String);
 
-impl From<OpOut>
-    for (
-        StatusCode,
-        ApiResponse<Result<PocketHttpResponse, ApiV2Error>>,
-    )
-{
+impl From<OpOut> for (StatusCode, ApiResponse<PocketHttpResponse>) {
     fn from(value: OpOut) -> Self {
         match value {
             OpOut::ApiV2Response((status, headers, bytes)) => (
                 StatusCode::from_u16(status).unwrap(),
-                ApiResponse::Success(Ok((headers, bytes))),
+                ApiResponse::Success((headers, bytes)),
             ),
-            OpOut::Error(PocketIcError::RequestRoutingError(e)) => (
-                StatusCode::BAD_REQUEST,
-                ApiResponse::Success(Err(ApiV2Error(e))),
-            ),
+            OpOut::Error(PocketIcError::RequestRoutingError(e)) => {
+                (StatusCode::BAD_REQUEST, ApiResponse::Error { message: e })
+            }
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ApiResponse::Error {
@@ -577,28 +617,196 @@ async fn handler_api_v2<T: Operation + Send + Sync + 'static>(
     instance_id: InstanceId,
     op: T,
 ) -> (StatusCode, NoApi<Response<Body>>) {
-    let (code, res): (
-        StatusCode,
-        ApiResponse<Result<PocketHttpResponse, ApiV2Error>>,
-    ) = run_operation(api_state, instance_id, None, op).await;
+    let (code, res): (StatusCode, ApiResponse<PocketHttpResponse>) =
+        run_operation(api_state, instance_id, None, op).await;
     let response = match res {
-        ApiResponse::Success(Ok((headers, bytes))) => {
+        ApiResponse::Success((headers, bytes)) => {
             let mut resp = Response::builder().status(code);
             for (name, value) in headers {
                 resp = resp.header(name, value);
             }
             resp.body(Body::from(bytes)).unwrap()
         }
-        ApiResponse::Success(Err(ApiV2Error(e))) => make_plaintext_response(code, e),
-        ApiResponse::Busy { .. } | ApiResponse::Started { .. } | ApiResponse::Error { .. } => {
+        ApiResponse::Error { message } => make_plaintext_response(code, message),
+        ApiResponse::Busy { .. } | ApiResponse::Started { .. } => {
             make_plaintext_response(code, format!("{:?}", res))
         }
     };
     (code, NoApi(response))
 }
 
+/// The result of a long running PocketIC operation is stored in a graph as an OpOut variant.
+/// When polling, the type (and therefore the variant) is no longer known. Therefore we need
+/// to try every variant and immediately convert to an axum::Response so that axum understands
+/// the return type.
+fn op_out_to_response(op_out: OpOut) -> Response {
+    match op_out {
+        OpOut::Pruned => (
+            StatusCode::GONE,
+            Json(ApiResponse::<()>::Error {
+                message: "Pruned".to_owned(),
+            })
+            .into_response(),
+        )
+            .into_response(),
+        opout @ OpOut::MessageId(_) => (
+            StatusCode::OK,
+            Json(ApiResponse::Success(Vec::<u8>::try_from(opout).unwrap())),
+        )
+            .into_response(),
+        OpOut::NoOutput => (
+            StatusCode::OK,
+            Json(ApiResponse::Success(())).into_response(),
+        )
+            .into_response(),
+        opout @ OpOut::Time(_) => (
+            StatusCode::OK,
+            Json(ApiResponse::Success(RawTime::try_from(opout).unwrap())),
+        )
+            .into_response(),
+        opout @ OpOut::CanisterResult(_) => (
+            StatusCode::OK,
+            Json(ApiResponse::Success(
+                RawCanisterResult::try_from(opout).unwrap(),
+            )),
+        )
+            .into_response(),
+        opout @ OpOut::CanisterId(_) => (
+            StatusCode::OK,
+            Json(ApiResponse::Success(
+                RawCanisterId::try_from(opout).unwrap(),
+            )),
+        )
+            .into_response(),
+        opout @ OpOut::Cycles(_) => (
+            StatusCode::OK,
+            Json(ApiResponse::Success(RawCycles::try_from(opout).unwrap())),
+        )
+            .into_response(),
+        opout @ OpOut::Bytes(_) => (
+            StatusCode::OK,
+            Json(ApiResponse::Success(Vec::<u8>::try_from(opout).unwrap())),
+        )
+            .into_response(),
+        opout @ OpOut::StableMemBytes(_) => (
+            StatusCode::OK,
+            Json(ApiResponse::Success(
+                RawStableMemory::try_from(opout).unwrap(),
+            )),
+        )
+            .into_response(),
+        opout @ OpOut::MaybeSubnetId(_) => (
+            StatusCode::OK,
+            Json(ApiResponse::Success(
+                Option::<RawSubnetId>::try_from(opout).unwrap(),
+            )),
+        )
+            .into_response(),
+        opout @ OpOut::Error(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::Error {
+                message: format!("{:?}", PocketIcError::try_from(opout).unwrap()),
+            }),
+        )
+            .into_response(),
+        OpOut::ApiV2Response((status, headers, bytes)) => {
+            let code = StatusCode::from_u16(status).unwrap();
+            let mut resp = Response::builder().status(code);
+            for (name, value) in headers {
+                resp = resp.header(name, value);
+            }
+            resp.body(Body::from(bytes)).unwrap()
+        }
+    }
+}
+
+/// Read a node in the graph of computations. Needed for polling for a previous ApiResponse::Started reply.
+pub async fn handler_read_graph(
+    State(AppState { api_state, .. }): State<AppState>,
+    // TODO: type state label and op id correctly but such that axum can handle it
+    Path((state_label_str, op_id_str)): Path<(String, String)>,
+) -> Response {
+    let Ok(vec) = base64::decode_config(state_label_str.as_bytes(), base64::URL_SAFE) else {
+        return (StatusCode::BAD_REQUEST, "malformed state_label").into_response();
+    };
+    if let Ok(state_label) = StateLabel::try_from(vec) {
+        let op_id = OpId(op_id_str.clone());
+        // TODO: use new_state_label and return it to library
+        if let Some((_new_state_label, op_out)) =
+            ApiState::read_result(api_state.get_graph(), &state_label, &op_id)
+        {
+            op_out_to_response(op_out)
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<()>::Error {
+                    message: format!(
+                        "state_label / op_id not found: {} (base64: {}) / {}",
+                        state_label_str,
+                        base64::encode_config(state_label.0, base64::URL_SAFE),
+                        op_id_str,
+                    ),
+                }),
+            )
+                .into_response()
+        }
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::Error {
+                message: "Bad state_label".to_string(),
+            }),
+        )
+            .into_response()
+    }
+}
+
 // ----------------------------------------------------------------------------------------------------------------- //
 // Update handlers
+
+pub async fn handler_submit_ingress_message(
+    State(AppState { api_state, .. }): State<AppState>,
+    Path(instance_id): Path<InstanceId>,
+    headers: HeaderMap,
+    extract::Json(raw_canister_call): extract::Json<RawCanisterCall>,
+) -> (StatusCode, Json<ApiResponse<RawSubmitIngressResult>>) {
+    let timeout = timeout_or_default(headers);
+    match crate::pocket_ic::CanisterCall::try_from(raw_canister_call) {
+        Ok(canister_call) => {
+            let ingress_op = SubmitIngressMessage(canister_call);
+            let (code, response) = run_operation(api_state, instance_id, timeout, ingress_op).await;
+            (code, Json(response))
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::Error {
+                message: format!("{:?}", e),
+            }),
+        ),
+    }
+}
+
+pub async fn handler_await_ingress_message(
+    State(AppState { api_state, .. }): State<AppState>,
+    Path(instance_id): Path<InstanceId>,
+    headers: HeaderMap,
+    extract::Json(raw_message_id): extract::Json<RawMessageId>,
+) -> (StatusCode, Json<ApiResponse<RawCanisterResult>>) {
+    let timeout = timeout_or_default(headers);
+    match crate::pocket_ic::MessageId::try_from(raw_message_id) {
+        Ok(message_id) => {
+            let ingress_op = AwaitIngressMessage(message_id);
+            let (code, response) = run_operation(api_state, instance_id, timeout, ingress_op).await;
+            (code, Json(response))
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::Error {
+                message: format!("{:?}", e),
+            }),
+        ),
+    }
+}
 
 pub async fn handler_execute_ingress_message(
     State(AppState { api_state, .. }): State<AppState>,
@@ -776,6 +984,31 @@ pub async fn delete_instance(
     StatusCode::OK
 }
 
+/// Create a new HTTP gateway instance from a given HTTP gateway configuration.
+/// The new InstanceId and HTTP gateway's port will be returned.
+pub async fn create_http_gateway(
+    State(AppState { api_state, .. }): State<AppState>,
+    extract::Json(http_gateway_config): extract::Json<HttpGatewayConfig>,
+) -> (StatusCode, Json<rest::CreateHttpGatewayResponse>) {
+    let (instance_id, port) = api_state.create_http_gateway(http_gateway_config).await;
+    (
+        StatusCode::CREATED,
+        Json(rest::CreateHttpGatewayResponse::Created(HttpGatewayInfo {
+            instance_id,
+            port,
+        })),
+    )
+}
+
+/// Stops an HTTP gateway instance.
+pub async fn stop_http_gateway(
+    State(AppState { api_state, .. }): State<AppState>,
+    Path(id): Path<InstanceId>,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    api_state.stop_http_gateway(id).await;
+    (StatusCode::OK, Json(ApiResponse::Success(())))
+}
+
 pub async fn auto_progress(
     State(AppState { api_state, .. }): State<AppState>,
     Path(id): Path<InstanceId>,
@@ -863,4 +1096,29 @@ fn make_plaintext_response(status: StatusCode, message: String) -> Response<Body
         header::HeaderValue::from_static(CONTENT_TYPE_TEXT),
     );
     resp
+}
+
+pub async fn verify_cbor_content_header(
+    request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    const CONTENT_TYPE_CBOR: &str = "application/cbor";
+    if !request
+        .headers()
+        .get_all(http::header::CONTENT_TYPE)
+        .iter()
+        .any(|value| {
+            if let Ok(v) = value.to_str() {
+                return v.to_lowercase() == CONTENT_TYPE_CBOR;
+            }
+            false
+        })
+    {
+        return make_plaintext_response(
+            StatusCode::BAD_REQUEST,
+            format!("Unexpected content-type, expected {}.", CONTENT_TYPE_CBOR),
+        );
+    }
+
+    next.run(request).await
 }

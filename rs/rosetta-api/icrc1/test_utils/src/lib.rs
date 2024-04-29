@@ -1,7 +1,7 @@
 use candid::{Nat, Principal};
 use ic_agent::identity::BasicIdentity;
 use ic_agent::Identity;
-use ic_canister_client_sender::Ed25519KeyPair;
+use ic_crypto_test_utils_reproducible_rng::reproducible_rng;
 use ic_icrc1::{Block, Operation, Transaction};
 use ic_ledger_core::block::BlockType;
 use ic_ledger_core::tokens::TokensType;
@@ -16,6 +16,7 @@ use proptest::prelude::*;
 use proptest::sample::select;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
+use rosetta_core::models::Ed25519KeyPair;
 use rosetta_core::objects::Currency;
 use rosetta_core::objects::ObjectMap;
 use serde_bytes::ByteBuf;
@@ -30,14 +31,9 @@ pub const E8: u64 = 100_000_000;
 pub const DEFAULT_TRANSFER_FEE: u64 = 10_000;
 
 pub fn minter_identity() -> BasicIdentity {
-    let rng = ring::rand::SystemRandom::new();
-    let key_pair = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
-        .expect("Could not generate a key pair.");
-
-    BasicIdentity::from_key_pair(
-        ring::signature::Ed25519KeyPair::from_pkcs8(key_pair.as_ref())
-            .expect("Could not read the key pair."),
-    )
+    let mut rng = reproducible_rng();
+    let keypair = Ed25519KeyPair::generate(&mut rng);
+    BasicIdentity::from_pem(keypair.to_pem().as_bytes()).unwrap()
 }
 
 pub fn principal_strategy() -> impl Strategy<Value = Principal> {
@@ -512,12 +508,8 @@ fn amount_strategy() -> impl Strategy<Value = u64> {
 
 fn basic_identity_strategy() -> impl Strategy<Value = BasicIdentity> {
     prop::array::uniform32(0u8..).prop_map(|ran| {
-        let rng = ChaCha20Rng::from_seed(ran);
-        let signing_key = ed25519_consensus::SigningKey::new(rng);
-        let keypair = Ed25519KeyPair {
-            secret_key: signing_key.to_bytes(),
-            public_key: signing_key.verification_key().to_bytes(),
-        };
+        let mut rng = ChaCha20Rng::from_seed(ran);
+        let keypair = Ed25519KeyPair::generate(&mut rng);
         BasicIdentity::from_pem(keypair.to_pem().as_bytes()).unwrap()
     })
 }
@@ -1068,25 +1060,39 @@ pub fn currency_strategy() -> impl Strategy<Value = Currency> {
     })
 }
 
-pub fn valid_construction_payloads_request_metadata() -> impl Strategy<Value = ObjectMap> {
+pub fn construction_payloads_request_metadata() -> impl Strategy<Value = ObjectMap> {
     let memo_strategy = arb_memo();
     let now = SystemTime::now();
-    let now_u64 = now.duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
-    let ingress_start_strategy = prop::option::of(Just(now_u64));
-    let created_at_time = valid_created_at_time_strategy(now);
+    // We select the last and next 48 hours as an interval in which the ingress boundaries are set
+    // They do not have to be valid
+    let ingress_interval_start =
+        now.duration_since(UNIX_EPOCH).unwrap() - Duration::from_secs(60 * 60 * 48);
+    let ingress_interval_end =
+        now.duration_since(UNIX_EPOCH).unwrap() + Duration::from_secs(60 * 60 * 48);
+    let ingress_start_strategy =
+        prop::option::of(ingress_interval_start.as_nanos()..ingress_interval_end.as_nanos());
+    let ingress_end_strategy =
+        prop::option::of(ingress_interval_start.as_nanos()..ingress_interval_end.as_nanos());
+    let created_at_time =
+        prop::option::of(ingress_interval_start.as_nanos()..ingress_interval_end.as_nanos());
 
-    (memo_strategy, ingress_start_strategy, created_at_time).prop_map(
-        |(memo, ingress_start, created_at_time)| {
+    (
+        memo_strategy,
+        ingress_start_strategy,
+        ingress_end_strategy,
+        created_at_time,
+    )
+        .prop_map(|(memo, ingress_start, ingress_end, created_at_time)| {
             let mut map = ObjectMap::new();
             map.insert(
                 "memo".to_string(),
                 memo.map(|m| m.0.as_slice().to_vec()).into(),
             );
             map.insert("ingress_start".to_string(), ingress_start.into());
+            map.insert("ingress_end".to_string(), ingress_end.into());
             map.insert("created_at_time".to_string(), created_at_time.into());
             map
-        },
-    )
+        })
 }
 
 #[cfg(test)]

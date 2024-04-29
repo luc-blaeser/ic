@@ -37,6 +37,7 @@ use crate::driver::ic::{InternetComputer, Subnet};
 use crate::driver::prometheus_vm::{HasPrometheus, PrometheusVm};
 use crate::driver::test_env::TestEnv;
 use crate::driver::test_env_api::*;
+use crate::retry_with_msg_async;
 use crate::util::*; // to use the universal canister
 use anyhow::bail;
 use ic_registry_subnet_type::SubnetType;
@@ -47,8 +48,16 @@ pub fn config_single_host(env: TestEnv) {
         .start(&env)
         .expect("failed to start prometheus VM");
     InternetComputer::new()
-        .add_subnet(Subnet::new(SubnetType::System).add_nodes(4))
-        .add_subnet(Subnet::new(SubnetType::Application).add_nodes(4))
+        .add_subnet(
+            Subnet::new(SubnetType::System)
+                .with_random_height()
+                .add_nodes(4),
+        )
+        .add_subnet(
+            Subnet::new(SubnetType::Application)
+                .with_random_height()
+                .add_nodes(4),
+        )
         .setup_and_start(&env)
         .expect("failed to setup IC under test");
     env.sync_with_prometheus();
@@ -153,21 +162,30 @@ pub fn test(env: TestEnv) {
         node.with_default_agent(move |agent| async move {
             let ucan = UniversalCanister::from_canister_id(&agent, ucan_id);
             // NOTE: retries are important here, 1/3 of the nodes might not observe changes immediately.
-            retry_async(&log, READY_WAIT_TIMEOUT, RETRY_BACKOFF, || async {
-                let current_msg = ucan
-                    .try_read_stable_with_retries(
-                        &log,
-                        0,
-                        XNET_MSG.len() as u32,
-                        READ_RETRIES,
-                        RETRY_WAIT,
-                    )
-                    .await;
-                if current_msg != XNET_MSG.to_vec() {
-                    bail!("Expected message not found!")
+            retry_with_msg_async!(
+                format!(
+                    "check if read message from canister {} is as expected",
+                    ucan_id.to_string()
+                ),
+                &log,
+                READY_WAIT_TIMEOUT,
+                RETRY_BACKOFF,
+                || async {
+                    let current_msg = ucan
+                        .try_read_stable_with_retries(
+                            &log,
+                            0,
+                            XNET_MSG.len() as u32,
+                            READ_RETRIES,
+                            RETRY_WAIT,
+                        )
+                        .await;
+                    if current_msg != XNET_MSG.to_vec() {
+                        bail!("Expected message not found!")
+                    }
+                    Ok(())
                 }
-                Ok(())
-            })
+            )
             .await
             .expect("Node not healthy");
         })

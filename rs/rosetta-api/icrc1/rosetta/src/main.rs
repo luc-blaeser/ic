@@ -1,14 +1,13 @@
 use anyhow::{bail, Context, Result};
 use axum::{
     body::Body,
+    extract::Request,
     routing::{get, post},
     Router,
 };
 use clap::{Parser, ValueEnum};
-use http::Request;
 use ic_agent::{
-    agent::http_transport::reqwest_transport::ReqwestHttpReplicaV2Transport,
-    identity::AnonymousIdentity, Agent,
+    agent::http_transport::reqwest_transport::ReqwestTransport, identity::AnonymousIdentity, Agent,
 };
 use ic_base_types::CanisterId;
 use ic_icrc_rosetta::{
@@ -21,8 +20,9 @@ use ic_icrc_rosetta::{
 };
 use icrc_ledger_agent::{CallMode, Icrc1Agent};
 use lazy_static::lazy_static;
-use std::{net::TcpListener, sync::Arc};
+use std::sync::Arc;
 use std::{path::PathBuf, process};
+use tokio::{net::TcpListener, sync::Mutex as AsyncMutex};
 use tower_http::classify::{ServerErrorsAsFailures, SharedClassifier};
 use tower_http::trace::TraceLayer;
 use tower_request_id::{RequestId, RequestIdLayer};
@@ -290,7 +290,7 @@ async fn main() -> Result<()> {
 
     let ic_agent = Agent::builder()
         .with_identity(AnonymousIdentity)
-        .with_transport(ReqwestHttpReplicaV2Transport::create(
+        .with_transport(ReqwestTransport::create(
             Url::parse(&network_url)
                 .context(format!("Failed to parse URL {}", network_url.clone()))?,
         )?)
@@ -314,6 +314,16 @@ async fn main() -> Result<()> {
         ledger_canister_id: args.ledger_id.into(),
     });
 
+    let metadata = load_metadata(&args, &icrc1_agent, &storage).await?;
+
+    let shared_state = Arc::new(AppState {
+        icrc1_agent: icrc1_agent.clone(),
+        ledger_id: args.ledger_id,
+        storage: storage.clone(),
+        archive_canister_ids: Arc::new(AsyncMutex::new(vec![])),
+        metadata,
+    });
+
     if args.exit_on_sync {
         if args.offline {
             bail!("'exit-on-sync' and 'offline' parameters cannot be specified at the same time.");
@@ -324,19 +334,12 @@ async fn main() -> Result<()> {
             icrc1_agent.clone(),
             storage.clone(),
             *MAXIMUM_BLOCKS_PER_REQUEST,
+            Arc::new(AsyncMutex::new(vec![])),
         )
         .await?;
 
         process::exit(0);
     }
-
-    let metadata = load_metadata(&args, &icrc1_agent, &storage).await?;
-    let shared_state = Arc::new(AppState {
-        icrc1_agent: icrc1_agent.clone(),
-        ledger_id: args.ledger_id,
-        storage: storage.clone(),
-        metadata,
-    });
 
     let app = Router::new()
         .route("/health", get(health))
@@ -346,6 +349,7 @@ async fn main() -> Result<()> {
         .route("/block", post(block))
         .route("/account/balance", post(account_balance))
         .route("/block/transaction", post(block_transaction))
+        .route("/search/transactions", post(search_transactions))
         .route("/mempool", post(mempool))
         .route("/mempool/transaction", post(mempool_transaction))
         .route("/construction/derive", post(construction_derive))
@@ -363,9 +367,9 @@ async fn main() -> Result<()> {
         // request extensions. Note that it should be added after the
         // Trace layer.
         .layer(RequestIdLayer)
-        .with_state(shared_state);
+        .with_state(shared_state.clone());
 
-    let tcp_listener = TcpListener::bind(format!("0.0.0.0:{}", args.get_port()))?;
+    let tcp_listener = TcpListener::bind(format!("0.0.0.0:{}", args.get_port())).await?;
 
     if let Some(port_file) = args.port_file {
         std::fs::write(port_file, tcp_listener.local_addr()?.port().to_string())?;
@@ -379,6 +383,7 @@ async fn main() -> Result<()> {
                     icrc1_agent.clone(),
                     storage.clone(),
                     *MAXIMUM_BLOCKS_PER_REQUEST,
+                    shared_state.clone().archive_canister_ids.clone(),
                 )
                 .await
                 {
@@ -396,8 +401,7 @@ async fn main() -> Result<()> {
 
     info!("Starting Rosetta server");
 
-    axum::Server::from_tcp(tcp_listener)?
-        .serve(app.into_make_service())
+    axum::serve(tcp_listener, app.into_make_service())
         .await
         .context("Unable to start the Rosetta server")
 }

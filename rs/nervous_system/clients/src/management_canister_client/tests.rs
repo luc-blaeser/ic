@@ -89,7 +89,7 @@ async fn test_limit_outstanding_calls() {
         };
 
         thread_local! {
-            static SLOTS: RefCell<u64> = RefCell::new(2);
+            static SLOTS: RefCell<u64> = const { RefCell::new(2) };
         }
 
         let subject =
@@ -110,8 +110,10 @@ async fn test_limit_outstanding_calls() {
             compute_allocation: zero.clone(),
             memory_allocation: zero.clone(),
             freezing_threshold: zero.clone(),
+            reserved_cycles_limit: zero.clone(),
         },
         status: CanisterStatusType::Running,
+        reserved_cycles: zero.clone(),
     };
 
     // Step 2: Call code under test.

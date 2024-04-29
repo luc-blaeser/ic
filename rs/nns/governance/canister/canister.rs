@@ -31,7 +31,7 @@ use ic_nns_common::{
 };
 use ic_nns_constants::LEDGER_CANISTER_ID;
 use ic_nns_governance::{
-    encode_metrics,
+    decoder_config, encode_metrics,
     governance::{
         BitcoinNetwork, BitcoinSetConfigProposal, Environment, Governance, HeapGrowthPotential,
         TimeWarp,
@@ -51,10 +51,10 @@ use ic_nns_governance::{
         Governance as GovernanceProto, GovernanceError, ListKnownNeuronsResponse, ListNeurons,
         ListNeuronsResponse, ListNodeProvidersResponse, ListProposalInfo, ListProposalInfoResponse,
         ManageNeuron, ManageNeuronResponse, MostRecentMonthlyNodeProviderRewards, NetworkEconomics,
-        Neuron, NeuronInfo, NnsFunction, NodeProvider, Proposal, ProposalInfo, RewardEvent,
-        RewardNodeProviders, SettleCommunityFundParticipation,
+        Neuron, NeuronInfo, NnsFunction, NodeProvider, Proposal, ProposalInfo, RestoreAgingSummary,
+        RewardEvent, RewardNodeProviders, SettleCommunityFundParticipation,
         SettleNeuronsFundParticipationRequest, SettleNeuronsFundParticipationResponse,
-        UpdateNodeProvider, Vote, XdrConversionRate as XdrConversionRatePb,
+        UpdateNodeProvider, Vote,
     },
     storage::{grow_upgrades_memory_to, validate_stable_storage, with_upgrades_memory},
 };
@@ -252,7 +252,11 @@ impl Environment for CanisterEnv {
             );
         };
         let (canister_id, method) = mt.canister_and_function()?;
-        let effective_payload = get_effective_payload(mt, &update.payload);
+        let proposal_timestamp_seconds = governance()
+            .get_proposal_data(ProposalId(proposal_id))
+            .map(|data| data.proposal_timestamp_seconds);
+        let effective_payload =
+            get_effective_payload(mt, &update.payload, proposal_id, proposal_timestamp_seconds)?;
         let err = call_with_callbacks(canister_id, method, &effective_payload, reply, reject);
         if err != 0 {
             Err(GovernanceError::new(ErrorType::PreconditionFailed))
@@ -347,7 +351,7 @@ fn canister_post_upgrade() {
     dfn_core::printer::hook();
     println!("{}Executing post upgrade", LOG_PREFIX);
 
-    let mut restored_state = with_upgrades_memory(|memory| {
+    let restored_state = with_upgrades_memory(|memory| {
         let result: Result<GovernanceProto, _> = load_protobuf(memory);
         result
     })
@@ -355,30 +359,6 @@ fn canister_post_upgrade() {
         "Error deserializing canister state post-upgrade with MemoryManager memory segment. \
              CANISTER MIGHT HAVE BROKEN STATE!!!!.",
     );
-
-    // The following mutation migrates the Neurons' Fund from statically encoded limits to dynamic
-    // data stored in the `economics.neurons_fund_economics` field of NNS Governance.
-    //
-    // TODO[NNS1-2925]: Remove this statement.
-    if let Some(ref mut economics) = restored_state.economics {
-        if economics.neurons_fund_economics.is_none() {
-            economics.neurons_fund_economics =
-                Some(ic_nns_governance::pb::v1::NeuronsFundEconomics::with_default_values())
-        }
-    };
-
-    // The following mutation migrates the Governance canister to a state starting from which
-    // the field `xdr_conversion_rate` should alwasys be specified.
-    //
-    // TODO[NNS1-2925]: Remove this statement.
-    if restored_state.xdr_conversion_rate.is_none() {
-        let xdr_conversion_rate = XdrConversionRatePb::with_default_values();
-        println!(
-            "{}canister_post_upgrade: Initializing xdr_conversion_rate for the first time as {:?}",
-            LOG_PREFIX, xdr_conversion_rate,
-        );
-        restored_state.xdr_conversion_rate = Some(xdr_conversion_rate);
-    }
 
     grow_upgrades_memory_to(WASM_PAGES_RESERVED_FOR_UPGRADES_MEMORY);
 
@@ -948,6 +928,18 @@ fn get_migrations_() -> Migrations {
         .unwrap_or_default()
 }
 
+#[export_name = "canister_query get_restore_aging_summary"]
+fn get_restore_aging_summary() {
+    over(candid, |()| -> RestoreAgingSummary {
+        get_restore_aging_summary_()
+    })
+}
+
+#[candid_method(query, rename = "get_restore_aging_summary")]
+fn get_restore_aging_summary_() -> RestoreAgingSummary {
+    governance().get_restore_aging_summary().unwrap_or_default()
+}
+
 #[export_name = "canister_query http_request"]
 fn http_request() {
     dfn_http_metrics::serve_metrics(|metrics_encoder| {
@@ -956,7 +948,14 @@ fn http_request() {
 }
 
 // Processes the payload received and transforms it into a form the intended canister expects.
-fn get_effective_payload(mt: NnsFunction, payload: &[u8]) -> Cow<[u8]> {
+// The arguments `_proposal_id` and `_proposal_timestamp_seconds` will be used in the future
+// by subnet rental NNS proposals.
+fn get_effective_payload(
+    mt: NnsFunction,
+    payload: &[u8],
+    _proposal_id: u64,
+    _proposal_timestamp_seconds: Option<u64>,
+) -> Result<Cow<[u8]>, GovernanceError> {
     const BITCOIN_SET_CONFIG_METHOD_NAME: &str = "set_config";
     const BITCOIN_MAINNET_CANISTER_ID: &str = "ghsi2-tqaaa-aaaan-aaaca-cai";
     const BITCOIN_TESTNET_CANISTER_ID: &str = "g4xu7-jiaaa-aaaan-aaaaq-cai";
@@ -964,15 +963,18 @@ fn get_effective_payload(mt: NnsFunction, payload: &[u8]) -> Cow<[u8]> {
     match mt {
         NnsFunction::BitcoinSetConfig => {
             // Decode the payload to get the network.
-            let payload = Decode!(payload, BitcoinSetConfigProposal)
-                .expect("payload must be a valid BitcoinSetConfigProposal.");
+            let payload = match Decode!([decoder_config()]; payload, BitcoinSetConfigProposal) {
+              Ok(payload) => payload,
+              Err(_) => {
+                return Err(GovernanceError::new_with_message(ErrorType::InvalidProposal, "Payload must be a valid BitcoinSetConfigProposal."));
+              }
+            };
 
             // Convert it to a call canister payload.
             let canister_id = CanisterId::from_str(match payload.network {
                 BitcoinNetwork::Mainnet => BITCOIN_MAINNET_CANISTER_ID,
                 BitcoinNetwork::Testnet => BITCOIN_TESTNET_CANISTER_ID,
-            })
-            .expect("bitcoin canister id must be valid.");
+            }).expect("bitcoin canister id must be valid.");
 
             let encoded_payload = Encode!(&CallCanisterProposal {
                 canister_id,
@@ -981,7 +983,7 @@ fn get_effective_payload(mt: NnsFunction, payload: &[u8]) -> Cow<[u8]> {
             })
             .unwrap();
 
-            Cow::Owned(encoded_payload)
+            Ok(Cow::Owned(encoded_payload))
         }
 
         // NOTE: Methods are listed explicitly as opposed to using the `_` wildcard so
@@ -990,6 +992,8 @@ fn get_effective_payload(mt: NnsFunction, payload: &[u8]) -> Cow<[u8]> {
         NnsFunction::Unspecified
         | NnsFunction::UpdateElectedHostosVersions
         | NnsFunction::UpdateNodesHostosVersion
+        | NnsFunction::ReviseElectedHostosVersions
+        | NnsFunction::DeployHostosToSomeNodes
         | NnsFunction::AssignNoid
         | NnsFunction::CreateSubnet
         | NnsFunction::AddNodeToSubnet
@@ -1002,9 +1006,9 @@ fn get_effective_payload(mt: NnsFunction, payload: &[u8]) -> Cow<[u8]> {
         | NnsFunction::RecoverSubnet
         | NnsFunction::BlessReplicaVersion
         | NnsFunction::RetireReplicaVersion
-        | NnsFunction::UpdateElectedReplicaVersions
+        | NnsFunction::ReviseElectedGuestosVersions
         | NnsFunction::UpdateNodeOperatorConfig
-        | NnsFunction::UpdateSubnetReplicaVersion
+        | NnsFunction::DeployGuestosToAllSubnetNodes
         | NnsFunction::UpdateConfigOfSubnet
         | NnsFunction::IcpXdrConversionRate
         | NnsFunction::ClearProvisionalWhitelist
@@ -1018,7 +1022,7 @@ fn get_effective_payload(mt: NnsFunction, payload: &[u8]) -> Cow<[u8]> {
         | NnsFunction::UninstallCode
         | NnsFunction::UpdateNodeRewardsTable
         | NnsFunction::AddOrRemoveDataCenters
-        | NnsFunction::UpdateUnassignedNodesConfig
+        | NnsFunction::UpdateUnassignedNodesConfig // obsolete
         | NnsFunction::RemoveNodeOperators
         | NnsFunction::RerouteCanisterRanges
         | NnsFunction::PrepareCanisterMigration
@@ -1031,7 +1035,10 @@ fn get_effective_payload(mt: NnsFunction, payload: &[u8]) -> Cow<[u8]> {
         | NnsFunction::InsertSnsWasmUpgradePathEntries
         | NnsFunction::AddApiBoundaryNode
         | NnsFunction::RemoveApiBoundaryNodes
-        | NnsFunction::UpdateApiBoundaryNodesVersion => Cow::Borrowed(payload),
+        | NnsFunction::UpdateApiBoundaryNodesVersion // obsolete
+        | NnsFunction::DeployGuestosToAllUnassignedNodes
+        | NnsFunction::UpdateSshReadonlyAccessForAllUnassignedNodes
+        | NnsFunction::DeployGuestosToSomeApiBoundaryNodes => Ok(Cow::Borrowed(payload)),
     }
 }
 

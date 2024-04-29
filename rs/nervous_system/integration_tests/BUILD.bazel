@@ -15,7 +15,6 @@ BASE_DEPENDENCIES = [
     "//rs/rosetta-api/icrc1",
     "//rs/rosetta-api/icrc1/index-ng",
     "//rs/rosetta-api/icrc1/tokens_u64",
-    "//rs/sns/governance",
     "//rs/sns/root",
     "//rs/test_utilities/load_wasm",
     "//rs/types/base_types",
@@ -30,6 +29,7 @@ BASE_DEPENDENCIES = [
     "//conditions:default": [
         "//packages/icrc-ledger-types:icrc_ledger_types",
         "//packages/pocket-ic",
+        "//rs/crypto/sha2",
         "//rs/nervous_system/common/test_keys",
         "//rs/protobuf",
         "//rs/registry/canister",
@@ -70,6 +70,7 @@ DEPENDENCIES_WITH_TEST_FEATURES = BASE_DEPENDENCIES + [
     "//rs/nns/governance:governance--test_feature",
     "//rs/nns/sns-wasm:sns-wasm--test_feature",
     "//rs/nns/handlers/root/impl:root--test_feature",
+    "//rs/sns/governance:governance--test_feature",
     "//rs/sns/swap:swap--test_feature",
 ] + select({
     "@rules_rust//rust/platform:wasm32-unknown-unknown": [],
@@ -77,6 +78,7 @@ DEPENDENCIES_WITH_TEST_FEATURES = BASE_DEPENDENCIES + [
         "//rs/nns/constants:constants--test_feature",
         "//rs/nns/test_utils:test_utils--test_feature",
         "//rs/nns/gtc:gtc--test_feature",
+        "//rs/sns/test_utils:test_utils--test_feature",
     ],
 })
 
@@ -99,7 +101,9 @@ DEV_DATA = [
     "@mainnet_nns_sns-wasm-canister//file",
     "@mainnet_icp_ledger_canister//file",
     "@mainnet_nns_governance_canister//file",
+    "@mainnet_nns_lifeline_canister//file",
     "@mainnet_nns_root-canister//file",
+    "@mainnet_nns_registry_canister//file",
     "//rs/registry/canister:registry-canister",
     "//rs/rosetta-api/icp_ledger/archive:ledger-archive-node-canister-wasm",
     "//rs/rosetta-api/icp_ledger/ledger:ledger-canister-wasm",
@@ -139,7 +143,9 @@ DEV_ENV = {
     "MAINNET_SNS_WASM_CANISTER_WASM_PATH": "$(rootpath @mainnet_nns_sns-wasm-canister//file)",
     "MAINNET_ICP_LEDGER_CANISTER_WASM_PATH": "$(rootpath @mainnet_icp_ledger_canister//file)",
     "MAINNET_GOVERNANCE_CANISTER_WASM_PATH": "$(rootpath @mainnet_nns_governance_canister//file)",
+    "MAINNET_LIFELINE_CANISTER_WASM_PATH": "$(rootpath @mainnet_nns_lifeline_canister//file)",
     "MAINNET_ROOT_CANISTER_WASM_PATH": "$(rootpath @mainnet_nns_root-canister//file)",
+    "MAINNET_REGISTRY_CANISTER_WASM_PATH": "$(rootpath @mainnet_nns_registry_canister//file)",
     "NEURON_CSV_PATH": "rs/nns/integration_tests/src/neurons.csv",
     "GENESIS_TOKEN_CANISTER_WASM_PATH": "$(rootpath //rs/nns/gtc:genesis-token-canister)",
     "SNS_WASM_CANISTER_WASM_PATH": "$(rootpath //rs/nns/sns-wasm:sns-wasm-canister)",

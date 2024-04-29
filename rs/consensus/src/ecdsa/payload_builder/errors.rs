@@ -1,11 +1,11 @@
 use ic_crypto::MegaKeyFromRegistryError;
 use ic_interfaces_state_manager::StateManagerError;
 use ic_types::{
-    consensus::ecdsa,
+    consensus::idkg,
     crypto::canister_threshold_sig::{
         error::{
-            IDkgParamsValidationError, IDkgTranscriptIdError, PresignatureQuadrupleCreationError,
-            ThresholdEcdsaSigInputsCreationError,
+            EcdsaPresignatureQuadrupleCreationError, IDkgParamsValidationError,
+            IDkgTranscriptIdError, ThresholdEcdsaSigInputsCreationError,
         },
         idkg::InitialIDkgDealings,
     },
@@ -15,25 +15,28 @@ use ic_types::{
 
 use super::InvalidChainCacheError;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
+// The fields are only read by the `Debug` implementation.
+// The `dead_code` lint ignores `Debug` impls, see: https://github.com/rust-lang/rust/issues/88900.
+// #[allow(dead_code)]
 pub(crate) enum EcdsaPayloadError {
     RegistryClientError(RegistryClientError),
     MegaKeyFromRegistryError(MegaKeyFromRegistryError),
     ConsensusSummaryBlockNotFound(Height),
     StateManagerError(StateManagerError),
     SubnetWithNoNodes(SubnetId, RegistryVersion),
-    PreSignatureError(PresignatureQuadrupleCreationError),
+    PreSignatureError(EcdsaPresignatureQuadrupleCreationError),
     IDkgParamsValidationError(IDkgParamsValidationError),
     IDkgTranscriptIdError(IDkgTranscriptIdError),
     ThresholdEcdsaSigInputsCreationError(ThresholdEcdsaSigInputsCreationError),
-    TranscriptLookupError(ecdsa::TranscriptLookupError),
-    TranscriptCastError(ecdsa::TranscriptCastError),
+    TranscriptLookupError(idkg::TranscriptLookupError),
+    TranscriptCastError(idkg::TranscriptCastError),
     InvalidChainCacheError(InvalidChainCacheError),
     InitialIDkgDealingsNotUnmaskedParams(Box<InitialIDkgDealings>),
 }
 
-impl From<ecdsa::TranscriptLookupError> for EcdsaPayloadError {
-    fn from(err: ecdsa::TranscriptLookupError) -> Self {
+impl From<idkg::TranscriptLookupError> for EcdsaPayloadError {
+    fn from(err: idkg::TranscriptLookupError) -> Self {
         EcdsaPayloadError::TranscriptLookupError(err)
     }
 }
@@ -50,8 +53,8 @@ impl From<StateManagerError> for EcdsaPayloadError {
     }
 }
 
-impl From<PresignatureQuadrupleCreationError> for EcdsaPayloadError {
-    fn from(err: PresignatureQuadrupleCreationError) -> Self {
+impl From<EcdsaPresignatureQuadrupleCreationError> for EcdsaPayloadError {
+    fn from(err: EcdsaPresignatureQuadrupleCreationError) -> Self {
         EcdsaPayloadError::PreSignatureError(err)
     }
 }
@@ -74,8 +77,8 @@ impl From<ThresholdEcdsaSigInputsCreationError> for EcdsaPayloadError {
     }
 }
 
-impl From<ecdsa::TranscriptCastError> for EcdsaPayloadError {
-    fn from(err: ecdsa::TranscriptCastError) -> Self {
+impl From<idkg::TranscriptCastError> for EcdsaPayloadError {
+    fn from(err: idkg::TranscriptCastError) -> Self {
         EcdsaPayloadError::TranscriptCastError(err)
     }
 }

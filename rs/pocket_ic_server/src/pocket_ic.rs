@@ -5,9 +5,11 @@ use crate::Operation;
 use crate::{copy_dir, BlobStore};
 use axum::{extract::State, response::IntoResponse};
 use hyper::body::Bytes;
-use hyper::header::HeaderValue;
+use hyper::header::{HeaderValue, CONTENT_TYPE};
+use hyper::Method;
 use ic_boundary::{Health, RootKey};
 use ic_config::execution_environment;
+use ic_config::flag_status::FlagStatus;
 use ic_config::subnet_config::SubnetConfig;
 use ic_crypto_sha2::Sha256;
 use ic_http_endpoints_public::{
@@ -26,15 +28,17 @@ use ic_types::{
     artifact::UnvalidatedArtifactMutation,
     artifact_kind::IngressArtifact,
     crypto::{BasicSig, BasicSigOf, CryptoResult, Signable},
-    messages::{CertificateDelegation, QueryResponseHash, ReplicaHealthStatus},
+    messages::{
+        CertificateDelegation, MessageId as OtherMessageId, QueryResponseHash, ReplicaHealthStatus,
+    },
     CanisterId, NodeId, NumInstructions, PrincipalId, RegistryVersion, SubnetId,
 };
 use ic_validator_ingress_message::StandaloneIngressSigVerifier;
 use itertools::Itertools;
 use pocket_ic::common::rest::{
-    self, BinaryBlob, BlobCompression, ExtendedSubnetConfigSet, RawAddCycles, RawCanisterCall,
-    RawEffectivePrincipal, RawSetStableMemory, SubnetInstructionConfig, SubnetKind, SubnetSpec,
-    Topology,
+    self, BinaryBlob, BlobCompression, DtsFlag, ExtendedSubnetConfigSet, RawAddCycles,
+    RawCanisterCall, RawEffectivePrincipal, RawMessageId, RawSetStableMemory,
+    SubnetInstructionConfig, SubnetKind, SubnetSpec, Topology,
 };
 use rand::rngs::StdRng;
 use rand::Rng;
@@ -68,6 +72,9 @@ pub struct PocketIc {
     // where a canister should be created. This value is seeded,
     // so reproducibility is maintained.
     randomness: StdRng,
+    // Used for computing the state label to distinguish PocketIC instances
+    // with different initial configs.
+    subnet_configs: ExtendedSubnetConfigSet,
 }
 
 impl PocketIc {
@@ -80,6 +87,7 @@ impl PocketIc {
                     SubnetKind::System,
                     spec.get_state_path(),
                     spec.get_instruction_config(),
+                    spec.get_dts_flag(),
                 )
             });
             let app = subnet_configs.application.iter().map(|spec| {
@@ -87,6 +95,7 @@ impl PocketIc {
                     SubnetKind::Application,
                     spec.get_state_path(),
                     spec.get_instruction_config(),
+                    spec.get_dts_flag(),
                 )
             });
             sys.chain(app)
@@ -96,14 +105,14 @@ impl PocketIc {
         let mut subnet_config_info: Vec<SubnetConfigInfo> = vec![];
         let mut routing_table = RoutingTable::new();
 
-        let mut nns_subnet_id = subnet_configs.nns.and_then(|x| {
+        let mut nns_subnet_id = subnet_configs.nns.as_ref().and_then(|x| {
             x.get_subnet_id()
                 .map(|y| SubnetId::new(PrincipalId(y.into())))
         });
 
         let ii_subnet_split = subnet_configs.ii.is_some();
 
-        for (subnet_kind, subnet_state_dir, instruction_config) in
+        for (subnet_kind, subnet_state_dir, instruction_config, dts_flag) in
             fixed_range_subnets.into_iter().chain(flexible_subnets)
         {
             let RangeConfig {
@@ -125,6 +134,7 @@ impl PocketIc {
                 subnet_kind,
                 state_dir,
                 instruction_config,
+                dts_flag,
             });
         }
 
@@ -142,10 +152,12 @@ impl PocketIc {
                 subnet_kind,
                 state_dir,
                 instruction_config,
+                dts_flag,
             },
         ) in subnet_config_info.into_iter().enumerate()
         {
-            let mut subnet_config = SubnetConfig::new(conv_type(subnet_kind));
+            let subnet_type = conv_type(subnet_kind);
+            let mut subnet_config = SubnetConfig::new(subnet_type);
             let mut hypervisor_config = execution_environment::Config::default();
             if let SubnetInstructionConfig::Benchmarking = instruction_config {
                 let instruction_limit = NumInstructions::new(99_999_999_999_999);
@@ -158,6 +170,15 @@ impl PocketIc {
                     .max_instructions_per_message_without_dts = instruction_limit;
                 hypervisor_config.max_query_call_graph_instructions = instruction_limit;
             }
+            // bound PocketIc resource consumption
+            hypervisor_config.embedders_config.min_sandbox_count = 0;
+            hypervisor_config.embedders_config.max_sandbox_count = 64;
+            hypervisor_config.embedders_config.max_sandbox_idle_time = Duration::from_secs(30);
+            // enable canister debug prints
+            hypervisor_config
+                .embedders_config
+                .feature_flags
+                .rate_limiting_of_debug_prints = FlagStatus::Disabled;
             let sm_config = StateMachineConfig::new(subnet_config, hypervisor_config);
             let subnet_size = subnet_size(subnet_kind);
             let mut builder = StateMachineBuilder::new()
@@ -165,9 +186,14 @@ impl PocketIc {
                 .with_config(Some(sm_config))
                 .with_subnet_seq_no(subnet_seq_no as u8)
                 .with_subnet_size(subnet_size.try_into().unwrap())
+                .with_subnet_type(subnet_type)
                 .with_registry_data_provider(registry_data_provider.clone())
                 .with_multisubnet_ecdsa_key()
                 .with_use_cost_scaling_flag(true);
+
+            if let DtsFlag::Disabled = dts_flag {
+                builder = builder.no_dts();
+            };
 
             if subnet_kind == SubnetKind::NNS {
                 builder = builder.with_root_subnet_config();
@@ -227,6 +253,7 @@ impl PocketIc {
             routing_table,
             topology,
             randomness: StdRng::seed_from_u64(42),
+            subnet_configs,
         }
     }
 
@@ -327,6 +354,8 @@ impl Default for PocketIc {
 impl HasStateLabel for PocketIc {
     fn get_state_label(&self) -> StateLabel {
         let mut hasher = Sha256::new();
+        let subnet_configs_string = format!("{:?}", self.subnet_configs);
+        hasher.write(subnet_configs_string.as_bytes());
         for subnet in self.subnets.read().unwrap().values() {
             let subnet_state_hash = subnet
                 .state_manager
@@ -482,6 +511,7 @@ struct SubnetConfigInfo {
     pub subnet_kind: SubnetKind,
     pub state_dir: Option<TempDir>,
     pub instruction_config: SubnetInstructionConfig,
+    pub dts_flag: DtsFlag,
 }
 
 // ---------------------------------------------------------------------------------------- //
@@ -552,7 +582,6 @@ pub struct Tick;
 impl Operation for Tick {
     fn compute(&self, pic: &mut PocketIc) -> OpOut {
         for subnet in pic.subnets.read().unwrap().values() {
-            subnet.advance_time(Duration::from_nanos(1));
             subnet.execute_round();
         }
         OpOut::NoOutput
@@ -577,6 +606,121 @@ impl Operation for AdvanceTimeAndTick {
 
     fn id(&self) -> OpId {
         OpId(format!("advance_time_and_tick({:?})", self.0))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SubmitIngressMessage(pub CanisterCall);
+
+impl Operation for SubmitIngressMessage {
+    fn compute(&self, pic: &mut PocketIc) -> OpOut {
+        let canister_call = self.0.clone();
+        let subnet = route_call(pic, canister_call);
+        match subnet {
+            Ok(subnet) => {
+                match subnet.submit_ingress_as(
+                    self.0.sender,
+                    self.0.canister_id,
+                    self.0.method.clone(),
+                    self.0.payload.clone(),
+                ) {
+                    Err(SubmitIngressError::HttpError(e)) => {
+                        eprintln!("Failed to submit ingress message: {}", e);
+                        OpOut::Error(PocketIcError::BadIngressMessage(e))
+                    }
+                    Err(SubmitIngressError::UserError(e)) => {
+                        eprintln!("Failed to submit ingress message: {:?}", e);
+                        Err::<ic_state_machine_tests::WasmResult, ic_state_machine_tests::UserError>(e).into()
+                    }
+                    Ok(msg_id) => OpOut::MessageId((
+                        EffectivePrincipal::SubnetId(subnet.get_subnet_id()),
+                        msg_id.as_bytes().to_vec(),
+                    )),
+                }
+            }
+            Err(e) => OpOut::Error(PocketIcError::BadIngressMessage(e)),
+        }
+    }
+
+    fn id(&self) -> OpId {
+        let call_id = self.0.id();
+        OpId(format!("submit_update_{}", call_id.0))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MessageId {
+    effective_principal: EffectivePrincipal,
+    msg_id: OtherMessageId,
+}
+
+impl TryFrom<RawMessageId> for MessageId {
+    type Error = ConversionError;
+    fn try_from(
+        RawMessageId {
+            effective_principal,
+            message_id,
+        }: RawMessageId,
+    ) -> Result<Self, Self::Error> {
+        let effective_principal = effective_principal.try_into()?;
+        let msg_id = match OtherMessageId::try_from(message_id.as_slice()) {
+            Ok(msg_id) => msg_id,
+            Err(_) => {
+                return Err(ConversionError {
+                    message: "Bad message id".to_string(),
+                })
+            }
+        };
+        Ok(MessageId {
+            effective_principal,
+            msg_id,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AwaitIngressMessage(pub MessageId);
+
+impl Operation for AwaitIngressMessage {
+    fn compute(&self, pic: &mut PocketIc) -> OpOut {
+        let subnet = route(pic, self.0.effective_principal.clone(), None);
+        match subnet {
+            Ok(subnet) => {
+                // Now, we execute on all subnets until we have the result
+                let max_rounds = 100;
+                for _i in 0..max_rounds {
+                    match subnet.ingress_status(&self.0.msg_id) {
+                        IngressStatus::Known {
+                            state: IngressState::Completed(result),
+                            ..
+                        } => return Ok(result).into(),
+                        IngressStatus::Known {
+                            state: IngressState::Failed(error),
+                            ..
+                        } => {
+                            return Err::<
+                                ic_state_machine_tests::WasmResult,
+                                ic_state_machine_tests::UserError,
+                            >(error)
+                            .into()
+                        }
+                        _ => {}
+                    }
+                    for subnet_ in pic.subnets.read().unwrap().values() {
+                        subnet_.execute_round();
+                    }
+                }
+                OpOut::Error(PocketIcError::BadIngressMessage(format!(
+                    "Failed to answer to ingress {} after {} rounds.",
+                    self.0.msg_id, max_rounds
+                )))
+            }
+            Err(e) => OpOut::Error(PocketIcError::BadIngressMessage(e)),
+        }
+    }
+
+    fn id(&self) -> OpId {
+        OpId(format!("await_update_{}", self.0.msg_id))
     }
 }
 
@@ -608,7 +752,6 @@ impl Operation for ExecuteIngressMessage {
                         let max_rounds = 100;
                         for _i in 0..max_rounds {
                             for subnet_ in pic.subnets.read().unwrap().values() {
-                                subnet_.advance_time(Duration::from_nanos(1));
                                 subnet_.execute_round();
                             }
                             match subnet.ingress_status(&msg_id) {
@@ -711,7 +854,6 @@ const CONTENT_TYPE_CBOR: HeaderValue = HeaderValue::from_static("application/cbo
 pub async fn status(
     State((rk, h)): State<(Arc<dyn RootKey>, Arc<dyn Health>)>,
 ) -> impl IntoResponse {
-    use hyper::header::CONTENT_TYPE;
     use ic_types::messages::HttpStatusResponse;
 
     let health = h.health().await;
@@ -828,10 +970,15 @@ impl Operation for CallRequest {
                     Arc::new(RwLock::new(PocketIngressPoolThrottler)),
                     s,
                 )
-                .build();
+                .build_service();
 
                 let request = axum::http::Request::builder()
-                    .extension(PrincipalId(self.effective_canister_id.get().into()))
+                    .method(Method::POST)
+                    .header(CONTENT_TYPE, CONTENT_TYPE_CBOR)
+                    .uri(format!(
+                        "/api/v2/canister/{}/call",
+                        PrincipalId(self.effective_canister_id.get().into())
+                    ))
                     .body(self.bytes.clone().into())
                     .unwrap();
                 let resp = self.runtime.block_on(svc.oneshot(request)).unwrap();
@@ -920,10 +1067,15 @@ impl Operation for QueryRequest {
                         }
                     })),
                 )
-                .build();
+                .build_service();
 
                 let request = axum::http::Request::builder()
-                    .extension(PrincipalId(self.effective_canister_id.get().into()))
+                    .method(Method::POST)
+                    .header(CONTENT_TYPE, CONTENT_TYPE_CBOR)
+                    .uri(format!(
+                        "/api/v2/canister/{}/query",
+                        PrincipalId(self.effective_canister_id.get().into())
+                    ))
                     .body(self.bytes.clone().into())
                     .unwrap();
                 let resp = self.runtime.block_on(svc.oneshot(request)).unwrap();
@@ -979,10 +1131,15 @@ impl Operation for ReadStateRequest {
                     Arc::new(StandaloneIngressSigVerifier),
                     Arc::new(RwLock::new(delegation)),
                 )
-                .build();
+                .build_service();
 
                 let request = axum::http::Request::builder()
-                    .extension(PrincipalId(self.effective_canister_id.get().into()))
+                    .method(Method::POST)
+                    .header(CONTENT_TYPE, CONTENT_TYPE_CBOR)
+                    .uri(format!(
+                        "/api/v2/canister/{}/read_state",
+                        PrincipalId(self.effective_canister_id.get().into())
+                    ))
                     .body(self.bytes.clone().into())
                     .unwrap();
                 let resp = self.runtime.block_on(svc.oneshot(request)).unwrap();
@@ -1017,11 +1174,51 @@ impl Operation for ReadStateRequest {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum EffectivePrincipal {
     None,
     SubnetId(SubnetId),
     CanisterId(CanisterId),
+}
+
+impl TryFrom<RawEffectivePrincipal> for EffectivePrincipal {
+    type Error = ConversionError;
+    fn try_from(effective_principal: RawEffectivePrincipal) -> Result<Self, Self::Error> {
+        match effective_principal {
+            RawEffectivePrincipal::SubnetId(subnet_id) => {
+                let sid = PrincipalId::try_from(subnet_id);
+                match sid {
+                    Ok(sid) => Ok(EffectivePrincipal::SubnetId(SubnetId::new(sid))),
+                    Err(_) => Err(ConversionError {
+                        message: "Bad subnet id".to_string(),
+                    }),
+                }
+            }
+            RawEffectivePrincipal::CanisterId(canister_id) => {
+                match CanisterId::try_from(canister_id) {
+                    Ok(canister_id) => Ok(EffectivePrincipal::CanisterId(canister_id)),
+                    Err(_) => Err(ConversionError {
+                        message: "Bad effective canister id".to_string(),
+                    }),
+                }
+            }
+            RawEffectivePrincipal::None => Ok(EffectivePrincipal::None),
+        }
+    }
+}
+
+impl From<EffectivePrincipal> for RawEffectivePrincipal {
+    fn from(effective_principal: EffectivePrincipal) -> Self {
+        match effective_principal {
+            EffectivePrincipal::None => RawEffectivePrincipal::None,
+            EffectivePrincipal::CanisterId(canister_id) => {
+                RawEffectivePrincipal::CanisterId(canister_id.get().to_vec())
+            }
+            EffectivePrincipal::SubnetId(subnet_id) => {
+                RawEffectivePrincipal::SubnetId(subnet_id.get().to_vec())
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1044,30 +1241,7 @@ impl TryFrom<RawCanisterCall> for CanisterCall {
             effective_principal,
         }: RawCanisterCall,
     ) -> Result<Self, Self::Error> {
-        let effective_principal = match effective_principal {
-            RawEffectivePrincipal::SubnetId(subnet_id) => {
-                let sid = PrincipalId::try_from(subnet_id);
-                match sid {
-                    Ok(sid) => EffectivePrincipal::SubnetId(SubnetId::new(sid)),
-                    Err(_) => {
-                        return Err(ConversionError {
-                            message: "Bad subnet id".to_string(),
-                        })
-                    }
-                }
-            }
-            RawEffectivePrincipal::CanisterId(canister_id) => {
-                match CanisterId::try_from(canister_id) {
-                    Ok(canister_id) => EffectivePrincipal::CanisterId(canister_id),
-                    Err(_) => {
-                        return Err(ConversionError {
-                            message: "Bad effective canister id".to_string(),
-                        })
-                    }
-                }
-            }
-            RawEffectivePrincipal::None => EffectivePrincipal::None,
-        };
+        let effective_principal = effective_principal.try_into()?;
         let sender = match PrincipalId::try_from(sender) {
             Ok(sender) => sender,
             Err(_) => {
@@ -1184,7 +1358,7 @@ pub struct GetStableMemory {
 
 impl Operation for GetStableMemory {
     fn compute(&self, pocket_ic: &mut PocketIc) -> OpOut {
-        OpOut::Bytes(
+        OpOut::StableMemBytes(
             pocket_ic
                 .try_route_canister(self.canister_id)
                 .unwrap()
@@ -1227,12 +1401,12 @@ impl Operation for GetSubnet {
         match sm {
             Some(sm) => {
                 if sm.canister_exists(self.canister_id) {
-                    OpOut::SubnetId(sm.get_subnet_id())
+                    OpOut::MaybeSubnetId(Some(sm.get_subnet_id()))
                 } else {
-                    OpOut::Error(PocketIcError::CanisterNotFound(self.canister_id))
+                    OpOut::MaybeSubnetId(None)
                 }
             }
-            None => OpOut::Error(PocketIcError::CanisterNotFound(self.canister_id)),
+            None => OpOut::MaybeSubnetId(None),
         }
     }
 

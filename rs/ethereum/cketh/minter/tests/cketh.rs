@@ -13,20 +13,22 @@ use ic_cketh_minter::lifecycle::upgrade::UpgradeArg;
 use ic_cketh_minter::memo::{BurnMemo, MintMemo};
 use ic_cketh_minter::numeric::BlockNumber;
 use ic_cketh_minter::{PROCESS_REIMBURSEMENT, SCRAPPING_ETH_LOGS_INTERVAL};
-use ic_cketh_test_utils::flow::{DepositParams, ProcessWithdrawalParams};
+use ic_cketh_test_utils::flow::{
+    double_and_increment_base_fee_per_gas, DepositParams, ProcessWithdrawalParams,
+};
 use ic_cketh_test_utils::mock::{JsonRpcMethod, JsonRpcProvider, MockJsonRpcProviders};
 use ic_cketh_test_utils::response::{
     all_eth_get_logs_response_size_estimates, block_response, decode_transaction,
-    default_signed_eip_1559_transaction, empty_logs, encode_transaction, hash_transaction,
-    multi_logs_for_single_transaction, transaction_count_response, transaction_receipt,
+    default_signed_eip_1559_transaction, empty_logs, hash_transaction,
+    multi_logs_for_single_transaction,
 };
 use ic_cketh_test_utils::{
-    CkEthSetup, CKETH_TRANSFER_FEE, DEFAULT_BLOCK_HASH, DEFAULT_BLOCK_NUMBER,
-    DEFAULT_DEPOSIT_FROM_ADDRESS, DEFAULT_DEPOSIT_LOG_INDEX, DEFAULT_DEPOSIT_TRANSACTION_HASH,
-    DEFAULT_PRINCIPAL_ID, DEFAULT_WITHDRAWAL_DESTINATION_ADDRESS,
-    DEFAULT_WITHDRAWAL_TRANSACTION_HASH, EXPECTED_BALANCE, HELPER_SMART_CONTRACT_ADDRESS,
-    LAST_SCRAPED_BLOCK_NUMBER_AT_INSTALL, MAX_ETH_LOGS_BLOCK_RANGE, MINTER_ADDRESS,
-    RECEIVED_ETH_EVENT_TOPIC,
+    CkEthSetup, CKETH_MINIMUM_WITHDRAWAL_AMOUNT, CKETH_TRANSFER_FEE, CKETH_WITHDRAWAL_AMOUNT,
+    DEFAULT_BLOCK_HASH, DEFAULT_BLOCK_NUMBER, DEFAULT_DEPOSIT_FROM_ADDRESS,
+    DEFAULT_DEPOSIT_LOG_INDEX, DEFAULT_DEPOSIT_TRANSACTION_HASH, DEFAULT_PRINCIPAL_ID,
+    DEFAULT_WITHDRAWAL_DESTINATION_ADDRESS, DEFAULT_WITHDRAWAL_TRANSACTION_HASH,
+    ETH_HELPER_CONTRACT_ADDRESS, EXPECTED_BALANCE, LAST_SCRAPED_BLOCK_NUMBER_AT_INSTALL,
+    MAX_ETH_LOGS_BLOCK_RANGE, MINTER_ADDRESS, RECEIVED_ETH_EVENT_TOPIC,
 };
 use ic_ethereum_types::Address;
 use icrc_ledger_types::icrc1::account::Account;
@@ -34,7 +36,6 @@ use icrc_ledger_types::icrc1::transfer::Memo;
 use icrc_ledger_types::icrc3::transactions::{Burn, Mint};
 use num_traits::cast::ToPrimitive;
 use serde_json::json;
-use std::convert::identity;
 use std::str::FromStr;
 
 #[test]
@@ -42,7 +43,7 @@ fn should_deposit_and_withdraw() {
     let cketh = CkEthSetup::default();
     let minter: Principal = cketh.minter_id.into();
     let caller: Principal = cketh.caller.into();
-    let withdrawal_amount = Nat::from(EXPECTED_BALANCE - CKETH_TRANSFER_FEE);
+    let withdrawal_amount = Nat::from(CKETH_WITHDRAWAL_AMOUNT);
     let destination = DEFAULT_WITHDRAWAL_DESTINATION_ADDRESS.to_string();
 
     let cketh = cketh
@@ -143,7 +144,7 @@ fn should_deposit_and_withdraw() {
 fn should_retrieve_cache_transaction_price() {
     let cketh = CkEthSetup::default();
     let caller: Principal = cketh.caller.into();
-    let withdrawal_amount = Nat::from(EXPECTED_BALANCE - CKETH_TRANSFER_FEE);
+    let withdrawal_amount = Nat::from(CKETH_WITHDRAWAL_AMOUNT);
     let destination = DEFAULT_WITHDRAWAL_DESTINATION_ADDRESS.to_string();
 
     let result = cketh.eip_1559_transaction_price();
@@ -205,11 +206,11 @@ fn should_not_mint_when_logs_inconsistent() {
     let deposit_params = DepositParams::default();
     let (ankr_logs, public_node_logs) = {
         let ankr_log_entry = deposit_params.eth_log_entry();
-        let mut cloudflare_log_entry = ankr_log_entry.clone();
-        cloudflare_log_entry.amount += 1;
+        let mut llama_nodes_log_entry = ankr_log_entry.clone();
+        llama_nodes_log_entry.amount += 1;
         (
             vec![ethers_core::types::Log::from(ankr_log_entry)],
-            vec![ethers_core::types::Log::from(cloudflare_log_entry)],
+            vec![ethers_core::types::Log::from(llama_nodes_log_entry)],
         )
     };
     assert_ne!(ankr_logs, public_node_logs);
@@ -218,7 +219,7 @@ fn should_not_mint_when_logs_inconsistent() {
         .deposit(deposit_params.with_mock_eth_get_logs(move |mock| {
             mock.respond_with(JsonRpcProvider::Ankr, ankr_logs.clone())
                 .respond_with(JsonRpcProvider::PublicNode, public_node_logs.clone())
-                .respond_with(JsonRpcProvider::Cloudflare, ankr_logs.clone())
+                .respond_with(JsonRpcProvider::LlamaNodes, ankr_logs.clone())
         }))
         .expect_no_mint();
 }
@@ -227,7 +228,7 @@ fn should_not_mint_when_logs_inconsistent() {
 fn should_block_withdrawal_to_blocked_address() {
     let cketh = CkEthSetup::default();
     let caller: Principal = cketh.caller.into();
-    let withdrawal_amount = Nat::from(EXPECTED_BALANCE - CKETH_TRANSFER_FEE);
+    let withdrawal_amount = Nat::from(CKETH_WITHDRAWAL_AMOUNT);
     let blocked_address = "0x01e2919679362dFBC9ee1644Ba9C6da6D6245BB1".to_string();
 
     cketh
@@ -251,7 +252,7 @@ fn should_fail_to_withdraw_without_approval() {
         .expect_mint()
         .call_minter_withdraw_eth(
             caller,
-            Nat::from(10_u8),
+            Nat::from(CKETH_MINIMUM_WITHDRAWAL_AMOUNT),
             DEFAULT_WITHDRAWAL_DESTINATION_ADDRESS.to_string(),
         )
         .expect_error(WithdrawalError::InsufficientAllowance {
@@ -263,8 +264,8 @@ fn should_fail_to_withdraw_without_approval() {
 fn should_fail_to_withdraw_when_insufficient_funds() {
     let cketh = CkEthSetup::default();
     let caller: Principal = cketh.caller.into();
-    let deposit_amount = 10_000_000_000_000_000_u64;
-    let amount_after_approval = deposit_amount - CKETH_TRANSFER_FEE;
+    let deposit_amount = CKETH_MINIMUM_WITHDRAWAL_AMOUNT + CKETH_TRANSFER_FEE;
+    let amount_after_approval = CKETH_MINIMUM_WITHDRAWAL_AMOUNT;
     assert!(deposit_amount > amount_after_approval);
 
     cketh
@@ -292,15 +293,15 @@ fn should_fail_to_withdraw_too_small_amount() {
     cketh
         .deposit(DepositParams::default())
         .expect_mint()
-        .call_ledger_approve_minter(caller, 10_000, None)
+        .call_ledger_approve_minter(caller, CKETH_MINIMUM_WITHDRAWAL_AMOUNT, None)
         .expect_ok(1)
         .call_minter_withdraw_eth(
             caller,
-            Nat::from(CKETH_TRANSFER_FEE - 1),
+            Nat::from(CKETH_MINIMUM_WITHDRAWAL_AMOUNT - 1),
             DEFAULT_WITHDRAWAL_DESTINATION_ADDRESS.to_string(),
         )
         .expect_error(WithdrawalError::AmountTooLow {
-            min_withdrawal_amount: CKETH_TRANSFER_FEE.into(),
+            min_withdrawal_amount: CKETH_MINIMUM_WITHDRAWAL_AMOUNT.into(),
         });
 }
 
@@ -308,7 +309,7 @@ fn should_fail_to_withdraw_too_small_amount() {
 fn should_not_finalize_transaction_when_receipts_do_not_match() {
     let cketh = CkEthSetup::default();
     let caller: Principal = cketh.caller.into();
-    let withdrawal_amount = Nat::from(EXPECTED_BALANCE - CKETH_TRANSFER_FEE);
+    let withdrawal_amount = Nat::from(CKETH_WITHDRAWAL_AMOUNT);
 
     cketh
         .deposit(DepositParams::default())
@@ -322,20 +323,7 @@ fn should_not_finalize_transaction_when_receipts_do_not_match() {
         )
         .expect_withdrawal_request_accepted()
         .wait_and_validate_withdrawal(
-            ProcessWithdrawalParams::default().with_mock_eth_get_transaction_receipt(move |mock| {
-                mock.modify_response(
-                    JsonRpcProvider::Ankr,
-                    &mut |response: &mut ethers_core::types::TransactionReceipt| {
-                        response.status = Some(0.into())
-                    },
-                )
-                .modify_response(
-                    JsonRpcProvider::PublicNode,
-                    &mut |response: &mut ethers_core::types::TransactionReceipt| {
-                        response.status = Some(1.into())
-                    },
-                )
-            }),
+            ProcessWithdrawalParams::default().with_inconsistent_transaction_receipt(),
         )
         .expect_status(RetrieveEthStatus::TxSent(EthTransaction {
             transaction_hash: DEFAULT_WITHDRAWAL_TRANSACTION_HASH.to_string(),
@@ -346,7 +334,7 @@ fn should_not_finalize_transaction_when_receipts_do_not_match() {
 fn should_not_send_eth_transaction_when_fee_history_inconsistent() {
     let cketh = CkEthSetup::default();
     let caller: Principal = cketh.caller.into();
-    let withdrawal_amount = Nat::from(EXPECTED_BALANCE - CKETH_TRANSFER_FEE);
+    let withdrawal_amount = Nat::from(CKETH_WITHDRAWAL_AMOUNT);
 
     cketh
         .deposit(DepositParams::default())
@@ -374,7 +362,7 @@ fn should_not_send_eth_transaction_when_fee_history_inconsistent() {
                 },
             )
             .modify_response(
-                JsonRpcProvider::Cloudflare,
+                JsonRpcProvider::LlamaNodes,
                 &mut |response: &mut ethers_core::types::FeeHistory| {
                     response.oldest_block = 0x17740744_u64.into()
                 },
@@ -388,7 +376,7 @@ fn should_reimburse() {
     let cketh = CkEthSetup::default();
     let minter: Principal = cketh.minter_id.into();
     let caller: Principal = cketh.caller.into();
-    let withdrawal_amount = Nat::from(EXPECTED_BALANCE - CKETH_TRANSFER_FEE);
+    let withdrawal_amount = Nat::from(CKETH_WITHDRAWAL_AMOUNT);
     let destination = "0x221E931fbFcb9bd54DdD26cE6f5e29E98AdD01C0".to_string();
 
     let cketh = cketh
@@ -414,7 +402,10 @@ fn should_reimburse() {
     let balance_before_withdrawal = cketh.balance_of(caller);
     assert_eq!(balance_before_withdrawal, withdrawal_amount);
 
-    let time_before_withdrawal = cketh.env.get_time().as_nanos_since_unix_epoch();
+    let time_at_withdrawal = cketh
+        .env
+        .get_time_of_next_round()
+        .as_nanos_since_unix_epoch();
 
     let cketh = cketh
         .call_minter_withdraw_eth(caller, withdrawal_amount.clone(), destination.clone())
@@ -424,13 +415,7 @@ fn should_reimburse() {
     let (tx, _sig) = default_signed_eip_1559_transaction();
     let cketh = cketh
         .wait_and_validate_withdrawal(
-            ProcessWithdrawalParams::default().with_mock_eth_get_transaction_receipt(move |mock| {
-                mock.modify_response_for_all(
-                    &mut |receipt: &mut ethers_core::types::TransactionReceipt| {
-                        receipt.status = Some(0_u64.into())
-                    },
-                )
-            }),
+            ProcessWithdrawalParams::default().with_failed_transaction_receipt(),
         )
         .expect_finalized_status(TxFinalizedStatus::PendingReimbursement(EthTransaction {
             transaction_hash: DEFAULT_WITHDRAWAL_TRANSACTION_HASH.to_string(),
@@ -495,7 +480,7 @@ fn should_reimburse() {
                 owner: PrincipalId::new_user_test_id(DEFAULT_PRINCIPAL_ID).into(),
                 subaccount: None,
             },
-            memo: Some(Memo::from(MintMemo::Reimburse {
+            memo: Some(Memo::from(MintMemo::ReimburseTransaction {
                 withdrawal_id: withdrawal_id.0.to_u64().unwrap(),
                 tx_hash: failed_tx_hash.parse().unwrap(),
             })),
@@ -508,7 +493,7 @@ fn should_reimburse() {
                 ledger_burn_index: withdrawal_id.clone(),
                 from: caller,
                 from_subaccount: None,
-                created_at: Some(time_before_withdrawal),
+                created_at: Some(time_at_withdrawal),
             },
             EventPayload::CreatedTransaction {
                 withdrawal_id: withdrawal_id.clone(),
@@ -553,11 +538,10 @@ fn should_reimburse() {
 fn should_resubmit_transaction_as_is_when_price_still_actual() {
     let cketh = CkEthSetup::default();
     let caller: Principal = cketh.caller.into();
-    let withdrawal_amount = Nat::from(EXPECTED_BALANCE - CKETH_TRANSFER_FEE);
+    let withdrawal_amount = Nat::from(CKETH_WITHDRAWAL_AMOUNT);
     let (expected_tx, expected_sig) = default_signed_eip_1559_transaction();
-    let expected_sent_tx = encode_transaction(expected_tx, expected_sig);
 
-    let cketh = cketh
+    cketh
         .deposit(DepositParams::default())
         .expect_mint()
         .call_ledger_approve_minter(caller, EXPECTED_BALANCE, None)
@@ -568,68 +552,29 @@ fn should_resubmit_transaction_as_is_when_price_still_actual() {
             DEFAULT_WITHDRAWAL_DESTINATION_ADDRESS.to_string(),
         )
         .expect_withdrawal_request_accepted()
-        .start_processing_withdrawals()
-        .retrieve_fee_history(identity)
-        .expect_status(RetrieveEthStatus::Pending)
-        .retrieve_latest_transaction_count(identity)
-        .expect_status(RetrieveEthStatus::TxCreated)
-        .send_raw_transaction_expecting(&expected_sent_tx)
-        .expect_status_sent()
-        .retrieve_finalized_transaction_count(|mock| {
-            mock.modify_response_for_all(&mut |count: &mut String| {
-                *count = transaction_count_response(0)
-            })
-        })
-        .expect_pending_transaction()
-        .retry_processing_withdrawals()
-        .retrieve_fee_history(identity)
-        .expect_status(RetrieveEthStatus::TxSent(EthTransaction {
-            transaction_hash: DEFAULT_WITHDRAWAL_TRANSACTION_HASH.to_string(),
-        }))
-        .retrieve_latest_transaction_count(|mock| {
-            mock.modify_response_for_all(&mut |count: &mut String| {
-                *count = transaction_count_response(0)
-            })
-        })
-        .expect_status(RetrieveEthStatus::TxSent(EthTransaction {
-            transaction_hash: DEFAULT_WITHDRAWAL_TRANSACTION_HASH.to_string(),
-        }))
-        .send_raw_transaction_expecting(&expected_sent_tx)
-        .expect_status_sent()
-        .retrieve_finalized_transaction_count(|mock| {
-            mock.modify_response_for_all(&mut |count: &mut String| {
-                *count = transaction_count_response(1)
-            })
-        })
-        .expect_finalized_transaction()
-        .retrieve_transaction_receipt(identity)
-        .expect_finalized_status(TxFinalizedStatus::Success(EthTransaction {
-            transaction_hash: DEFAULT_WITHDRAWAL_TRANSACTION_HASH.to_string(),
-        }));
-
-    cketh.assert_has_no_event_satisfying(|event| {
-        matches!(event, EventPayload::ReplacedTransaction { .. })
-    });
+        .process_withdrawal_with_resubmission_and_same_price(expected_tx, expected_sig)
+        .assert_has_no_event_satisfying(|event| {
+            matches!(event, EventPayload::ReplacedTransaction { .. })
+        });
 }
 
 #[test]
 fn should_resubmit_new_transaction_when_price_increased() {
     let cketh = CkEthSetup::default();
     let caller: Principal = cketh.caller.into();
-    let withdrawal_amount = Nat::from(EXPECTED_BALANCE - CKETH_TRANSFER_FEE);
+    let withdrawal_amount = Nat::from(CKETH_WITHDRAWAL_AMOUNT);
     let (expected_tx, expected_sig) = default_signed_eip_1559_transaction();
     let first_tx_hash = hash_transaction(expected_tx.clone(), expected_sig);
-    let expected_sent_tx = encode_transaction(expected_tx.clone(), expected_sig);
-    let resubmitted_sent_tx = "0x02f87301808462590080850873e448ec82520894221e931fbfcb9bd54ddd26ce6f5e29e98add01c088016090159f0c209680c080a0b43ed9d22ba0731a5cb30ca6e8e171982ab0edc5040dfe0aeee2c77e1b89bd9ea01dfb601f4125243a81ce4d2bfe10c60d519f92a3a4eff8b6dc3da69e19382238";
+    let resubmitted_sent_tx = "0x02f87301808462590080850f0de1e14682520894221e931fbfcb9bd54ddd26ce6f5e29e98add01c088015e728d945289c680c001a0537665ebe010409f026674776c6273ef7af3a79bca42492a263ec405c3869c2ca00a238d29dbf894e7cf85b70d5ecd62fc99e375b754c112bcbe1199fc9f00dff2";
     let (resubmitted_tx, resubmitted_tx_sig) = decode_transaction(resubmitted_sent_tx);
     let resubmitted_tx_hash = hash_transaction(resubmitted_tx.clone(), resubmitted_tx_sig);
     assert_eq!(
         resubmitted_tx,
         expected_tx
             .clone()
-            .value(99_237_614_339_235_990_u64)
+            .value(98_642_194_253_121_990_u64)
             .max_priority_fee_per_gas(1_650_000_000_u64)
-            .max_fee_per_gas(36_304_079_084_u64)
+            .max_fee_per_gas(64_657_416_518_u64)
     );
     assert_ne!(first_tx_hash, resubmitted_tx_hash);
 
@@ -647,82 +592,45 @@ fn should_resubmit_new_transaction_when_price_increased() {
 
     let withdrawal_id = cketh.withdrawal_id().clone();
 
-    let cketh = cketh
-        .start_processing_withdrawals()
-        .retrieve_fee_history(identity)
-        .expect_status(RetrieveEthStatus::Pending)
-        .retrieve_latest_transaction_count(identity)
-        .expect_status(RetrieveEthStatus::TxCreated)
-        .send_raw_transaction_expecting(&expected_sent_tx)
-        .expect_status_sent()
-        .retrieve_finalized_transaction_count(|mock| {
-            mock.modify_response_for_all(&mut |count: &mut String| {
-                *count = transaction_count_response(0)
-            })
-        })
-        .expect_pending_transaction()
-        .retry_processing_withdrawals()
-        .retrieve_fee_history(|mock| mock.modify_response_for_all(&mut increment_base_fee_per_gas))
-        .expect_status(RetrieveEthStatus::TxSent(EthTransaction {
-            transaction_hash: DEFAULT_WITHDRAWAL_TRANSACTION_HASH.to_string(),
-        }))
-        .retrieve_latest_transaction_count(|mock| {
-            mock.modify_response_for_all(&mut |count: &mut String| {
-                *count = transaction_count_response(0)
-            })
-        })
-        .expect_status(RetrieveEthStatus::TxCreated)
-        .send_raw_transaction_expecting(&encode_transaction(resubmitted_tx, resubmitted_tx_sig))
-        .expect_status_sent()
-        .retrieve_finalized_transaction_count(|mock| {
-            mock.modify_response_for_all(&mut |count: &mut String| {
-                *count = transaction_count_response(1)
-            })
-        })
-        .expect_finalized_transaction()
-        .retrieve_transaction_receipt(|mock| {
-            mock.with_request_params(json!([first_tx_hash]))
-                .respond_for_all_with(serde_json::Value::Null)
-        })
-        .retrieve_transaction_receipt(|mock| {
-            mock.with_request_params(json!([resubmitted_tx_hash]))
-                .respond_for_all_with(transaction_receipt(format!("{:?}", resubmitted_tx_hash)))
-        })
-        .expect_finalized_status(TxFinalizedStatus::Success(EthTransaction {
-            transaction_hash: format!("{:?}", resubmitted_tx_hash),
-        }));
-
-    cketh.assert_has_unique_events_in_order(&vec![
-        EventPayload::ReplacedTransaction {
-            withdrawal_id: withdrawal_id.clone(),
-            transaction: UnsignedTransaction {
-                chain_id: Nat::from(1_u8),
-                nonce: Nat::from(0_u8),
-                max_priority_fee_per_gas: Nat::from(1_650_000_000_u64),
-                max_fee_per_gas: Nat::from(36_304_079_084_u64),
-                gas_limit: Nat::from(21_000_u32),
-                destination: DEFAULT_WITHDRAWAL_DESTINATION_ADDRESS.to_string(),
-                value: Nat::from(99_237_614_339_235_990_u64),
-                data: Default::default(),
-                access_list: vec![],
+    cketh
+        .process_withdrawal_with_resubmission_and_increased_price(
+            expected_tx,
+            expected_sig,
+            &mut double_and_increment_base_fee_per_gas,
+            resubmitted_tx,
+            resubmitted_tx_sig,
+        )
+        .assert_has_unique_events_in_order(&vec![
+            EventPayload::ReplacedTransaction {
+                withdrawal_id: withdrawal_id.clone(),
+                transaction: UnsignedTransaction {
+                    chain_id: Nat::from(1_u8),
+                    nonce: Nat::from(0_u8),
+                    max_priority_fee_per_gas: Nat::from(1_650_000_000_u64),
+                    max_fee_per_gas: Nat::from(64_657_416_518_u64),
+                    gas_limit: Nat::from(21_000_u32),
+                    destination: DEFAULT_WITHDRAWAL_DESTINATION_ADDRESS.to_string(),
+                    value: Nat::from(98_642_194_253_121_990_u64),
+                    data: Default::default(),
+                    access_list: vec![],
+                },
             },
-        },
-        EventPayload::SignedTransaction {
-            withdrawal_id: withdrawal_id.clone(),
-            raw_transaction: resubmitted_sent_tx.to_string(),
-        },
-        EventPayload::FinalizedTransaction {
-            withdrawal_id,
-            transaction_receipt: TransactionReceipt {
-                block_hash: DEFAULT_BLOCK_HASH.to_string(),
-                block_number: Nat::from(DEFAULT_BLOCK_NUMBER),
-                effective_gas_price: Nat::from(4277923390u64),
-                gas_used: Nat::from(21_000_u32),
-                status: TransactionStatus::Success,
-                transaction_hash: format!("{:?}", resubmitted_tx_hash),
+            EventPayload::SignedTransaction {
+                withdrawal_id: withdrawal_id.clone(),
+                raw_transaction: resubmitted_sent_tx.to_string(),
             },
-        },
-    ]);
+            EventPayload::FinalizedTransaction {
+                withdrawal_id,
+                transaction_receipt: TransactionReceipt {
+                    block_hash: DEFAULT_BLOCK_HASH.to_string(),
+                    block_number: Nat::from(DEFAULT_BLOCK_NUMBER),
+                    effective_gas_price: Nat::from(4277923390u64),
+                    gas_used: Nat::from(21_000_u32),
+                    status: TransactionStatus::Success,
+                    transaction_hash: format!("{:?}", resubmitted_tx_hash),
+                },
+            },
+        ]);
 }
 
 #[test]
@@ -743,7 +651,7 @@ fn should_not_overlap_when_scrapping_logs() {
         .with_request_params(json!([{
             "fromBlock": first_from_block,
             "toBlock": first_to_block,
-            "address": [HELPER_SMART_CONTRACT_ADDRESS],
+            "address": [ETH_HELPER_CONTRACT_ADDRESS],
             "topics": [RECEIVED_ETH_EVENT_TOPIC]
         }]))
         .respond_for_all_with(empty_logs())
@@ -760,7 +668,7 @@ fn should_not_overlap_when_scrapping_logs() {
         .with_request_params(json!([{
             "fromBlock": second_from_block,
             "toBlock": second_to_block,
-            "address": [HELPER_SMART_CONTRACT_ADDRESS],
+            "address": [ETH_HELPER_CONTRACT_ADDRESS],
             "topics": [RECEIVED_ETH_EVENT_TOPIC]
         }]))
         .respond_for_all_with(empty_logs())
@@ -791,7 +699,7 @@ fn should_retry_from_same_block_when_scrapping_fails() {
         .with_request_params(json!([{
             "fromBlock": from_block,
             "toBlock": to_block,
-            "address": [HELPER_SMART_CONTRACT_ADDRESS],
+            "address": [ETH_HELPER_CONTRACT_ADDRESS],
             "topics": [RECEIVED_ETH_EVENT_TOPIC]
         }]))
         .respond_for_all_with(empty_logs())
@@ -814,7 +722,7 @@ fn should_retry_from_same_block_when_scrapping_fails() {
         .with_request_params(json!([{
             "fromBlock": from_block,
             "toBlock": to_block,
-            "address": [HELPER_SMART_CONTRACT_ADDRESS],
+            "address": [ETH_HELPER_CONTRACT_ADDRESS],
             "topics": [RECEIVED_ETH_EVENT_TOPIC]
         }]))
         .respond_for_all_with(empty_logs())
@@ -842,7 +750,7 @@ fn should_scrap_one_block_when_at_boundary_with_last_finalized_block() {
         .with_request_params(json!([{
             "fromBlock": from_block,
             "toBlock": from_block,
-            "address": [HELPER_SMART_CONTRACT_ADDRESS],
+            "address": [ETH_HELPER_CONTRACT_ADDRESS],
             "topics": [RECEIVED_ETH_EVENT_TOPIC]
         }]))
         .respond_for_all_with(empty_logs())
@@ -879,7 +787,7 @@ fn should_panic_when_last_finalized_block_in_the_past() {
         .with_request_params(json!([{
             "fromBlock": first_from_block,
             "toBlock": first_to_block,
-            "address": [HELPER_SMART_CONTRACT_ADDRESS],
+            "address": [ETH_HELPER_CONTRACT_ADDRESS],
             "topics": [RECEIVED_ETH_EVENT_TOPIC]
         }]))
         .respond_for_all_with(empty_logs())
@@ -914,7 +822,7 @@ fn should_skip_scrapping_when_last_seen_block_newer_than_current_height() {
                     mock.with_request_params(json!([{
                         "fromBlock": BlockNumber::from(LAST_SCRAPED_BLOCK_NUMBER_AT_INSTALL + 1),
                         "toBlock": BlockNumber::from(safe_block_number),
-                        "address": [HELPER_SMART_CONTRACT_ADDRESS],
+                        "address": [ETH_HELPER_CONTRACT_ADDRESS],
                         "topics": [RECEIVED_ETH_EVENT_TOPIC]
                     }]))
                 }),
@@ -973,7 +881,7 @@ fn should_half_range_of_scrapped_logs_when_response_over_two_mega_bytes() {
             .with_request_params(json!([{
                 "fromBlock": from_block,
                 "toBlock": to_block,
-                "address": [HELPER_SMART_CONTRACT_ADDRESS],
+                "address": [ETH_HELPER_CONTRACT_ADDRESS],
                 "topics": [RECEIVED_ETH_EVENT_TOPIC]
             }]))
             .with_max_response_bytes(max_response_bytes)
@@ -986,7 +894,7 @@ fn should_half_range_of_scrapped_logs_when_response_over_two_mega_bytes() {
         .with_request_params(json!([{
             "fromBlock": from_block,
             "toBlock": half_to_block,
-            "address": [HELPER_SMART_CONTRACT_ADDRESS],
+            "address": [ETH_HELPER_CONTRACT_ADDRESS],
             "topics": [RECEIVED_ETH_EVENT_TOPIC]
         }]))
         .with_max_response_bytes(all_eth_get_logs_response_size_estimates()[0])
@@ -1021,7 +929,7 @@ fn should_skip_single_block_containing_too_many_events() {
             .with_request_params(json!([{
                 "fromBlock": BlockNumber::from(LAST_SCRAPED_BLOCK_NUMBER_AT_INSTALL + 1),
                 "toBlock": BlockNumber::from(LAST_SCRAPED_BLOCK_NUMBER_AT_INSTALL + 3),
-                "address": [HELPER_SMART_CONTRACT_ADDRESS],
+                "address": [ETH_HELPER_CONTRACT_ADDRESS],
                 "topics": [RECEIVED_ETH_EVENT_TOPIC]
             }]))
             .with_max_response_bytes(max_response_bytes)
@@ -1035,7 +943,7 @@ fn should_skip_single_block_containing_too_many_events() {
             .with_request_params(json!([{
                 "fromBlock": BlockNumber::from(LAST_SCRAPED_BLOCK_NUMBER_AT_INSTALL + 1),
                 "toBlock": BlockNumber::from(LAST_SCRAPED_BLOCK_NUMBER_AT_INSTALL + 2),
-                "address": [HELPER_SMART_CONTRACT_ADDRESS],
+                "address": [ETH_HELPER_CONTRACT_ADDRESS],
                 "topics": [RECEIVED_ETH_EVENT_TOPIC]
             }]))
             .with_max_response_bytes(max_response_bytes)
@@ -1049,7 +957,7 @@ fn should_skip_single_block_containing_too_many_events() {
             .with_request_params(json!([{
                 "fromBlock": BlockNumber::from(LAST_SCRAPED_BLOCK_NUMBER_AT_INSTALL + 1),
                 "toBlock": BlockNumber::from(LAST_SCRAPED_BLOCK_NUMBER_AT_INSTALL + 1),
-                "address": [HELPER_SMART_CONTRACT_ADDRESS],
+                "address": [ETH_HELPER_CONTRACT_ADDRESS],
                 "topics": [RECEIVED_ETH_EVENT_TOPIC]
             }]))
             .with_max_response_bytes(max_response_bytes)
@@ -1062,7 +970,7 @@ fn should_skip_single_block_containing_too_many_events() {
         .with_request_params(json!([{
             "fromBlock": BlockNumber::from(LAST_SCRAPED_BLOCK_NUMBER_AT_INSTALL + 2),
             "toBlock": BlockNumber::from(LAST_SCRAPED_BLOCK_NUMBER_AT_INSTALL + 3),
-            "address": [HELPER_SMART_CONTRACT_ADDRESS],
+            "address": [ETH_HELPER_CONTRACT_ADDRESS],
             "topics": [RECEIVED_ETH_EVENT_TOPIC]
         }]))
         .with_max_response_bytes(all_eth_get_logs_response_size_estimates()[0])
@@ -1082,11 +990,12 @@ fn should_skip_single_block_containing_too_many_events() {
         ]);
 }
 
+#[allow(deprecated)]
 #[test]
 fn should_retrieve_minter_info() {
     let cketh = CkEthSetup::default();
     let caller: Principal = cketh.caller.into();
-    let withdrawal_amount = Nat::from(EXPECTED_BALANCE - CKETH_TRANSFER_FEE);
+    let withdrawal_amount = Nat::from(CKETH_WITHDRAWAL_AMOUNT);
     let destination = DEFAULT_WITHDRAWAL_DESTINATION_ADDRESS.to_string();
 
     let info_at_start = cketh.get_minter_info();
@@ -1095,13 +1004,19 @@ fn should_retrieve_minter_info() {
         MinterInfo {
             minter_address: Some(format_ethereum_address_to_eip_55(MINTER_ADDRESS)),
             smart_contract_address: Some(format_ethereum_address_to_eip_55(
-                HELPER_SMART_CONTRACT_ADDRESS
+                ETH_HELPER_CONTRACT_ADDRESS
             )),
-            minimum_withdrawal_amount: Some(Nat::from(CKETH_TRANSFER_FEE)),
+            eth_helper_contract_address: Some(format_ethereum_address_to_eip_55(
+                ETH_HELPER_CONTRACT_ADDRESS
+            )),
+            erc20_helper_contract_address: None,
+            supported_ckerc20_tokens: None,
+            minimum_withdrawal_amount: Some(Nat::from(CKETH_MINIMUM_WITHDRAWAL_AMOUNT)),
             ethereum_block_height: Some(Finalized),
             last_observed_block_number: None,
             eth_balance: Some(Nat::from(0_u8)),
             last_gas_fee_estimate: None,
+            erc20_balances: None,
         }
     );
 
@@ -1136,12 +1051,6 @@ fn should_retrieve_minter_info() {
             ..info_after_deposit
         }
     );
-}
-
-fn increment_base_fee_per_gas(fee_history: &mut ethers_core::types::FeeHistory) {
-    for base_fee_per_gas in fee_history.base_fee_per_gas.iter_mut() {
-        *base_fee_per_gas = base_fee_per_gas.checked_add(1_u64.into()).unwrap();
-    }
 }
 
 fn format_ethereum_address_to_eip_55(address: &str) -> String {

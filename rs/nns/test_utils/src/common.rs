@@ -313,6 +313,11 @@ pub fn build_registry_wasm() -> Wasm {
     let features = [];
     Project::cargo_bin_maybe_from_env("registry-canister", &features)
 }
+/// Build mainnet Wasm for NNS Registry canister
+pub fn build_mainnet_registry_wasm() -> Wasm {
+    let features = [];
+    Project::cargo_bin_maybe_from_env("mainnet-registry-canister", &features)
+}
 /// Build Wasm for NNS Ledger canister
 pub fn build_ledger_wasm() -> Wasm {
     let features = ["notify-method"];
@@ -328,6 +333,13 @@ pub fn build_lifeline_wasm() -> Wasm {
     Wasm::from_location_specified_by_env_var("lifeline_canister", &[])
         .unwrap_or_else(|| Wasm::from_bytes(LIFELINE_CANISTER_WASM))
 }
+
+/// Build mainnet Wasm for NNS Lifeline canister
+pub fn build_mainnet_lifeline_wasm() -> Wasm {
+    let features = [];
+    Project::cargo_bin_maybe_from_env("mainnet-lifeline-canister", &features)
+}
+
 /// Build Wasm for NNS Genesis Token canister
 pub fn build_genesis_token_wasm() -> Wasm {
     let features = [];

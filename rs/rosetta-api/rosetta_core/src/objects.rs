@@ -1,4 +1,4 @@
-use crate::models::EdKeypair;
+use crate::models::Ed25519KeyPair;
 use crate::models::RosettaSupportedKeyPair;
 use crate::models::Secp256k1KeyPair;
 use crate::{
@@ -13,6 +13,7 @@ use anyhow::Context;
 use candid::Nat;
 use candid::Principal;
 use ic_types::PrincipalId;
+use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
@@ -313,9 +314,9 @@ pub struct Amount {
 }
 
 impl Amount {
-    pub fn new(value: String, currency: Currency) -> Self {
+    pub fn new(value: BigInt, currency: Currency) -> Self {
         Self {
-            value,
+            value: value.to_string(),
             currency,
             metadata: None,
         }
@@ -503,7 +504,7 @@ impl PublicKey {
     pub fn get_der_encoding(&self) -> anyhow::Result<Vec<u8>> {
         match self.curve_type {
             CurveType::Edwards25519 => {
-                EdKeypair::der_encode_pk(EdKeypair::hex_decode_pk(&self.hex_bytes)?)
+                Ed25519KeyPair::der_encode_pk(Ed25519KeyPair::hex_decode_pk(&self.hex_bytes)?)
             }
             CurveType::Secp256K1 => {
                 Secp256k1KeyPair::der_encode_pk(Secp256k1KeyPair::hex_decode_pk(&self.hex_bytes)?)

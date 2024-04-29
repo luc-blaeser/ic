@@ -16,9 +16,10 @@ use ic_sns_governance::{
 };
 use ic_sns_test_utils::{
     itest_helpers::SnsTestsInitPayloadBuilder,
-    state_test_helpers::{setup_sns_canisters, sns_root_register_dapp_canisters},
+    state_test_helpers::{
+        setup_sns_canisters, sns_root_register_dapp_canisters, state_machine_builder_for_sns_tests,
+    },
 };
-use ic_state_machine_tests::StateMachine;
 use lazy_static::lazy_static;
 use tokio::time::Duration;
 
@@ -29,7 +30,7 @@ lazy_static! {
 
 #[test]
 fn test_manage_dapp_canister_settings_successful() {
-    let state_machine = StateMachine::new();
+    let state_machine = state_machine_builder_for_sns_tests().build();
 
     // Step 1.1: Boot up SNS with one user.
     let user = PrincipalId::new_user_test_id(0);
@@ -105,7 +106,8 @@ fn test_manage_dapp_canister_settings_successful() {
             Some(1 << 30),
             100_000,
             Some(1_000_000_000_000),
-            ic_management_canister_types::LogVisibility::Public
+            ic_management_canister_types::LogVisibility::Public,
+            Some(0),
         ),
     );
 
@@ -156,14 +158,15 @@ fn test_manage_dapp_canister_settings_successful() {
             Some(0),
             0,
             Some(0),
-            ic_management_canister_types::LogVisibility::Controllers
+            ic_management_canister_types::LogVisibility::Controllers,
+            Some(0),
         ),
     );
 }
 
 #[test]
 fn test_manage_dapp_canister_settings_failure() {
-    let state_machine = StateMachine::new();
+    let state_machine = state_machine_builder_for_sns_tests().build();
 
     // Step 1.1: Boot up SNS with one user.
     let user = PrincipalId::new_user_test_id(0);
@@ -195,6 +198,7 @@ fn test_manage_dapp_canister_settings_failure() {
                 .with_memory_allocation(1 << 30)
                 .with_freezing_threshold(100_000)
                 .with_reserved_cycles_limit(1_000_000_000_000)
+                .with_wasm_memory_limit(1_000_000_000)
                 .with_log_visibility(ic_management_canister_types::LogVisibility::Public)
                 .build(),
         ),
@@ -231,7 +235,8 @@ fn test_manage_dapp_canister_settings_failure() {
             Some(1 << 30),
             100_000,
             Some(1_000_000_000_000),
-            ic_management_canister_types::LogVisibility::Public
+            ic_management_canister_types::LogVisibility::Public,
+            Some(1_000_000_000),
         ),
     );
 
@@ -303,7 +308,8 @@ fn test_manage_dapp_canister_settings_failure() {
             Some(1 << 30),
             100_000,
             Some(1_000_000_000_000),
-            ic_management_canister_types::LogVisibility::Public
+            ic_management_canister_types::LogVisibility::Public,
+            Some(1_000_000_000),
         ),
     );
 

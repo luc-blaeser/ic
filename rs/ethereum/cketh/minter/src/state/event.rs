@@ -3,8 +3,13 @@ use crate::eth_logs::{EventSource, ReceivedErc20Event, ReceivedEthEvent, Receive
 use crate::eth_rpc_client::responses::TransactionReceipt;
 use crate::lifecycle::{init::InitArg, upgrade::UpgradeArg};
 use crate::numeric::{BlockNumber, LedgerBurnIndex, LedgerMintIndex};
-use crate::state::transactions::{Erc20WithdrawalRequest, EthWithdrawalRequest, Reimbursed};
+use crate::state::transactions::{
+    Erc20WithdrawalRequest, EthWithdrawalRequest, Reimbursed, ReimbursementIndex,
+    ReimbursementRequest,
+};
 use crate::tx::{Eip1559TransactionRequest, SignedEip1559TransactionRequest};
+use candid::Principal;
+use ic_ethereum_types::Address;
 use minicbor::{Decode, Encode};
 
 /// The event describing the ckETH minter state transition.
@@ -43,7 +48,7 @@ pub enum EventType {
     /// The minter processed the helper smart contract logs up to the specified height.
     #[n(6)]
     SyncedToBlock {
-        /// The last processed block number (inclusive).
+        /// The last processed block number for ETH helper contract (inclusive).
         #[n(0)]
         block_number: BlockNumber,
     },
@@ -88,7 +93,8 @@ pub enum EventType {
         #[n(1)]
         transaction_receipt: TransactionReceipt,
     },
-    /// The minter successfully reimbursed a failed withdrawal.
+    /// The minter successfully reimbursed a failed withdrawal
+    /// or the transaction fee associated with a ckERC20 withdrawal.
     #[n(12)]
     ReimbursedEthWithdrawal(#[n(0)] Reimbursed),
     /// The minter could not scrap the logs for that block.
@@ -103,6 +109,56 @@ pub enum EventType {
     /// The minter accepted a new ERC-20 withdrawal request.
     #[n(16)]
     AcceptedErc20WithdrawalRequest(#[n(0)] Erc20WithdrawalRequest),
+    #[n(17)]
+    MintedCkErc20 {
+        /// The unique identifier of the deposit on the Ethereum network.
+        #[n(0)]
+        event_source: EventSource,
+        /// The transaction index on the ckETH ledger.
+        #[cbor(n(1), with = "crate::cbor::id")]
+        mint_block_index: LedgerMintIndex,
+        #[n(2)]
+        ckerc20_token_symbol: String,
+        #[n(3)]
+        erc20_contract_address: Address,
+    },
+    /// The minter processed the helper smart contract logs up to the specified height.
+    #[n(18)]
+    SyncedErc20ToBlock {
+        /// The last processed block number for ERC20 helper contract (inclusive).
+        #[n(0)]
+        block_number: BlockNumber,
+    },
+    #[n(19)]
+    ReimbursedErc20Withdrawal {
+        #[cbor(n(0), with = "crate::cbor::id")]
+        cketh_ledger_burn_index: LedgerBurnIndex,
+        #[cbor(n(1), with = "crate::cbor::principal")]
+        ckerc20_ledger_id: Principal,
+        #[n(2)]
+        reimbursed: Reimbursed,
+    },
+    /// The minter could not burn the given amount of ckERC20 tokens.
+    #[n(20)]
+    FailedErc20WithdrawalRequest(#[n(0)] ReimbursementRequest),
+    /// The minter unexpectedly panic while processing a deposit.
+    /// The deposit is quarantined to prevent any double minting and
+    /// will not be processed without further manual intervention.
+    #[n(21)]
+    QuarantinedDeposit {
+        /// The unique identifier of the deposit on the Ethereum network.
+        #[n(0)]
+        event_source: EventSource,
+    },
+    /// The minter unexpectedly panic while processing a reimbursement.
+    /// The reimbursement is quarantined to prevent any double minting and
+    /// will not be processed without further manual intervention.
+    #[n(22)]
+    QuarantinedReimbursement {
+        /// The unique identifier of the reimbursement.
+        #[n(0)]
+        index: ReimbursementIndex,
+    },
 }
 
 impl ReceivedEvent {

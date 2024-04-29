@@ -16,8 +16,8 @@ use hyper::{body::Incoming, Method, Request, StatusCode};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use ic_agent::{
     agent::{
-        http_transport::reqwest_transport::ReqwestHttpReplicaV2Transport, QueryBuilder,
-        RejectResponse, UpdateBuilder,
+        http_transport::reqwest_transport::ReqwestTransport, QueryBuilder, RejectResponse,
+        UpdateBuilder,
     },
     agent_error::HttpErrorPayload,
     export::Principal,
@@ -46,7 +46,7 @@ use ic_protobuf::registry::crypto::v1::{
 };
 use ic_registry_keys::make_crypto_threshold_signing_pubkey_key;
 use ic_replicated_state::ReplicatedState;
-use ic_test_utilities::state::ReplicatedStateBuilder;
+use ic_test_utilities_state::ReplicatedStateBuilder;
 use ic_test_utilities_types::ids::{canister_test_id, subnet_test_id, user_test_id};
 use ic_types::{
     consensus::certification::{Certification, CertificationContent},
@@ -124,7 +124,7 @@ fn test_healthy_behind() {
         .run();
 
     let agent = Agent::builder()
-        .with_transport(ReqwestHttpReplicaV2Transport::create(format!("http://{}", addr)).unwrap())
+        .with_transport(ReqwestTransport::create(format!("http://{}", addr)).unwrap())
         .build()
         .unwrap();
 
@@ -156,7 +156,7 @@ fn test_unauthorized_controller() {
     HttpEndpointBuilder::new(rt.handle().clone(), config).run();
 
     let agent = Agent::builder()
-        .with_transport(ReqwestHttpReplicaV2Transport::create(format!("http://{}", addr)).unwrap())
+        .with_transport(ReqwestTransport::create(format!("http://{}", addr)).unwrap())
         .build()
         .unwrap();
 
@@ -171,7 +171,7 @@ fn test_unauthorized_controller() {
 
     let expected_error = AgentError::HttpError(HttpErrorPayload {
         status: 400,
-        content_type: Some("text/plain".to_string()),
+        content_type: Some("text/plain; charset=utf-8".to_string()),
         content: format!(
             "Effective principal id in URL {} does not match requested principal id: {}.",
             canister1, canister2
@@ -201,7 +201,7 @@ fn test_unauthorized_query() {
     let (_, _, mut query_handler) = HttpEndpointBuilder::new(rt.handle().clone(), config).run();
 
     let agent = Agent::builder()
-        .with_transport(ReqwestHttpReplicaV2Transport::create(format!("http://{}", addr)).unwrap())
+        .with_transport(ReqwestTransport::create(format!("http://{}", addr)).unwrap())
         .with_verify_query_signatures(false)
         .build()
         .unwrap();
@@ -240,7 +240,7 @@ fn test_unauthorized_query() {
         .unwrap();
     let expected_resp = AgentError::HttpError(HttpErrorPayload {
         status: 400,
-        content_type: Some("text/plain".to_string()),
+        content_type: Some("text/plain; charset=utf-8".to_string()),
         content: format!(
             "Specified CanisterId {} does not match effective canister id in URL {}",
             canister1, canister2
@@ -278,7 +278,7 @@ fn test_unauthorized_call() {
 
     let agent = Agent::builder()
         .with_identity(AnonymousIdentity)
-        .with_transport(ReqwestHttpReplicaV2Transport::create(format!("http://{}", addr)).unwrap())
+        .with_transport(ReqwestTransport::create(format!("http://{}", addr)).unwrap())
         .build()
         .unwrap();
 
@@ -312,7 +312,7 @@ fn test_unauthorized_call() {
         .unwrap();
     let expected_resp = AgentError::HttpError(HttpErrorPayload {
         status: 400,
-        content_type: Some("text/plain".to_string()),
+        content_type: Some("text/plain; charset=utf-8".to_string()),
         content: format!(
             "Specified CanisterId {} does not match effective canister id in URL {}",
             canister1, canister2
@@ -390,7 +390,7 @@ fn test_request_timeout() {
     let (_, _, mut query_handler) = HttpEndpointBuilder::new(rt.handle().clone(), config).run();
 
     let agent = Agent::builder()
-        .with_transport(ReqwestHttpReplicaV2Transport::create(format!("http://{}", addr)).unwrap())
+        .with_transport(ReqwestTransport::create(format!("http://{}", addr)).unwrap())
         .with_verify_query_signatures(false)
         .build()
         .unwrap();
@@ -484,7 +484,7 @@ fn test_request_too_slow() {
     };
     HttpEndpointBuilder::new(rt.handle().clone(), config).run();
     let agent = Agent::builder()
-        .with_transport(ReqwestHttpReplicaV2Transport::create(format!("http://{}", addr)).unwrap())
+        .with_transport(ReqwestTransport::create(format!("http://{}", addr)).unwrap())
         .build()
         .unwrap();
 
@@ -523,7 +523,7 @@ fn test_status_code_when_ingress_filter_fails() {
     let (mut ingress_filter, _, _) = HttpEndpointBuilder::new(rt.handle().clone(), config).run();
 
     let agent = Agent::builder()
-        .with_transport(ReqwestHttpReplicaV2Transport::create(format!("http://{}", addr)).unwrap())
+        .with_transport(ReqwestTransport::create(format!("http://{}", addr)).unwrap())
         .build()
         .unwrap();
 
@@ -546,7 +546,7 @@ fn test_status_code_when_ingress_filter_fails() {
             .await
     });
 
-    let expected_response = Err(AgentError::ReplicaError(RejectResponse {
+    let expected_response = Err(AgentError::UncertifiedReject(RejectResponse {
         reject_code: ic_agent::agent::RejectCode::SysTransient,
         reject_message: "Test reject message".to_string(),
         error_code: Some("IC0204".to_string()),
@@ -570,7 +570,7 @@ fn test_graceful_shutdown_of_the_endpoint() {
     HttpEndpointBuilder::new(rt.handle().clone(), config).run();
 
     let agent = Agent::builder()
-        .with_transport(ReqwestHttpReplicaV2Transport::create(format!("http://{}", addr)).unwrap())
+        .with_transport(ReqwestTransport::create(format!("http://{}", addr)).unwrap())
         .build()
         .unwrap();
 
@@ -612,7 +612,7 @@ fn test_too_long_paths_are_rejected() {
     let canister = Principal::from_text("223xb-saaaa-aaaaf-arlqa-cai").unwrap();
 
     let agent = Agent::builder()
-        .with_transport(ReqwestHttpReplicaV2Transport::create(format!("http://{}", addr)).unwrap())
+        .with_transport(ReqwestTransport::create(format!("http://{}", addr)).unwrap())
         .build()
         .unwrap();
 
@@ -621,7 +621,7 @@ fn test_too_long_paths_are_rejected() {
 
     let expected_error_response = AgentError::HttpError(HttpErrorPayload {
         status: 404,
-        content_type: Some("text/plain".to_string()),
+        content_type: Some("text/plain; charset=utf-8".to_string()),
         content: b"Invalid path requested.".to_vec(),
     });
 
@@ -649,7 +649,7 @@ fn test_query_endpoint_returns_service_unavailable_on_missing_state() {
     let (_, _, mut query_handler) = HttpEndpointBuilder::new(rt.handle().clone(), config).run();
 
     let agent = Agent::builder()
-        .with_transport(ReqwestHttpReplicaV2Transport::create(format!("http://{}", addr)).unwrap())
+        .with_transport(ReqwestTransport::create(format!("http://{}", addr)).unwrap())
         .with_verify_query_signatures(false)
         .build()
         .unwrap();
@@ -701,7 +701,7 @@ fn can_retrieve_subnet_metrics() {
     };
 
     let agent = Agent::builder()
-        .with_transport(ReqwestHttpReplicaV2Transport::create(format!("http://{}", addr)).unwrap())
+        .with_transport(ReqwestTransport::create(format!("http://{}", addr)).unwrap())
         .build()
         .unwrap();
 
@@ -877,7 +877,7 @@ fn subnet_metrics_not_supported_via_canister_read_state() {
     };
 
     let agent = Agent::builder()
-        .with_transport(ReqwestHttpReplicaV2Transport::create(format!("http://{}", addr)).unwrap())
+        .with_transport(ReqwestTransport::create(format!("http://{}", addr)).unwrap())
         .build()
         .unwrap();
 

@@ -161,7 +161,7 @@ fn parse_message(s: &str, nonce: u64) -> Result<Message, String> {
 
             let signed_ingress = SignedIngressBuilder::new()
                 // `source` should become a self-authenticating id according
-                // to https://sdk.dfinity.org/docs/interface-spec/index.html#id-classes
+                // to https://internetcomputer.org/docs/current/references/ic-interface-spec#id-classes
                 .canister_id(canister_id)
                 .method_name(method_name)
                 .method_payload(method_payload)
@@ -276,7 +276,7 @@ fn parse_install(
 
     let signed_ingress = SignedIngressBuilder::new()
         // `source` should become a self-authenticating id according
-        // to https://sdk.dfinity.org/docs/interface-spec/index.html#id-classes
+        // to https://internetcomputer.org/docs/current/references/ic-interface-spec#id-classes
         .canister_id(ic00::IC_00)
         .method_name(ic00::Method::InstallCode)
         .method_payload(
@@ -287,7 +287,6 @@ fn parse_install(
                 payload,
                 None,
                 Some(8 * 1024 * 1024 * 1024), // drun users dont care about memory limits
-                None,
             )
             .encode(),
         )

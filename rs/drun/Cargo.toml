@@ -37,8 +37,8 @@ ic-test-utilities-consensus = { path = "../test_utilities/consensus" }
 ic-test-utilities-registry = { path = "../test_utilities/registry" }
 ic-test-utilities-types = { path = "../test_utilities/types" }
 ic-types = { path = "../types/types" }
-clap = { workspace = true }
-hex = "0.4.2"
+clap = { version = "3.2.25", features = ["derive"] }
+hex = { workspace = true }
 slog = { workspace = true }
 slog-term = "2.6.0"
 tokio = { workspace = true }

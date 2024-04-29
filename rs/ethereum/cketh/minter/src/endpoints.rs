@@ -28,15 +28,43 @@ impl From<TransactionPrice> for Eip1559TransactionPrice {
     }
 }
 
+#[derive(CandidType, Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct CkErc20Token {
+    pub ckerc20_token_symbol: String,
+    pub erc20_contract_address: String,
+    pub ledger_canister_id: Principal,
+}
+
+impl From<crate::erc20::CkErc20Token> for CkErc20Token {
+    fn from(value: crate::erc20::CkErc20Token) -> Self {
+        Self {
+            ckerc20_token_symbol: value.ckerc20_token_symbol.to_string(),
+            erc20_contract_address: value.erc20_contract_address.to_string(),
+            ledger_canister_id: value.ckerc20_ledger_id,
+        }
+    }
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct Erc20Balance {
+    pub erc20_contract_address: String,
+    pub balance: Nat,
+}
+
 #[derive(CandidType, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct MinterInfo {
     pub minter_address: Option<String>,
+    #[deprecated(note = "use eth_helper_contract_address instead")]
     pub smart_contract_address: Option<String>,
+    pub eth_helper_contract_address: Option<String>,
+    pub erc20_helper_contract_address: Option<String>,
+    pub supported_ckerc20_tokens: Option<Vec<CkErc20Token>>,
     pub minimum_withdrawal_amount: Option<Nat>,
     pub ethereum_block_height: Option<CandidBlockTag>,
     pub last_observed_block_number: Option<Nat>,
     pub eth_balance: Option<Nat>,
     pub last_gas_fee_estimate: Option<GasFeeEstimate>,
+    pub erc20_balances: Option<Vec<Erc20Balance>>,
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -164,6 +192,13 @@ impl From<LedgerBurnError> for WithdrawalError {
             LedgerBurnError::InsufficientAllowance { allowance, .. } => {
                 Self::InsufficientAllowance { allowance }
             }
+            LedgerBurnError::AmountTooLow {
+                minimum_burn_amount,
+                failed_burn_amount,
+                ledger,
+            } => {
+                panic!("BUG: withdrawal amount {failed_burn_amount} on the ckETH ledger {ledger:?} should always be higher than the ledger transaction fee {minimum_burn_amount}")
+            }
         }
     }
 }
@@ -204,6 +239,18 @@ pub mod events {
     pub struct EventSource {
         pub transaction_hash: String,
         pub log_index: Nat,
+    }
+
+    #[derive(CandidType, Deserialize, Debug, Clone, PartialEq, Eq)]
+    pub enum ReimbursementIndex {
+        CkEth {
+            ledger_burn_index: Nat,
+        },
+        CkErc20 {
+            cketh_ledger_burn_index: Nat,
+            ledger_id: Principal,
+            ckerc20_ledger_burn_index: Nat,
+        },
     }
 
     #[derive(CandidType, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -273,6 +320,9 @@ pub mod events {
         SyncedToBlock {
             block_number: Nat,
         },
+        SyncedErc20ToBlock {
+            block_number: Nat,
+        },
         AcceptedEthWithdrawalRequest {
             withdrawal_amount: Nat,
             destination: String,
@@ -303,6 +353,14 @@ pub mod events {
             reimbursed_amount: Nat,
             transaction_hash: Option<String>,
         },
+        ReimbursedErc20Withdrawal {
+            withdrawal_id: Nat,
+            burn_in_block: Nat,
+            reimbursed_in_block: Nat,
+            ledger_id: Principal,
+            reimbursed_amount: Nat,
+            transaction_hash: Option<String>,
+        },
         SkippedBlock {
             block_number: Nat,
         },
@@ -315,13 +373,32 @@ pub mod events {
         AcceptedErc20WithdrawalRequest {
             max_transaction_fee: Nat,
             withdrawal_amount: Nat,
-            ckerc20_token_symbol: String,
+            erc20_contract_address: String,
             destination: String,
             cketh_ledger_burn_index: Nat,
+            ckerc20_ledger_id: Principal,
             ckerc20_ledger_burn_index: Nat,
             from: Principal,
             from_subaccount: Option<[u8; 32]>,
             created_at: u64,
+        },
+        FailedErc20WithdrawalRequest {
+            withdrawal_id: Nat,
+            reimbursed_amount: Nat,
+            to: Principal,
+            to_subaccount: Option<[u8; 32]>,
+        },
+        MintedCkErc20 {
+            event_source: EventSource,
+            mint_block_index: Nat,
+            ckerc20_token_symbol: String,
+            erc20_contract_address: String,
+        },
+        QuarantinedDeposit {
+            event_source: EventSource,
+        },
+        QuarantinedReimbursement {
+            index: ReimbursementIndex,
         },
     }
 }

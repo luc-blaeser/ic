@@ -13,8 +13,8 @@ use std::{
 
 use ic_system_api::{ModificationTracking, SystemApiImpl};
 use wasmtime::{
-    unix::StoreExt, Engine, Instance, InstancePre, Linker, Memory, Module, Mutability, Store, Val,
-    ValType,
+    unix::StoreExt, Engine, Instance, InstancePre, Linker, Memory, Module, Mutability, Store,
+    StoreLimits, StoreLimitsBuilder, Val, ValType,
 };
 
 pub use host_memory::WasmtimeMemoryCreator;
@@ -30,14 +30,14 @@ use ic_replicated_state::{
 use ic_sys::PAGE_SIZE;
 use ic_types::{
     methods::{FuncRef, WasmMethod},
-    CanisterId, NumInstructions, NumPages,
+    CanisterId, NumInstructions, NumPages, MAX_STABLE_MEMORY_IN_BYTES,
 };
 use ic_wasm_types::{BinaryEncodedWasm, WasmEngineError};
 use memory_tracker::{DirtyPageTracking, PageBitmap, SigsegvMemoryTracker};
 use signal_stack::WasmtimeSignalStack;
 
 use crate::wasm_utils::instrumentation::{
-    ACCESSED_PAGES_COUNTER_GLOBAL_NAME, DIRTY_PAGES_COUNTER_GLOBAL_NAME,
+    WasmMemoryType, ACCESSED_PAGES_COUNTER_GLOBAL_NAME, DIRTY_PAGES_COUNTER_GLOBAL_NAME,
     INSTRUCTIONS_COUNTER_GLOBAL_NAME,
 };
 use crate::{
@@ -56,6 +56,9 @@ pub(crate) const WASM_HEAP_MEMORY_NAME: &str = "memory";
 pub(crate) const WASM_HEAP_BYTEMAP_MEMORY_NAME: &str = "bytemap_memory";
 pub(crate) const STABLE_MEMORY_NAME: &str = "stable_memory";
 pub(crate) const STABLE_BYTEMAP_MEMORY_NAME: &str = "stable_bytemap_memory";
+
+pub(crate) const MAX_STORE_TABLES: usize = 10;
+pub(crate) const MAX_STORE_TABLE_ELEMENTS: u32 = 1_000_000;
 
 fn wasmtime_error_to_hypervisor_error(err: anyhow::Error) -> HypervisorError {
     match err.downcast::<wasmtime::Trap>() {
@@ -83,7 +86,11 @@ fn wasmtime_error_to_hypervisor_error(err: anyhow::Error) -> HypervisorError {
                 })
                 .unwrap_or(false);
             if message.contains("argument type mismatch") || arguments_or_results_mismatch {
-                return HypervisorError::ContractViolation(BAD_SIGNATURE_MESSAGE.to_string());
+                return HypervisorError::ContractViolation {
+                    error: BAD_SIGNATURE_MESSAGE.to_string(),
+                    suggestion: "".to_string(),
+                    doc_link: "".to_string(),
+                };
             }
             HypervisorError::Trapped(TrapCode::Other)
         }
@@ -95,9 +102,11 @@ fn trap_code_to_hypervisor_error(trap: wasmtime::Trap) -> HypervisorError {
         wasmtime::Trap::StackOverflow => HypervisorError::Trapped(TrapCode::StackOverflow),
         wasmtime::Trap::MemoryOutOfBounds => HypervisorError::Trapped(TrapCode::HeapOutOfBounds),
         wasmtime::Trap::TableOutOfBounds => HypervisorError::Trapped(TrapCode::TableOutOfBounds),
-        wasmtime::Trap::BadSignature => {
-            HypervisorError::ContractViolation(BAD_SIGNATURE_MESSAGE.to_string())
-        }
+        wasmtime::Trap::BadSignature => HypervisorError::ContractViolation {
+            error: BAD_SIGNATURE_MESSAGE.to_string(),
+            suggestion: "".to_string(),
+            doc_link: "".to_string(),
+        },
         wasmtime::Trap::IntegerDivisionByZero => {
             HypervisorError::Trapped(TrapCode::IntegerDivByZero)
         }
@@ -186,7 +195,7 @@ impl WasmtimeEmbedder {
     /// canisters __except__ the `host_memory`.
     #[doc(hidden)]
     pub fn wasmtime_execution_config(embedder_config: &EmbeddersConfig) -> wasmtime::Config {
-        let mut config = wasmtime_validation_config();
+        let mut config = wasmtime_validation_config(embedder_config);
 
         // Wasmtime features that differ between Wasm validation and execution.
         // Currently these are multi-memories and the 64-bit memory needed for
@@ -226,12 +235,22 @@ impl WasmtimeEmbedder {
 
     pub fn pre_instantiate(&self, module: &Module) -> HypervisorResult<InstancePre<StoreData>> {
         let mut linker: wasmtime::Linker<StoreData> = Linker::new(module.engine());
+        let mut main_memory_type = WasmMemoryType::Wasm32;
+
+        if let Some(export) = module.get_export(WASM_HEAP_MEMORY_NAME) {
+            if let Some(mem) = export.memory() {
+                if mem.is_64() {
+                    main_memory_type = WasmMemoryType::Wasm64;
+                }
+            }
+        }
+
         system_api::syscalls(
             &mut linker,
             self.config.feature_flags,
             self.config.stable_memory_dirty_page_limit,
             self.config.stable_memory_accessed_page_limit,
-            self.config.metering_type,
+            main_memory_type,
         );
 
         let instance_pre = linker.instantiate_pre(module).map_err(|e| {
@@ -342,8 +361,14 @@ impl WasmtimeEmbedder {
                 num_instructions_global: None,
                 log: self.log.clone(),
                 num_stable_dirty_pages_from_non_native_writes: NumPages::from(0),
+                limits: StoreLimitsBuilder::new()
+                    .memory_size(MAX_STABLE_MEMORY_IN_BYTES as usize)
+                    .tables(MAX_STORE_TABLES)
+                    .table_elements(MAX_STORE_TABLE_ELEMENTS)
+                    .build(),
             },
         );
+        store.limiter(|state| &mut state.limits);
 
         let instance = match instance_pre.instantiate(&mut store) {
             Ok(instance) => instance,
@@ -395,6 +420,7 @@ impl WasmtimeEmbedder {
                                 Global::I64(val) => Val::I64(*val),
                                 Global::F32(val) => Val::F32((val).to_bits()),
                                 Global::F64(val) => Val::F64((val).to_bits()),
+                                Global::V128(val) => Val::V128((*val).into()),
                             },
                         )
                         .unwrap_or_else(|e| {
@@ -403,6 +429,7 @@ impl WasmtimeEmbedder {
                                 Global::I64(val) => (val).to_string(),
                                 Global::F32(val) => (val).to_string(),
                                 Global::F64(val) => (val).to_string(),
+                                Global::V128(val) => (val).to_string(),
                             };
                             fatal!(
                                 self.log,
@@ -573,16 +600,6 @@ impl WasmtimeEmbedder {
     }
 }
 
-struct StoreRef(*mut wasmtime::Store<()>);
-
-/// SAFETY: The users of `StoreRef` are required to only dereference the pointer
-/// when it is know that nothing else is using the `Store`. When the signal
-/// handler runs we dereference the pointer even though wasmtime may still be
-/// using it, but we don't modify it in any way. EXC-535 should make this
-/// unnecessary.
-unsafe impl Sync for StoreRef {}
-unsafe impl Send for StoreRef {}
-
 pub struct MemorySigSegvInfo {
     instance_memory: wasmtime::Memory,
     current_memory_size_in_pages: MemoryPageSize,
@@ -648,6 +665,7 @@ pub struct StoreData {
     pub log: ReplicaLogger,
     /// Tracks the number of dirty pages in stable memory in non-native stable mode
     pub num_stable_dirty_pages_from_non_native_writes: NumPages,
+    pub limits: StoreLimits,
 }
 
 impl StoreData {
@@ -725,8 +743,10 @@ impl WasmtimeInstance {
                 HypervisorError::MethodNotFound(WasmMethod::try_from(export.to_string()).unwrap())
             })?
             .into_func()
-            .ok_or_else(|| {
-                HypervisorError::ContractViolation("export is not a function".to_string())
+            .ok_or_else(|| HypervisorError::ContractViolation {
+                error: "export is not a function".to_string(),
+                suggestion: "".to_string(),
+                doc_link: "".to_string(),
             })?
             .call(&mut self.store, args, &mut [])
             .map_err(wasmtime_error_to_hypervisor_error)
@@ -806,13 +826,20 @@ impl WasmtimeInstance {
 
     fn get_memory(&mut self, name: &str) -> HypervisorResult<Memory> {
         match self.instance.get_export(&mut self.store, name) {
-            Some(export) => export.into_memory().ok_or_else(|| {
-                HypervisorError::ContractViolation(format!("export '{}' is not a memory", name))
+            Some(export) => {
+                export
+                    .into_memory()
+                    .ok_or_else(|| HypervisorError::ContractViolation {
+                        error: format!("export '{}' is not a memory", name),
+                        suggestion: "".to_string(),
+                        doc_link: "".to_string(),
+                    })
+            }
+            None => Err(HypervisorError::ContractViolation {
+                error: format!("export '{}' not found", name),
+                suggestion: "".to_string(),
+                doc_link: "".to_string(),
             }),
-            None => Err(HypervisorError::ContractViolation(format!(
-                "export '{}' not found",
-                name
-            ))),
         }
     }
 
@@ -826,21 +853,29 @@ impl WasmtimeInstance {
             FuncRef::QueryClosure(closure) | FuncRef::UpdateClosure(closure) => self
                 .instance
                 .get_export(&mut self.store, "table")
-                .ok_or_else(|| HypervisorError::ContractViolation("table not found".to_string()))?
+                .ok_or_else(|| HypervisorError::ContractViolation {
+                    error: "table not found".to_string(),
+                    suggestion: "".to_string(),
+                    doc_link: "".to_string(),
+                })?
                 .into_table()
-                .ok_or_else(|| {
-                    HypervisorError::ContractViolation("export 'table' is not a table".to_string())
+                .ok_or_else(|| HypervisorError::ContractViolation {
+                    error: "export 'table' is not a table".to_string(),
+                    suggestion: "".to_string(),
+                    doc_link: "".to_string(),
                 })?
                 .get(&mut self.store, closure.func_idx)
                 .ok_or(HypervisorError::FunctionNotFound(0, closure.func_idx))?
-                .funcref()
-                .ok_or_else(|| {
-                    HypervisorError::ContractViolation("not a function reference".to_string())
+                .as_func()
+                .ok_or_else(|| HypervisorError::ContractViolation {
+                    error: "not a function reference".to_string(),
+                    suggestion: "".to_string(),
+                    doc_link: "".to_string(),
                 })?
-                .ok_or_else(|| {
-                    HypervisorError::ContractViolation(
-                        "unexpected null function reference".to_string(),
-                    )
+                .ok_or_else(|| HypervisorError::ContractViolation {
+                    error: "unexpected null function reference".to_string(),
+                    suggestion: "".to_string(),
+                    doc_link: "".to_string(),
                 })?
                 .call(&mut self.store, &[Val::I32(closure.env as i32)], &mut [])
                 .map_err(wasmtime_error_to_hypervisor_error),
@@ -945,7 +980,11 @@ impl WasmtimeInstance {
         if let Ok(heap_memory) = self.get_memory(memory_name) {
             let bytemap = self.get_memory(bytemap_name)?.data(&self.store);
             let tracker = self.memory_trackers.get(&memory_type).ok_or_else(|| {
-                HypervisorError::ContractViolation(format!("No {} memory tracker", memory_type))
+                HypervisorError::ContractViolation {
+                    error: format!("No {} memory tracker", memory_type),
+                    suggestion: "".to_string(),
+                    doc_link: "".to_string(),
+                }
             })?;
             let tracker = tracker.lock().unwrap();
             let page_map = tracker.page_map();
@@ -990,10 +1029,11 @@ impl WasmtimeInstance {
                         *previous_page_marked_written = false;
                         Ok(())
                     }
-                    _ => Err(HypervisorError::ContractViolation(format!(
-                        "Bytemap contains invalid value {}",
-                        written
-                    ))),
+                    _ => Err(HypervisorError::ContractViolation {
+                        error: format!("Bytemap contains invalid value {}", written),
+                        suggestion: "".to_string(),
+                        doc_link: "".to_string(),
+                    }),
                 }
             }
 
@@ -1108,8 +1148,11 @@ impl WasmtimeInstance {
                 ValType::F64 => Ok(Global::F64(
                     g.get(&mut self.store).f64().expect("global f64"),
                 )),
+                ValType::V128 => Ok(Global::V128(
+                    g.get(&mut self.store).v128().expect("global v128").into(),
+                )),
                 _ => Err(HypervisorError::WasmEngineError(WasmEngineError::Other(
-                    "unexpected global value type".to_string(),
+                    "Unexpected global value type".to_string(),
                 ))),
             })
             .collect()

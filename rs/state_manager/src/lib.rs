@@ -16,7 +16,7 @@ use crate::{
         chunkable::cache::StateSyncCache,
         types::{FileGroupChunks, Manifest, MetaManifest},
     },
-    tip::{spawn_tip_thread, PageMapToFlush, TipRequest},
+    tip::{spawn_tip_thread, HasDowngrade, PageMapToFlush, TipRequest},
 };
 use crossbeam_channel::{unbounded, Sender};
 use ic_base_types::CanisterId;
@@ -42,12 +42,15 @@ use ic_metrics::{buckets::decimal_buckets, MetricsRegistry};
 use ic_protobuf::proxy::{ProtoProxy, ProxyDecodeError};
 use ic_protobuf::{messaging::xnet::v1, state::v1 as pb};
 use ic_registry_subnet_type::SubnetType;
+use ic_replicated_state::page_map::PageAllocatorFileDescriptor;
 use ic_replicated_state::{
     canister_state::execution_state::SandboxMemory,
     page_map::{PersistenceError, StorageMetrics},
     PageIndex, PageMap, ReplicatedState,
 };
-use ic_state_layout::{error::LayoutError, AccessPolicy, CheckpointLayout, ReadOnly, StateLayout};
+use ic_state_layout::{
+    error::LayoutError, AccessPolicy, CheckpointLayout, PageMapLayout, ReadOnly, StateLayout,
+};
 use ic_types::{
     consensus::certification::Certification,
     crypto::CryptoHash,
@@ -56,12 +59,14 @@ use ic_types::{
     xnet::{CertifiedStreamSlice, StreamIndex, StreamSlice},
     CryptoHashOfPartialState, CryptoHashOfState, Height, RegistryVersion, SubnetId,
 };
-use ic_utils::thread::JoinOnDrop;
+use ic_utils_thread::JoinOnDrop;
 use prometheus::{Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge};
 use prost::Message;
 use std::convert::{From, TryFrom};
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::os::unix::io::RawFd;
+use std::os::unix::prelude::IntoRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -72,10 +77,6 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Mutex,
 };
-
-use ic_replicated_state::page_map::PageAllocatorFileDescriptor;
-use std::os::unix::io::RawFd;
-use std::os::unix::prelude::IntoRawFd;
 use tempfile::tempfile;
 use uuid::Uuid;
 
@@ -149,6 +150,7 @@ pub struct StateManagerMetrics {
     decode_slice_status: IntCounterVec,
     height_update_time_seconds: Histogram,
     storage_metrics: StorageMetrics,
+    merge_metrics: MergeMetrics,
     latest_hash_tree_size: IntGauge,
     latest_hash_tree_max_index: IntGauge,
 }
@@ -241,6 +243,50 @@ impl CheckpointMetrics {
             page_map_flushes,
             page_map_flush_skips,
             log: replica_logger,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct MergeMetrics {
+    disk_size_bytes: IntGauge,
+    memory_size_bytes: IntGauge,
+    estimated_storage_savings_bytes: Histogram,
+    num_page_maps_merged: HistogramVec,
+}
+
+impl MergeMetrics {
+    pub fn new(metrics_registry: &MetricsRegistry) -> Self {
+        let disk_size_bytes = metrics_registry.int_gauge(
+            "state_manager_merge_disk_size_bytes",
+            "Number of bytes of on disk for all PageMaps, measured before merging.",
+        );
+
+        let memory_size_bytes = metrics_registry.int_gauge(
+            "state_manager_merge_memory_size_bytes",
+            "Number of bytes of memory for all PageMaps, not counting duplicate data in overlays, measured before merging.",
+        );
+
+        let estimated_storage_savings_bytes = metrics_registry.histogram(
+            "state_manager_merge_estimated_storage_savings_bytes",
+            "Estimated number of bytes saved in disk space across all PageMaps for a merge, estimated by the merge strategy.",
+            // 10MB, 20MB, 50MB, 100MB, 200MB, 500MB, …, 100GB, 200GB, 500GB
+            decimal_buckets(7, 11),
+        );
+
+        let num_page_maps_merged = metrics_registry.histogram_vec(
+            "state_manager_num_page_maps_merged",
+            "Number of PapeMaps merged separated by which part of the merge strategy triggered the merge.",
+            // 1, 2, 5, 10, 20, 50, …, 10k, 20k, 50k
+            decimal_buckets(0, 4),
+            &["reason"],
+        );
+
+        Self {
+            disk_size_bytes,
+            memory_size_bytes,
+            estimated_storage_savings_bytes,
+            num_page_maps_merged,
         }
     }
 }
@@ -388,6 +434,7 @@ impl StateManagerMetrics {
             decode_slice_status,
             height_update_time_seconds,
             storage_metrics: StorageMetrics::new(metrics_registry),
+            merge_metrics: MergeMetrics::new(metrics_registry),
             latest_hash_tree_size,
             latest_hash_tree_max_index,
         }
@@ -578,8 +625,6 @@ type CertificationsMetadata = BTreeMap<Height, CertificationMetadata>;
 pub(crate) struct BundledManifest {
     root_hash: CryptoHashOfState,
     manifest: Manifest,
-    // `meta_manifest` will be used during state sync in future replica versions.
-    #[allow(dead_code)]
     meta_manifest: Arc<MetaManifest>,
 }
 
@@ -606,8 +651,7 @@ impl StateMetadata {
             .as_ref()
             .map(|bundled_manifest| &bundled_manifest.manifest)
     }
-    // `meta_manifest` will be used during state sync in future replica versions.
-    #[allow(dead_code)]
+
     pub fn meta_manifest(&self) -> Option<Arc<MetaManifest>> {
         self.bundled_manifest
             .as_ref()
@@ -857,6 +901,7 @@ fn initialize_tip(
         .send(TipRequest::ResetTipAndMerge {
             checkpoint_layout,
             pagemaptypes_with_num_pages: pagemaptypes_with_num_pages(&snapshot.state),
+            is_initializing_tip: true,
         })
         .unwrap();
     ReplicatedState::clone(&snapshot.state)
@@ -1043,22 +1088,17 @@ impl PageMapType {
         result
     }
 
-    fn id(&self) -> CanisterId {
-        match &self {
-            PageMapType::WasmMemory(id) => *id,
-            PageMapType::StableMemory(id) => *id,
-            PageMapType::WasmChunkStore(id) => *id,
-        }
-    }
-
-    /// Maps a PageMapType to its location in a checkpoint according to `layout`
-    fn base<Access>(&self, layout: &CheckpointLayout<Access>) -> Result<PathBuf, LayoutError>
+    /// The layout of the files on disk for this PageMap.
+    fn layout<Access>(
+        &self,
+        layout: &CheckpointLayout<Access>,
+    ) -> Result<PageMapLayout<Access>, LayoutError>
     where
         Access: AccessPolicy,
     {
         match &self {
             PageMapType::WasmMemory(id) => Ok(layout.canister(id)?.vmemory_0()),
-            PageMapType::StableMemory(id) => Ok(layout.canister(id)?.stable_memory_blob()),
+            PageMapType::StableMemory(id) => Ok(layout.canister(id)?.stable_memory()),
             PageMapType::WasmChunkStore(id) => Ok(layout.canister(id)?.wasm_chunk_store()),
         }
     }
@@ -2327,8 +2367,8 @@ impl StateManagerImpl {
                 self.lsmt_status,
             )
         };
-        let (cp_layout, checkpointed_state) = match result {
-            Ok(checkpointed_state) => checkpointed_state,
+        let (cp_layout, checkpointed_state, has_downgrade) = match result {
+            Ok(response) => response,
             Err(CheckpointError::AlreadyExists(_)) => {
                 warn!(
                     self.log,
@@ -2366,6 +2406,8 @@ impl StateManagerImpl {
                 (
                     self.state_layout.checkpoint(height).unwrap(),
                     checkpointed_state,
+                    // HasDowngrade::Yes is the conservative choice, opting for full Manifest computation.
+                    HasDowngrade::Yes,
                 )
             }
             Err(err) => fatal!(
@@ -2387,7 +2429,7 @@ impl StateManagerImpl {
 
         // On the NNS subnet we never allow incremental manifest computation
         let is_nns = self.own_subnet_id == state.metadata.network_topology.nns_subnet_id;
-        let manifest_delta = if is_nns {
+        let manifest_delta = if is_nns || has_downgrade == HasDowngrade::Yes {
             None
         } else {
             let _timer = self
@@ -2429,6 +2471,7 @@ impl StateManagerImpl {
                 vec![TipRequest::ResetTipAndMerge {
                     checkpoint_layout: checkpoint_layout.clone(),
                     pagemaptypes_with_num_pages: pagemaptypes_with_num_pages(state),
+                    is_initializing_tip: false,
                 }]
             } else {
                 vec![TipRequest::DefragTip {

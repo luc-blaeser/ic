@@ -43,7 +43,7 @@ use ic_types::{
     xnet::{StreamHeader, StreamIndex},
     Height, NodeId, NumBytes, PrincipalIdBlobParseError, RegistryVersion, SubnetId, Time,
 };
-use ic_utils::thread::JoinOnDrop;
+use ic_utils_thread::JoinOnDrop;
 #[cfg(test)]
 use mockall::automock;
 use prometheus::{Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec};
@@ -89,6 +89,7 @@ const METRIC_TIMED_OUT_REQUESTS_TOTAL: &str = "mr_timed_out_requests_total";
 const METRIC_SUBNET_SPLIT_HEIGHT: &str = "mr_subnet_split_height";
 const BLOCKS_PROPOSED_TOTAL: &str = "mr_blocks_proposed_total";
 const BLOCKS_NOT_PROPOSED_TOTAL: &str = "mr_blocks_not_proposed_total";
+const METRIC_NEXT_CHECKPOINT_HEIGHT: &str = "mr_next_checkpoint_height";
 
 const METRIC_WASM_CUSTOM_SECTIONS_MEMORY_USAGE_BYTES: &str =
     "mr_wasm_custom_sections_memory_usage_bytes";
@@ -315,6 +316,9 @@ pub(crate) struct MessageRoutingMetrics {
 
     /// Metrics for query stats aggregator
     pub query_stats_metrics: QueryStatsAggregatorMetrics,
+
+    /// Metrics for the `next_checkpoint_height` passed to `process_batch`.
+    next_checkpoint_height: IntGauge,
 }
 
 impl MessageRoutingMetrics {
@@ -400,6 +404,11 @@ impl MessageRoutingMetrics {
                 .error_counter(CRITICAL_ERROR_NON_INCREASING_BATCH_TIME),
 
             query_stats_metrics: QueryStatsAggregatorMetrics::new(metrics_registry),
+
+            next_checkpoint_height: metrics_registry.int_gauge(
+                METRIC_NEXT_CHECKPOINT_HEIGHT,
+                "Next checkpoint height passed to process_batch."
+            ),
         }
     }
 
@@ -564,7 +573,6 @@ impl BatchProcessorImpl {
             stream_builder,
             log.clone(),
             metrics.clone(),
-            hypervisor_config.query_stats_epoch_length,
         ));
 
         Self {
@@ -646,25 +654,24 @@ impl BatchProcessorImpl {
         loop {
             match self.try_to_read_registry(registry_version, own_subnet_id) {
                 Ok(result) => return result,
-                Err(err) => {
-                    if let ReadRegistryError::Persistent(_) = err {
-                        // Increment the critical error counter in case of a persistent error.
-                        self.metrics.critical_error_failed_to_read_registry.inc();
-                        warn!(
-                            self.log,
-                            "{}: Persistent error reading registry @ version {}: {:?}.",
-                            CRITICAL_ERROR_FAILED_TO_READ_REGISTRY,
-                            registry_version,
-                            err
-                        );
-                    } else {
-                        warn!(
-                            self.log,
-                            "Unable to read registry @ version {}: {:?}. Trying again...",
-                            registry_version,
-                            err
-                        );
-                    }
+                Err(ReadRegistryError::Persistent(error_message)) => {
+                    // Increment the critical error counter in case of a persistent error.
+                    self.metrics.critical_error_failed_to_read_registry.inc();
+                    warn!(
+                        self.log,
+                        "{}: Persistent error reading registry @ version {}: {:?}.",
+                        CRITICAL_ERROR_FAILED_TO_READ_REGISTRY,
+                        registry_version,
+                        error_message
+                    );
+                }
+                Err(ReadRegistryError::Transient(error_message)) => {
+                    warn!(
+                        self.log,
+                        "Unable to read registry @ version {}: {:?}. Trying again...",
+                        registry_version,
+                        error_message
+                    );
                 }
             }
             sleep(std::time::Duration::from_millis(100));
@@ -899,7 +906,6 @@ impl BatchProcessorImpl {
         nodes: BTreeSet<NodeId>,
         registry_version: RegistryVersion,
     ) -> Result<NodePublicKeys, ReadRegistryError> {
-        use ic_crypto_internal_basic_sig_ed25519::{public_key_to_der, types::PublicKeyBytes};
         let mut node_public_keys: NodePublicKeys = BTreeMap::new();
         for node_id in nodes {
             let optional_public_key_proto = self
@@ -913,9 +919,11 @@ impl BatchProcessorImpl {
             match optional_public_key_proto {
                 Some(public_key_proto) => {
                     // If the public key protobuf is invalid, we continue without stalling the subnet.
-                    match PublicKeyBytes::try_from(&public_key_proto) {
-                        Ok(pk_bytes) => {
-                            node_public_keys.insert(node_id, public_key_to_der(pk_bytes));
+                    match ic_crypto_ed25519::PublicKey::convert_raw_to_der(
+                        &public_key_proto.key_value,
+                    ) {
+                        Ok(pk_der) => {
+                            node_public_keys.insert(node_id, pk_der);
                         }
                         Err(err) => {
                             self.metrics
@@ -923,7 +931,7 @@ impl BatchProcessorImpl {
                                 .inc();
                             warn!(
                                 self.log,
-                                "{}: the PublicKey protobuf of node {} stored in registry is not an valid Ed25519 public key, {}.",
+                                "{}: the PublicKey protobuf of node {} stored in registry is not a valid Ed25519 public key, {:?}.",
                                 CRITICAL_ERROR_MISSING_OR_INVALID_NODE_PUBLIC_KEYS,
                                 node_id,
                                 err
@@ -1065,6 +1073,13 @@ impl BatchProcessor for BatchProcessorImpl {
                 self.state_manager.latest_state_height()
             ),
         };
+
+        if let Some(next_checkpoint) = batch.next_checkpoint_height {
+            self.metrics
+                .next_checkpoint_height
+                .set(next_checkpoint.get() as i64);
+        }
+
         // If the subnet is starting up after a split, execute splitting phase 2.
         if let Some(split_from) = state.metadata.split_from {
             info!(
