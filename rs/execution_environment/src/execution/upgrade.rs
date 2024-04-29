@@ -301,7 +301,14 @@ fn upgrade_stage_2_and_3a_create_execution_state_and_call_start(
         Ok(memory_handling) => memory_handling,
         Err(err) => {
             let instructions_left = helper.instructions_left();
-            return finish_err(clean_canister, instructions_left, original, round, err);
+            return finish_err(
+                clean_canister,
+                instructions_left,
+                original,
+                round,
+                err,
+                helper.take_canister_log(),
+            );
         }
     };
 
