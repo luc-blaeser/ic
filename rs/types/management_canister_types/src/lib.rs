@@ -1353,39 +1353,6 @@ impl From<WasmMemoryPersistence> for WasmMemoryPersistenceProto {
     }
 }
 
-#[test]
-fn wasm_persistence_round_trip() {
-    for persistence in WasmMemoryPersistence::iter() {
-        let encoded: WasmMemoryPersistenceProto = (*persistence).into();
-        let decoded = WasmMemoryPersistence::try_from(encoded).unwrap();
-        assert_eq!(*persistence, decoded);
-    }
-
-    WasmMemoryPersistence::try_from(WasmMemoryPersistenceProto::Unspecified).unwrap_err();
-}
-
-#[test]
-fn canister_install_mode_round_trip() {
-    fn canister_install_mode_round_trip_aux(mode: CanisterInstallMode) {
-        let pb_mode: i32 = (&mode).into();
-        let dec_mode = CanisterInstallMode::try_from(pb_mode).unwrap();
-        assert_eq!(mode, dec_mode);
-    }
-
-    canister_install_mode_round_trip_aux(CanisterInstallMode::Install);
-    canister_install_mode_round_trip_aux(CanisterInstallMode::Reinstall);
-    canister_install_mode_round_trip_aux(CanisterInstallMode::Upgrade);
-}
-
-#[test]
-fn canister_install_mode_v2_round_trip() {
-    for mode in CanisterInstallModeV2::iter() {
-        let encoded: CanisterInstallModeV2Proto = mode.into();
-        let decoded = CanisterInstallModeV2::try_from(encoded).unwrap();
-        assert_eq!(*mode, decoded);
-    }
-}
-
 impl Payload<'_> for CanisterStatusResultV2 {}
 
 /// Struct used for encoding/decoding
@@ -3030,6 +2997,26 @@ mod tests {
                 .collect::<Vec<i32>>(),
             [1, 2, 3]
         );
+    }
+
+    #[test]
+    fn wasm_persistence_round_trip() {
+        for persistence in WasmMemoryPersistence::iter() {
+            let encoded: WasmMemoryPersistenceProto = (*persistence).into();
+            let decoded = WasmMemoryPersistence::try_from(encoded).unwrap();
+            assert_eq!(*persistence, decoded);
+        }
+
+        WasmMemoryPersistence::try_from(WasmMemoryPersistenceProto::Unspecified).unwrap_err();
+    }
+
+    #[test]
+    fn canister_install_mode_v2_round_trip() {
+        for mode in CanisterInstallModeV2::iter() {
+            let encoded: CanisterInstallModeV2Proto = mode.into();
+            let decoded = CanisterInstallModeV2::try_from(encoded).unwrap();
+            assert_eq!(*mode, decoded);
+        }
     }
 
     #[test]
