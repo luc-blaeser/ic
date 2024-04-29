@@ -23,7 +23,7 @@ use ic_management_canister_types::{
     CanisterInstallModeV2, CanisterUpgradeOptions, WasmMemoryPersistence,
 };
 use ic_replicated_state::{
-    metadata_state::subnet_call_context_manager::InstallCodeCallId, CanisterState,
+    metadata_state::subnet_call_context_manager::InstallCodeCallId, CanisterState, ExecutionState,
 };
 use ic_system_api::ApiType;
 use ic_types::methods::{FuncRef, SystemMethod, WasmMethod};

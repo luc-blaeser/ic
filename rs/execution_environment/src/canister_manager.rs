@@ -2138,12 +2138,12 @@ impl AsErrorHelp for CanisterManagerError {
             | CanisterManagerError::WasmChunkStoreError { .. }
             | CanisterManagerError::CanisterSnapshotNotFound { .. }
             | CanisterManagerError::CanisterHeapDeltaRateLimited { .. }
-            | CanisterManagerError::CanisterSnapshotInvalidOwnership { .. } => {
-                ErrorHelp::UserError {
-                    suggestion: "".to_string(),
-                    doc_link: "".to_string(),
-                }
-            }
+            | CanisterManagerError::CanisterSnapshotInvalidOwnership { .. }
+            | CanisterManagerError::MissingUpgradeOptionError { .. }
+            | CanisterManagerError::InvalidUpgradeOptionError { .. } => ErrorHelp::UserError {
+                suggestion: "".to_string(),
+                doc_link: "".to_string(),
+            },
         }
     }
 }
