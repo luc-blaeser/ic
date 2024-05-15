@@ -4511,6 +4511,7 @@ fn test_invalid_wasm_with_enhanced_orthogonal_persistence() {
     )
     "#;
     let version1_wasm = wat::parse_str(valid_version1_wat).unwrap();
+    let canister_id = test.create_canister(Cycles::new(1_000_000_000_000_000));
     test.install_canister(canister_id, version1_wasm).unwrap();
 
     let invalid_version2_wat = r#"
