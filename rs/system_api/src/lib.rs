@@ -28,7 +28,7 @@ use ic_types::{
     messages::{CallContextId, RejectContext, Request, MAX_INTER_CANISTER_PAYLOAD_IN_BYTES},
     methods::{SystemMethod, WasmClosure},
     CanisterId, CanisterTimer, ComputeAllocation, Cycles, MemoryAllocation, NumBytes,
-    NumInstructions, NumPages, PrincipalId, SubnetId, Time, MAX_STABLE_MEMORY_IN_BYTES,
+    NumInstructions, NumOsPages, PrincipalId, SubnetId, Time, MAX_STABLE_MEMORY_IN_BYTES,
 };
 use ic_utils::deterministic_operations::deterministic_copy_from_slice;
 use request_in_prep::{into_request, RequestInPrep};
@@ -53,8 +53,9 @@ const WASM_NATIVE_STABLE_MEMORY_ERROR: &str = "Stable memory cannot be accessed 
 
 const MAX_32_BIT_STABLE_MEMORY_IN_PAGES: u64 = 64 * 1024; // 4GiB
 
-/// `MAX_CALL_TIMEOUT` in seconds.
-const MAX_CALL_TIMEOUT_SECONDS: u32 = 300;
+/// Upper bound on `timeout` when using calls with
+/// best-effort responses represented in seconds.
+pub const MAX_CALL_TIMEOUT_SECONDS: u32 = 300;
 
 // This macro is used in system calls for tracing.
 macro_rules! trace_syscall {
@@ -2411,7 +2412,7 @@ impl SystemApi for SystemApiImpl {
         &self,
         offset: u64,
         size: u64,
-    ) -> HypervisorResult<(NumPages, NumInstructions)> {
+    ) -> HypervisorResult<(NumOsPages, NumInstructions)> {
         let dirty_pages = self.stable_memory().dirty_pages_from_write(offset, size);
         let cost = self
             .sandbox_safe_system_state
@@ -2997,9 +2998,15 @@ impl SystemApi for SystemApiImpl {
             | ApiType::SystemTask { .. }
             | ApiType::ReplyCallback { .. }
             | ApiType::RejectCallback { .. } => {
-                self.sandbox_safe_system_state
-                    .mint_cycles(Cycles::from(amount))?;
-                Ok(amount)
+                if self.execution_parameters.execution_mode == ExecutionMode::NonReplicated {
+                    // Non-replicated mode means we are handling a composite query.
+                    // Access to this syscall not permitted.
+                    Err(self.error_for("ic0_mint_cycles"))
+                } else {
+                    self.sandbox_safe_system_state
+                        .mint_cycles(Cycles::from(amount))?;
+                    Ok(amount)
+                }
             }
         };
         trace_syscall!(self, MintCycles, result, amount);
@@ -3148,6 +3155,44 @@ impl SystemApi for SystemApiImpl {
         result
     }
 
+    fn ic0_msg_deadline(&self) -> HypervisorResult<u64> {
+        let result = match self.api_type {
+            ApiType::Start { .. }
+            | ApiType::Init { .. }
+            | ApiType::PreUpgrade { .. }
+            | ApiType::SystemTask { .. }
+            | ApiType::Cleanup { .. }
+            | ApiType::InspectMessage { .. } => Err(self.error_for("ic0_msg_deadline")),
+            ApiType::ReplicatedQuery { .. }
+            | ApiType::NonReplicatedQuery {
+                query_kind: NonReplicatedQueryKind::Pure,
+                ..
+            } => Ok(0),
+            ApiType::Update {
+                call_context_id, ..
+            }
+            | ApiType::NonReplicatedQuery {
+                query_kind:
+                    NonReplicatedQueryKind::Stateful {
+                        call_context_id, ..
+                    },
+                ..
+            }
+            | ApiType::ReplyCallback {
+                call_context_id, ..
+            }
+            | ApiType::RejectCallback {
+                call_context_id, ..
+            } => {
+                let deadline = self.sandbox_safe_system_state.msg_deadline(call_context_id);
+                Ok(Time::from(deadline).as_nanos_since_unix_epoch())
+            }
+        };
+
+        trace_syscall!(self, CallWithBestEffortResponse, result);
+        result
+    }
+
     fn ic0_in_replicated_execution(&self) -> HypervisorResult<i32> {
         let result = match &self.api_type {
             ApiType::Start { .. }
@@ -3192,13 +3237,19 @@ impl SystemApi for SystemApiImpl {
             | ApiType::SystemTask { .. }
             | ApiType::ReplyCallback { .. }
             | ApiType::RejectCallback { .. } => {
-                let cycles = self.sandbox_safe_system_state.cycles_burn128(
-                    amount,
-                    self.memory_usage.current_usage,
-                    self.memory_usage.current_message_usage,
-                );
-                copy_cycles_to_heap(cycles, dst, heap, method_name)?;
-                Ok(())
+                if self.execution_parameters.execution_mode == ExecutionMode::NonReplicated {
+                    // Non-replicated mode means we are handling a composite query.
+                    // Access to this syscall not permitted.
+                    Err(self.error_for(method_name))
+                } else {
+                    let cycles = self.sandbox_safe_system_state.cycles_burn128(
+                        amount,
+                        self.memory_usage.current_usage,
+                        self.memory_usage.current_message_usage,
+                    );
+                    copy_cycles_to_heap(cycles, dst, heap, method_name)?;
+                    Ok(())
+                }
             }
         };
         trace_syscall!(self, CyclesBurn128, result, amount);

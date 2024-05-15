@@ -23,7 +23,7 @@ pub use storage::{
 };
 use storage::{OverlayFile, OverlayVersion, Storage};
 
-use ic_types::{Height, NumPages, MAX_STABLE_MEMORY_IN_BYTES};
+use ic_types::{Height, NumOsPages, MAX_STABLE_MEMORY_IN_BYTES};
 use int_map::{Bounds, IntMap};
 use libc::off_t;
 use page_allocator::Page;
@@ -56,6 +56,10 @@ pub struct StorageMetrics {
     empty_delta_writes: IntCounter,
     /// For each merge, amount of input files we merged.
     num_merged_files: Histogram,
+    /// The number of files in a shard before merging.
+    num_files_by_shard: Histogram,
+    /// The storage overhead of a shard before merging.
+    storage_overhead_by_shard: Histogram,
 }
 
 impl StorageMetrics {
@@ -95,11 +99,29 @@ impl StorageMetrics {
             linear_buckets(0.0, 1.0, 20),
         );
 
+        let num_files_by_shard = metrics_registry.histogram(
+            "storage_layer_merge_num_files_by_shard",
+            "Number of files per PageMap shard before merging.",
+            linear_buckets(0.0, 1.0, 20),
+        );
+
+        let storage_overhead_by_shard = metrics_registry.histogram(
+            "storage_layer_merge_storage_overhead_by_shard",
+            "Storage overhead per PageMap shard before merging.",
+            // Extra resolution in the 1 - 1.25 range.
+            vec![
+                0.5, 0.75, 1.0, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.5, 1.75, 2.0, 2.25, 2.5, 3.0,
+                3.5, 4.0, 4.5, 5.0, 6.0, 7.0,
+            ],
+        );
+
         Self {
             write_bytes,
             write_duration,
             empty_delta_writes,
             num_merged_files,
+            num_files_by_shard,
+            storage_overhead_by_shard,
         }
     }
 }
@@ -955,9 +977,9 @@ impl Buffer {
     ///
     /// This function assumes the write doesn't extend beyond the maximum stable
     /// memory size (in which case the memory would fail anyway).
-    pub fn dirty_pages_from_write(&self, offset: u64, size: u64) -> NumPages {
+    pub fn dirty_pages_from_write(&self, offset: u64, size: u64) -> NumOsPages {
         if size == 0 {
-            return NumPages::from(0);
+            return NumOsPages::from(0);
         }
         let first_page = offset / (PAGE_SIZE as u64);
         let last_page = offset
@@ -967,7 +989,7 @@ impl Buffer {
         let dirty_page_count = (first_page..=last_page)
             .filter(|p| !self.dirty_pages.contains_key(&PageIndex::new(*p)))
             .count();
-        NumPages::new(dirty_page_count as u64)
+        NumOsPages::new(dirty_page_count as u64)
     }
 
     pub fn dirty_pages(&self) -> impl Iterator<Item = (PageIndex, &PageBytes)> {

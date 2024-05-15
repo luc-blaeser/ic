@@ -408,6 +408,12 @@ pub mod transfer_sns_treasury_funds {
 pub struct ManageLedgerParameters {
     #[prost(uint64, optional, tag = "1")]
     pub transfer_fee: ::core::option::Option<u64>,
+    #[prost(string, optional, tag = "2")]
+    pub token_name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub token_symbol: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub token_logo: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// A proposal to mint SNS tokens to (optionally a Subaccount of) the
 /// target principal.
@@ -479,6 +485,7 @@ pub struct DeregisterDappCanisters {
     #[prost(message, repeated, tag = "2")]
     pub new_controllers: ::prost::alloc::vec::Vec<::ic_base_types::PrincipalId>,
 }
+/// A proposal to manage the settings of one or more dapp canisters.
 #[derive(candid::CandidType, candid::Deserialize, comparable::Comparable)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -486,6 +493,8 @@ pub struct ManageDappCanisterSettings {
     /// The canister IDs of the dapp canisters to be modified.
     #[prost(message, repeated, tag = "1")]
     pub canister_ids: ::prost::alloc::vec::Vec<::ic_base_types::PrincipalId>,
+    /// Below are fields under CanisterSettings defined at
+    /// <https://internetcomputer.org/docs/current/references/ic-interface-spec/#ic-candid.>
     #[prost(uint64, optional, tag = "2")]
     pub compute_allocation: ::core::option::Option<u64>,
     #[prost(uint64, optional, tag = "3")]
@@ -496,6 +505,8 @@ pub struct ManageDappCanisterSettings {
     pub reserved_cycles_limit: ::core::option::Option<u64>,
     #[prost(enumeration = "LogVisibility", optional, tag = "6")]
     pub log_visibility: ::core::option::Option<i32>,
+    #[prost(uint64, optional, tag = "7")]
+    pub wasm_memory_limit: ::core::option::Option<u64>,
 }
 /// A proposal is the immutable input of a proposal submission.
 #[derive(candid::CandidType, candid::Deserialize, comparable::Comparable)]

@@ -87,7 +87,7 @@ const MEMORY_CAPACITY: NumBytes = NumBytes::new(8 * 1024 * 1024 * 1024); // 8GiB
 const MAX_CONTROLLERS: usize = 10;
 const WASM_PAGE_SIZE_IN_BYTES: u64 = 64 * 1024; // 64KiB
 const MAX_NUMBER_OF_CANISTERS: u64 = 0;
-// The simplest valid WASM binary: "(module)"
+// The simplest valid Wasm binary: "(module)"
 const MINIMAL_WASM: [u8; 8] = [
     0, 97, 115, 109, // \0ASM - magic
     1, 0, 0, 0, //  0x01 - version
@@ -4511,7 +4511,6 @@ fn test_invalid_wasm_with_enhanced_orthogonal_persistence() {
     )
     "#;
     let version1_wasm = wat::parse_str(valid_version1_wat).unwrap();
-    let canister_id = test.create_canister(Cycles::new(1_000_000_000_000_000));
     test.install_canister(canister_id, version1_wasm).unwrap();
 
     let invalid_version2_wat = r#"

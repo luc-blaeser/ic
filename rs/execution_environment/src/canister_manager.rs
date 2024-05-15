@@ -447,6 +447,7 @@ impl CanisterManager {
             | Ok(Ic00Method::SetupInitialDKG)
             | Ok(Ic00Method::SignWithECDSA)
             | Ok(Ic00Method::ComputeInitialEcdsaDealings)
+            | Ok(Ic00Method::ComputeInitialIDkgDealings)
             // "DepositCycles" can be called by anyone however as ingress message
             // cannot carry cycles, it does not make sense to allow them from users.
             | Ok(Ic00Method::DepositCycles)
@@ -2460,6 +2461,9 @@ pub fn uninstall_canister(
     // Drop the canister's execution state.
     canister.execution_state = None;
 
+    // Clear log.
+    canister.clear_log();
+
     // Clear the Wasm chunk store.
     canister.system_state.wasm_chunk_store = WasmChunkStore::new(fd_factory);
 
@@ -2487,7 +2491,7 @@ pub fn uninstall_canister(
         // Mark all call contexts as deleted and prepare reject responses.
         // Note that callbacks will be unregistered at a later point once they are
         // received.
-        for call_context in call_context_manager.call_contexts_mut().values_mut() {
+        for call_context in call_context_manager.call_contexts_mut() {
             // Mark the call context as deleted.
             call_context.mark_deleted();
 
@@ -2533,9 +2537,18 @@ pub fn uninstall_canister(
                     // Cannot respond to system tasks. Nothing to do.
                 }
             }
+        }
 
-            // Mark the call context as responded to.
-            call_context.mark_responded();
+        // Mark all call contexts as responded to.
+        let call_context_ids = call_context_manager
+            .call_contexts()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for call_context_id in call_context_ids {
+            call_context_manager
+                .mark_responded(call_context_id)
+                .unwrap(); // Safe to do, we only just collected the IDs above.
         }
     }
 

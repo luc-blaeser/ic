@@ -16,7 +16,7 @@ use ic_types::{
         AnonymousQuery, AnonymousQueryResponse, CertificateDelegation, MessageId,
         SignedIngressContent, UserQuery,
     },
-    Cycles, ExecutionRound, Height, NumInstructions, NumPages, Randomness, Time,
+    Cycles, ExecutionRound, Height, NumInstructions, NumOsPages, Randomness, Time,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, ops};
@@ -151,6 +151,8 @@ pub enum SystemApiCallId {
     MsgCyclesRefunded,
     /// Tracker for `ic0.msg_cycles_refunded128()`
     MsgCyclesRefunded128,
+    /// Tracker for `ic0.msg_deadline()`
+    MsgDeadline,
     /// Tracker for `ic0.msg_method_name_copy()`
     MsgMethodNameCopy,
     /// Tracker for `ic0.msg_method_name_size()`
@@ -716,6 +718,12 @@ pub trait SystemApi {
     /// Otherwise, it traps. A different timeout can be specified for each call.
     fn ic0_call_with_best_effort_response(&mut self, timeout_seconds: u32) -> HypervisorResult<()>;
 
+    /// The deadline, in nanoseconds since 1970-01-01, after which the caller might stop waiting for a response.
+    ///
+    /// For calls with best-effort responses, the deadline is computed based on the time the call was made, and
+    /// the `timeout_seconds` parameter provided by the caller. For other calls, a deadline of 0 will be returned.
+    fn ic0_msg_deadline(&self) -> HypervisorResult<u64>;
+
     /// Specifies the closure to be called if the reply/reject closures trap.
     /// Can be called at most once between `ic0.call_new` and
     /// `ic0.call_perform`.
@@ -858,7 +866,7 @@ pub trait SystemApi {
         &self,
         offset: u64,
         size: u64,
-    ) -> HypervisorResult<(NumPages, NumInstructions)>;
+    ) -> HypervisorResult<(NumOsPages, NumInstructions)>;
 
     /// The canister can query the IC for the current time.
     fn ic0_time(&mut self) -> HypervisorResult<Time>;

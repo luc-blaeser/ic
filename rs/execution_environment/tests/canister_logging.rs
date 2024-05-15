@@ -3,9 +3,9 @@ use ic_config::execution_environment::Config as ExecutionConfig;
 use ic_config::flag_status::FlagStatus;
 use ic_config::subnet_config::SubnetConfig;
 use ic_management_canister_types::{
-    CanisterInstallMode, CanisterLogRecord, CanisterSettingsArgs, CanisterSettingsArgsBuilder,
-    DataSize, FetchCanisterLogsRequest, FetchCanisterLogsResponse, LogVisibility, Payload,
-    MAX_ALLOWED_CANISTER_LOG_BUFFER_SIZE,
+    CanisterIdRecord, CanisterInstallMode, CanisterLogRecord, CanisterSettingsArgs,
+    CanisterSettingsArgsBuilder, DataSize, FetchCanisterLogsRequest, FetchCanisterLogsResponse,
+    LogVisibility, Payload, MAX_ALLOWED_CANISTER_LOG_BUFFER_SIZE,
 };
 use ic_registry_subnet_type::SubnetType;
 use ic_state_machine_tests::{
@@ -13,13 +13,20 @@ use ic_state_machine_tests::{
     SubmitIngressError, UserError,
 };
 use ic_test_utilities_execution_environment::{get_reply, wat_canister, wat_fn};
-use ic_types::{ingress::WasmResult, CanisterId, Cycles};
+use ic_test_utilities_metrics::fetch_histogram_stats;
+use ic_types::{ingress::WasmResult, CanisterId, Cycles, NumInstructions};
 use more_asserts::{assert_le, assert_lt};
 use proptest::{prelude::ProptestConfig, prop_assume};
 use std::time::{Duration, SystemTime};
 
 const MAX_LOG_MESSAGE_LEN: usize = 4 * 1024;
 const TIME_STEP: Duration = Duration::from_nanos(111_111);
+
+// Change limits in order not to duplicate prod values.
+const B: u64 = 1_000_000_000;
+const MAX_INSTRUCTIONS_PER_ROUND: NumInstructions = NumInstructions::new(5 * B);
+const MAX_INSTRUCTIONS_PER_MESSAGE: NumInstructions = NumInstructions::new(20 * B);
+const MAX_INSTRUCTIONS_PER_SLICE: NumInstructions = NumInstructions::new(B);
 
 fn system_time_to_nanos(t: SystemTime) -> u64 {
     t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos() as u64
@@ -56,8 +63,12 @@ fn setup(
     settings: CanisterSettingsArgs,
 ) -> (StateMachine, CanisterId) {
     let subnet_type = SubnetType::Application;
+    let mut subnet_config = SubnetConfig::new(subnet_type);
+    subnet_config.scheduler_config.max_instructions_per_round = MAX_INSTRUCTIONS_PER_ROUND;
+    subnet_config.scheduler_config.max_instructions_per_message = MAX_INSTRUCTIONS_PER_MESSAGE;
+    subnet_config.scheduler_config.max_instructions_per_slice = MAX_INSTRUCTIONS_PER_SLICE;
     let config = StateMachineConfig::new(
-        SubnetConfig::new(subnet_type),
+        subnet_config,
         default_config_with_canister_logging(canister_logging),
     );
     let env = StateMachineBuilder::new()
@@ -112,7 +123,7 @@ fn restart_node(env: StateMachine, canister_logging: FlagStatus) -> StateMachine
 }
 
 fn fetch_canister_logs(
-    env: StateMachine,
+    env: &StateMachine,
     sender: PrincipalId,
     canister_id: CanisterId,
 ) -> Result<WasmResult, UserError> {
@@ -257,7 +268,7 @@ fn test_log_visibility_of_fetch_canister_logs() {
                 .build(),
             wat_canister().build(),
         );
-        let actual_result = fetch_canister_logs(env, sender, canister_id);
+        let actual_result = fetch_canister_logs(&env, sender, canister_id);
         assert_eq!(actual_result, expected_result);
     }
 }
@@ -273,7 +284,7 @@ fn test_appending_logs_in_replied_update_call(#[strategy("\\PC*")] message: Stri
     );
     let timestamp = system_time_to_nanos(env.time_of_next_round());
     let _ = env.execute_ingress(canister_id, "test", vec![]);
-    let result = fetch_canister_logs(env, controller, canister_id);
+    let result = fetch_canister_logs(&env, controller, canister_id);
     assert_eq!(
         FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
         canister_log_response(vec![(0, timestamp, message.as_bytes().to_vec())])
@@ -291,7 +302,7 @@ fn test_appending_logs_in_trapped_update_call(#[strategy("\\PC*")] message: Stri
     );
     let timestamp = system_time_to_nanos(env.time_of_next_round());
     let _ = env.execute_ingress(canister_id, "test", vec![]);
-    let result = fetch_canister_logs(env, controller, canister_id);
+    let result = fetch_canister_logs(&env, controller, canister_id);
     assert_eq!(
         FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
         canister_log_response(vec![
@@ -312,7 +323,7 @@ fn test_appending_logs_in_replied_replicated_query_call(#[strategy("\\PC*")] mes
     );
     let timestamp = system_time_to_nanos(env.time_of_next_round());
     let _ = env.execute_ingress(canister_id, "test", vec![]);
-    let result = fetch_canister_logs(env, controller, canister_id);
+    let result = fetch_canister_logs(&env, controller, canister_id);
     assert_eq!(
         FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
         canister_log_response(vec![(0, timestamp, message.as_bytes().to_vec())])
@@ -330,7 +341,7 @@ fn test_appending_logs_in_trapped_replicated_query_call(#[strategy("\\PC*")] mes
     );
     let timestamp = system_time_to_nanos(env.time_of_next_round());
     let _ = env.execute_ingress(canister_id, "test", vec![]);
-    let result = fetch_canister_logs(env, controller, canister_id);
+    let result = fetch_canister_logs(&env, controller, canister_id);
     assert_eq!(
         FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
         canister_log_response(vec![
@@ -367,7 +378,7 @@ fn test_canister_log_record_index_increment_for_different_calls() {
     let timestamp_23 = system_time_to_nanos(env.time_of_next_round());
     let _ = env.execute_ingress(canister_id, "test2", vec![]);
 
-    let result = fetch_canister_logs(env, controller, canister_id);
+    let result = fetch_canister_logs(&env, controller, canister_id);
     assert_eq!(
         FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
         canister_log_response(vec![
@@ -411,7 +422,7 @@ fn test_canister_log_record_index_increment_after_node_restart() {
     let timestamp_23 = system_time_to_nanos(env.time_of_next_round());
     let _ = env.execute_ingress(canister_id, "test2", vec![]);
 
-    let result = fetch_canister_logs(env, controller, canister_id);
+    let result = fetch_canister_logs(&env, controller, canister_id);
     assert_eq!(
         FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
         canister_log_response(vec![
@@ -419,7 +430,7 @@ fn test_canister_log_record_index_increment_after_node_restart() {
             (1, timestamp_01, b"message 1".to_vec()),
             (2, timestamp_23, b"message 2".to_vec()),
             (3, timestamp_23, b"message 3".to_vec()),
-        ],)
+        ])
     );
 }
 
@@ -434,7 +445,7 @@ fn test_logging_in_trapped_wasm_execution() {
     // Grow stable memory by 1 page (64kb), reading outside of the page should trap.
     let timestamp = system_time_to_nanos(env.time_of_next_round());
     let _ = env.execute_ingress(canister_id, "test", vec![]);
-    let result = fetch_canister_logs(env, controller, canister_id);
+    let result = fetch_canister_logs(&env, controller, canister_id);
     assert_eq!(
         FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
         canister_log_response(vec![(
@@ -453,7 +464,7 @@ fn test_logging_explicit_canister_trap_without_message() {
     );
     let timestamp = system_time_to_nanos(env.time_of_next_round());
     let _ = env.execute_ingress(canister_id, "test", vec![]);
-    let result = fetch_canister_logs(env, controller, canister_id);
+    let result = fetch_canister_logs(&env, controller, canister_id);
     assert_eq!(
         FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
         canister_log_response(vec![(0, timestamp, b"[TRAP]: (no message)".to_vec())])
@@ -470,7 +481,7 @@ fn test_logging_explicit_canister_trap_with_message() {
     );
     let timestamp = system_time_to_nanos(env.time_of_next_round());
     let _ = env.execute_ingress(canister_id, "test", vec![]);
-    let result = fetch_canister_logs(env, controller, canister_id);
+    let result = fetch_canister_logs(&env, controller, canister_id);
     assert_eq!(
         FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
         canister_log_response(vec![(0, timestamp, b"[TRAP]: some text".to_vec())])
@@ -495,7 +506,7 @@ fn test_canister_log_stays_within_limit() {
         let _ = env.execute_ingress(canister_id, "test", vec![]);
         env.tick();
     }
-    let result = fetch_canister_logs(env, controller, canister_id);
+    let result = fetch_canister_logs(&env, controller, canister_id);
     let response = FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap();
     // Expect that the total size of the log records is less than the limit.
     assert_le!(
@@ -565,7 +576,7 @@ fn test_logging_trap_in_heartbeat() {
             .build(),
     );
     let timestamp = system_time_to_nanos(env.time());
-    let result = fetch_canister_logs(env, controller, canister_id);
+    let result = fetch_canister_logs(&env, controller, canister_id);
     assert_eq!(
         FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
         canister_log_response(vec![
@@ -589,7 +600,7 @@ fn test_logging_trap_in_timer() {
             .build(),
     );
     let timestamp = system_time_to_nanos(env.time());
-    let result = fetch_canister_logs(env, controller, canister_id);
+    let result = fetch_canister_logs(&env, controller, canister_id);
     assert_eq!(
         FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
         canister_log_response(vec![
@@ -629,7 +640,7 @@ fn test_canister_log_preserved_after_disabling_and_enabling_again() {
     let _ = env.execute_ingress(canister_id, "test3", vec![]);
 
     // Expect only batches 1 and 3.
-    let result = fetch_canister_logs(env, controller, canister_id);
+    let result = fetch_canister_logs(&env, controller, canister_id);
     let data = FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap();
     assert_eq!(data.canister_log_records.len(), 2);
     assert_eq!(
@@ -640,7 +651,117 @@ fn test_canister_log_preserved_after_disabling_and_enabling_again() {
             // No batch #2 records.
             // Batch #3.
             (1, timestamp_3, b"message 3".to_vec()),
-        ],)
+        ])
+    );
+}
+
+#[test]
+fn test_deleting_logs_on_reinstall() {
+    // Test logs are deleted on canister reinstall.
+    let (env, canister_id, controller) = setup_with_controller(
+        FlagStatus::Enabled,
+        wat_canister()
+            .start(wat_fn().debug_print(b"start_1"))
+            .init(wat_fn().debug_print(b"init_1"))
+            .update("test_1", wat_fn().debug_print(b"test_1"))
+            .build(),
+    );
+    let timestamp_1_init = system_time_to_nanos(env.time());
+    env.advance_time(TIME_STEP);
+
+    // Prepopulate log.
+    let timestamp_1_update = system_time_to_nanos(env.time_of_next_round());
+    let _ = env.execute_ingress(canister_id, "test_1", vec![]);
+    env.advance_time(TIME_STEP);
+
+    // Expect the log record from cansiter version #1.
+    let result = fetch_canister_logs(&env, controller, canister_id);
+    assert_eq!(
+        FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
+        canister_log_response(vec![
+            (0, timestamp_1_init, b"start_1".to_vec()),
+            (1, timestamp_1_init, b"init_1".to_vec()),
+            (2, timestamp_1_update, b"test_1".to_vec())
+        ])
+    );
+
+    // Reinstall canister to version #2.
+    env.install_wasm_in_mode(
+        canister_id,
+        CanisterInstallMode::Reinstall,
+        wat::parse_str(
+            wat_canister()
+                .start(wat_fn().debug_print(b"start_2"))
+                .init(wat_fn().debug_print(b"init_2"))
+                .update("test_2", wat_fn().debug_print(b"test_2"))
+                .build(),
+        )
+        .unwrap(),
+        vec![],
+    )
+    .unwrap();
+    env.advance_time(TIME_STEP);
+
+    // Populate log after reinstall.
+    let timestamp_2_update = system_time_to_nanos(env.time_of_next_round());
+    let _ = env.execute_ingress(canister_id, "test_2", vec![]);
+    env.advance_time(TIME_STEP);
+
+    // Expect only the log records after reinstall.
+    let result = fetch_canister_logs(&env, controller, canister_id);
+    assert_eq!(
+        FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
+        canister_log_response(vec![(5, timestamp_2_update, b"test_2".to_vec())])
+    );
+}
+
+#[test]
+fn test_deleting_logs_on_uninstall() {
+    // Test logs are deleted when the canister is uninstalled.
+    let (env, canister_id, controller) = setup_with_controller(
+        FlagStatus::Enabled,
+        wat_canister()
+            .start(wat_fn().debug_print(b"start_1"))
+            .init(wat_fn().debug_print(b"init_1"))
+            .update("test_1", wat_fn().debug_print(b"test_1"))
+            .build(),
+    );
+    let timestamp_1_init = system_time_to_nanos(env.time());
+    env.advance_time(TIME_STEP);
+
+    // Prepopulate log.
+    let timestamp_1_update = system_time_to_nanos(env.time_of_next_round());
+    let _ = env.execute_ingress(canister_id, "test_1", vec![]);
+    env.advance_time(TIME_STEP);
+
+    // Stop canister.
+    env.stop_canister_as(controller, canister_id).unwrap();
+
+    // Expect logs to be available.
+    let result = fetch_canister_logs(&env, controller, canister_id);
+    assert_eq!(
+        FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
+        canister_log_response(vec![
+            (0, timestamp_1_init, b"start_1".to_vec()),
+            (1, timestamp_1_init, b"init_1".to_vec()),
+            (2, timestamp_1_update, b"test_1".to_vec())
+        ])
+    );
+
+    // Uninstall canister.
+    env.execute_ingress_as(
+        controller,
+        CanisterId::ic_00(),
+        "uninstall_code",
+        (CanisterIdRecord::from(canister_id)).encode(),
+    )
+    .unwrap();
+
+    // Expect logs to be deleted.
+    let result = fetch_canister_logs(&env, controller, canister_id);
+    assert_eq!(
+        FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
+        canister_log_response(vec![])
     );
 }
 
@@ -686,7 +807,7 @@ fn test_logging_debug_print_persists_over_upgrade() {
     let _ = env.execute_ingress(canister_id, "test", vec![]);
     env.advance_time(TIME_STEP);
 
-    let result = fetch_canister_logs(env, controller, canister_id);
+    let result = fetch_canister_logs(&env, controller, canister_id);
     assert_eq!(
         FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
         canister_log_response(vec![
@@ -729,7 +850,7 @@ fn test_logging_trap_at_install_start() {
     // Assert install fails due to trap.
     assert_eq!(result.unwrap_err().code(), ErrorCode::CanisterCalledTrap);
 
-    let result = fetch_canister_logs(env, canister_id.into(), canister_id);
+    let result = fetch_canister_logs(&env, canister_id.into(), canister_id);
     assert_eq!(
         FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
         canister_log_response(vec![
@@ -766,7 +887,7 @@ fn test_logging_trap_at_install_init() {
     // Assert install fails due to trap.
     assert_eq!(result.unwrap_err().code(), ErrorCode::CanisterCalledTrap);
 
-    let result = fetch_canister_logs(env, canister_id.into(), canister_id);
+    let result = fetch_canister_logs(&env, canister_id.into(), canister_id);
     assert_eq!(
         FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
         canister_log_response(vec![
@@ -826,7 +947,7 @@ fn test_logging_trap_in_pre_upgrade() {
     let _ = env.execute_ingress(canister_id, "test", vec![]);
     env.advance_time(TIME_STEP);
 
-    let result = fetch_canister_logs(env, controller, canister_id);
+    let result = fetch_canister_logs(&env, controller, canister_id);
     assert_eq!(
         FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
         canister_log_response(vec![
@@ -887,7 +1008,7 @@ fn test_logging_trap_after_upgrade_in_start() {
     let _ = env.execute_ingress(canister_id, "test", vec![]);
     env.advance_time(TIME_STEP);
 
-    let result = fetch_canister_logs(env, controller, canister_id);
+    let result = fetch_canister_logs(&env, controller, canister_id);
     assert_eq!(
         FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
         canister_log_response(vec![
@@ -953,7 +1074,7 @@ fn test_logging_trap_after_upgrade_in_post_upgrade() {
     let _ = env.execute_ingress(canister_id, "test", vec![]);
     env.advance_time(TIME_STEP);
 
-    let result = fetch_canister_logs(env, controller, canister_id);
+    let result = fetch_canister_logs(&env, controller, canister_id);
     assert_eq!(
         FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
         canister_log_response(vec![
@@ -969,4 +1090,230 @@ fn test_logging_trap_after_upgrade_in_post_upgrade() {
             (7, timestamp_after_upgrade, b"update_1".to_vec()),
         ])
     );
+}
+
+#[test]
+fn test_logging_debug_print_over_dts() {
+    // Test canister logging debug_print messages (without traps) in separated DTS slices.
+    // Check that log messages are available only after the message is finished.
+    let number_of_slices = 4;
+    let instructions_per_slice = MAX_INSTRUCTIONS_PER_SLICE.get() as i64;
+    let (env, canister_id, controller) = setup_with_controller(
+        FlagStatus::Enabled,
+        wat_canister()
+            .update(
+                "test",
+                wat_fn()
+                    .debug_print(b"slice_0")
+                    .wait(instructions_per_slice)
+                    .debug_print(b"slice_1")
+                    .wait(instructions_per_slice)
+                    .debug_print(b"slice_2")
+                    .wait(instructions_per_slice)
+                    .debug_print(b"slice_3"),
+            )
+            .build(),
+    );
+
+    let timestamp = system_time_to_nanos(env.time_of_next_round());
+    // Slice #0 is processed inside `send_ingress` in round #0.
+    let _msg_id = env.send_ingress(PrincipalId::new_anonymous(), canister_id, "test", vec![]);
+    // Since one slice was processed in `send_ingress` iterate over one slice less.
+    for i in 1..number_of_slices {
+        let result = fetch_canister_logs(&env, controller, canister_id);
+        assert_eq!(
+            FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
+            canister_log_response(vec![]),
+            "Expect no log messages after round #{}",
+            i
+        );
+        env.advance_time(TIME_STEP);
+        env.tick();
+    }
+
+    // Expect all the log messages after the last slice is processed with the timestamp of the first slice.
+    let result = fetch_canister_logs(&env, controller, canister_id);
+    assert_eq!(
+        FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
+        canister_log_response(vec![
+            (0, timestamp, b"slice_0".to_vec()),
+            (1, timestamp, b"slice_1".to_vec()),
+            (2, timestamp, b"slice_2".to_vec()),
+            (3, timestamp, b"slice_3".to_vec())
+        ])
+    );
+}
+
+#[test]
+fn test_logging_trap_over_dts() {
+    // Test canister logging debug_print messages (with a trap) in separated DTS slices.
+    // Check that log messages are available only after the message is finished.
+    let number_of_slices = 4;
+    let instructions_per_slice = MAX_INSTRUCTIONS_PER_SLICE.get() as i64;
+    let (env, canister_id, controller) = setup_with_controller(
+        FlagStatus::Enabled,
+        wat_canister()
+            .update(
+                "test",
+                wat_fn()
+                    .debug_print(b"slice_0")
+                    .wait(instructions_per_slice)
+                    .debug_print(b"slice_1")
+                    .wait(instructions_per_slice)
+                    .debug_print(b"slice_2")
+                    .wait(instructions_per_slice)
+                    .trap_with_blob(b"slice_3"),
+            )
+            .build(),
+    );
+
+    let timestamp = system_time_to_nanos(env.time_of_next_round());
+    // Slice #0 is processed inside `send_ingress` in round #0.
+    let _msg_id = env.send_ingress(PrincipalId::new_anonymous(), canister_id, "test", vec![]);
+    // Since one slice was processed in `send_ingress` iterate over one slice less.
+    for i in 1..number_of_slices {
+        let result = fetch_canister_logs(&env, controller, canister_id);
+        assert_eq!(
+            FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
+            canister_log_response(vec![]),
+            "Expect no log messages after round #{}",
+            i
+        );
+        env.advance_time(TIME_STEP);
+        env.tick();
+    }
+
+    // Expect all the log messages after the last slice is processed with the timestamp of the first slice.
+    let result = fetch_canister_logs(&env, controller, canister_id);
+    assert_eq!(
+        FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
+        canister_log_response(vec![
+            (0, timestamp, b"slice_0".to_vec()),
+            (1, timestamp, b"slice_1".to_vec()),
+            (2, timestamp, b"slice_2".to_vec()),
+            (3, timestamp, b"[TRAP]: slice_3".to_vec())
+        ])
+    );
+}
+
+#[test]
+fn test_logging_of_long_running_dts_over_checkpoint() {
+    // Test canister logging long and short messages with DTS over a checkpoint.
+    let number_of_slices = 5;
+    let checkpoint_slice_idx = 3;
+    assert_lt!(1, checkpoint_slice_idx); // This is due to using `send_ingress` 2 times for sending long and short messages.
+    assert_lt!(checkpoint_slice_idx, number_of_slices);
+    let instructions_per_slice = MAX_INSTRUCTIONS_PER_SLICE.get() as i64;
+    let (env, canister_id, controller) = setup_with_controller(
+        FlagStatus::Enabled,
+        wat_canister()
+            .update(
+                "test_long",
+                wat_fn()
+                    .debug_print(b"long_slice_0")
+                    .wait(instructions_per_slice)
+                    .debug_print(b"long_slice_1")
+                    .wait(instructions_per_slice)
+                    .debug_print(b"long_slice_2")
+                    .wait(instructions_per_slice)
+                    .debug_print(b"long_slice_3")
+                    .wait(instructions_per_slice)
+                    .debug_print(b"long_slice_4"),
+            )
+            .update("test_short", wat_fn().debug_print(b"short"))
+            .build(),
+    );
+
+    // Round #A0: slice #0 is processed inside `send_ingress`.
+    let _msg_id = env.send_ingress(
+        PrincipalId::new_anonymous(),
+        canister_id,
+        "test_long",
+        vec![],
+    );
+    env.advance_time(TIME_STEP);
+    // Round #A1: slice #1 is processed inside `send_ingress` and short message is added to the queue.
+    let _msg_id = env.send_ingress(
+        PrincipalId::new_anonymous(),
+        canister_id,
+        "test_short",
+        vec![],
+    );
+    env.advance_time(TIME_STEP);
+    // Round #A2 and further: process slices until the checkpoint.
+    for i in 2..number_of_slices {
+        if i == checkpoint_slice_idx {
+            // Execute checkpoint round.
+            env.set_checkpoints_enabled(true);
+            env.tick();
+            env.set_checkpoints_enabled(false);
+            env.advance_time(TIME_STEP);
+            break;
+        } else {
+            env.tick();
+            env.advance_time(TIME_STEP);
+        }
+    }
+    // Expect no log messages right after the checkpoint round, since the message did not finish.
+    let result = fetch_canister_logs(&env, controller, canister_id);
+    assert_eq!(
+        FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
+        canister_log_response(vec![])
+    );
+
+    // Rounds #B0 and further: Afther the checkpoint process the message again through all the slices.
+    let timestamp_after_checkpoint = system_time_to_nanos(env.time_of_next_round());
+    for i in 0..number_of_slices {
+        let result = fetch_canister_logs(&env, controller, canister_id);
+        assert_eq!(
+            FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
+            canister_log_response(vec![]),
+            "Expect no log messages after round #{}",
+            i
+        );
+        env.tick();
+        env.advance_time(TIME_STEP);
+    }
+    // Round to process short message.
+    let timestamp_short = system_time_to_nanos(env.time_of_next_round());
+    env.tick();
+    env.advance_time(TIME_STEP);
+
+    // Expect all the log messages after the last slice is processed with the timestamp of the first slice.
+    let result = fetch_canister_logs(&env, controller, canister_id);
+    assert_eq!(
+        FetchCanisterLogsResponse::decode(&get_reply(result)).unwrap(),
+        canister_log_response(vec![
+            (0, timestamp_after_checkpoint, b"long_slice_0".to_vec()),
+            (1, timestamp_after_checkpoint, b"long_slice_1".to_vec()),
+            (2, timestamp_after_checkpoint, b"long_slice_2".to_vec()),
+            (3, timestamp_after_checkpoint, b"long_slice_3".to_vec()),
+            (4, timestamp_after_checkpoint, b"long_slice_4".to_vec()),
+            (5, timestamp_short, b"short".to_vec())
+        ])
+    );
+}
+
+#[test]
+fn test_canister_log_memory_usage_bytes() {
+    // Test canister logging metrics record the size of the log.
+    let metric = "canister_log_memory_usage_bytes";
+    const PAYLOAD_SIZE: usize = 1_000;
+    let (env, canister_id, _controller) = setup_with_controller(
+        FlagStatus::Enabled,
+        wat_canister()
+            .update("test", wat_fn().debug_print(&[37; PAYLOAD_SIZE]))
+            .build(),
+    );
+    // Assert canister log size metric is zero initially.
+    let stats = fetch_histogram_stats(env.metrics_registry(), metric).unwrap();
+    assert_eq!(stats.sum, 0.0);
+
+    // Add log message.
+    let _ = env.execute_ingress(canister_id, "test", vec![]);
+
+    // Assert canister log size metric is within the expected range.
+    let stats = fetch_histogram_stats(env.metrics_registry(), metric).unwrap();
+    assert_le!(PAYLOAD_SIZE as f64, stats.sum);
+    assert_le!(stats.sum, 1.05 * (PAYLOAD_SIZE as f64));
 }
