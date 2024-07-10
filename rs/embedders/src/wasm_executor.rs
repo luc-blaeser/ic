@@ -8,7 +8,7 @@ use ic_replicated_state::{ExportedFunctions, Global, Memory, NumWasmPages, PageM
 use ic_system_api::sandbox_safe_system_state::{SandboxSafeSystemState, SystemStateChanges};
 use ic_system_api::{ApiType, DefaultOutOfInstructionsHandler};
 use ic_types::methods::{FuncRef, WasmMethod};
-use ic_types::NumOsPages;
+use ic_types::{NumOsPages, MAX_WASM_MEMORY_IN_BYTES};
 use prometheus::IntCounter;
 use serde::{Deserialize, Serialize};
 use wasmtime::Module;
@@ -710,7 +710,7 @@ pub fn process(
     if instance.is_wasm32() {
         let wasm_heap_size_after = instance.heap_size(CanisterMemoryType::Heap);
         let wasm32_max_pages = NumWasmPages::from(
-            wasmtime_environ::WASM32_MAX_SIZE as usize / wasmtime_environ::WASM_PAGE_SIZE as usize,
+            MAX_WASM_MEMORY_IN_BYTES as usize / wasmtime_environ::WASM_PAGE_SIZE as usize,
         );
         let wasm_heap_limit = wasm32_max_pages - wasm_reserved_pages;
 
