@@ -1040,7 +1040,7 @@ dependencies = [
  "proc-macro2 1.0.75",
  "quote 1.0.35",
  "regex",
- "rustc-hash 1.1.0",
+ "rustc-hash",
  "shlex",
 ]
 
@@ -1059,7 +1059,7 @@ dependencies = [
  "proc-macro2 1.0.75",
  "quote 1.0.35",
  "regex",
- "rustc-hash 1.1.0",
+ "rustc-hash",
  "shlex",
  "syn 2.0.48",
 ]
@@ -1978,6 +1978,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "cesu8"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d43a04d8753f35258c91f8ec639f792891f748a1edbd759cf1dcea3382ad83c"
+
+[[package]]
 name = "cexpr"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2237,6 +2243,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "combine"
+version = "4.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
+dependencies = [
+ "bytes",
+ "memchr",
+]
+
+[[package]]
 name = "comparable"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2492,7 +2508,7 @@ dependencies = [
  "hashbrown 0.14.5",
  "log",
  "regalloc2",
- "rustc-hash 1.1.0",
+ "rustc-hash",
  "smallvec",
  "target-lexicon",
 ]
@@ -9437,7 +9453,7 @@ dependencies = [
  "registry-canister",
  "rust_decimal",
  "rust_decimal_macros",
- "rustc-hash 1.1.0",
+ "rustc-hash",
  "serde",
  "xrc-mock",
 ]
@@ -9945,7 +9961,7 @@ dependencies = [
  "prost",
  "rand 0.8.5",
  "registry-canister",
- "rustc-hash 1.1.0",
+ "rustc-hash",
  "serde",
  "serde_bytes",
  "strum 0.26.2",
@@ -10078,8 +10094,8 @@ dependencies = [
  "ic-types-test-utils",
  "mockall",
  "pin-project-lite",
- "quinn 0.11.2 (git+https://github.com/quinn-rs/quinn?rev=693c9b7cfbf89c541ba99523237594499984ffed)",
- "quinn-udp 0.5.2 (git+https://github.com/quinn-rs/quinn?rev=693c9b7cfbf89c541ba99523237594499984ffed)",
+ "quinn",
+ "quinn-udp",
  "serde",
  "slog",
  "tempfile",
@@ -10240,8 +10256,8 @@ dependencies = [
  "phantom_newtype",
  "prometheus",
  "prost",
- "quinn 0.11.2 (git+https://github.com/quinn-rs/quinn?rev=693c9b7cfbf89c541ba99523237594499984ffed)",
- "quinn-udp 0.5.2 (git+https://github.com/quinn-rs/quinn?rev=693c9b7cfbf89c541ba99523237594499984ffed)",
+ "quinn",
+ "quinn-udp",
  "rustls 0.23.11",
  "slog",
  "socket2 0.5.7",
@@ -13653,6 +13669,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "jni"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6df18c2e3db7e453d3c6ac5b3e9d5182664d28788126d39b91f2d1e22b017ec"
+dependencies = [
+ "cesu8",
+ "combine",
+ "jni-sys",
+ "log",
+ "thiserror",
+ "walkdir",
+]
+
+[[package]]
+name = "jni-sys"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eaf4bc02d17cbdd7ff4c7438cafcdf7fb9a4613313ad11b4f8fefe7d3fa0130"
+
+[[package]]
 name = "jobserver"
 version = "0.1.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16695,27 +16731,10 @@ checksum = "e4ceeeeabace7857413798eb1ffa1e9c905a9946a57d81fb69b4b71c4d8eb3ad"
 dependencies = [
  "bytes",
  "pin-project-lite",
- "quinn-proto 0.11.3 (registry+https://github.com/rust-lang/crates.io-index)",
- "quinn-udp 0.5.2 (registry+https://github.com/rust-lang/crates.io-index)",
- "rustc-hash 1.1.0",
+ "quinn-proto",
+ "quinn-udp",
+ "rustc-hash",
  "rustls 0.23.11",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "quinn"
-version = "0.11.2"
-source = "git+https://github.com/quinn-rs/quinn?rev=693c9b7cfbf89c541ba99523237594499984ffed#693c9b7cfbf89c541ba99523237594499984ffed"
-dependencies = [
- "bytes",
- "pin-project-lite",
- "quinn-proto 0.11.3 (git+https://github.com/quinn-rs/quinn?rev=693c9b7cfbf89c541ba99523237594499984ffed)",
- "quinn-udp 0.5.2 (git+https://github.com/quinn-rs/quinn?rev=693c9b7cfbf89c541ba99523237594499984ffed)",
- "rustc-hash 2.0.0",
- "rustls 0.23.11",
- "socket2 0.5.7",
  "thiserror",
  "tokio",
  "tracing",
@@ -16730,24 +16749,9 @@ dependencies = [
  "bytes",
  "rand 0.8.5",
  "ring 0.17.8",
- "rustc-hash 1.1.0",
+ "rustc-hash",
  "rustls 0.23.11",
- "slab",
- "thiserror",
- "tinyvec",
- "tracing",
-]
-
-[[package]]
-name = "quinn-proto"
-version = "0.11.3"
-source = "git+https://github.com/quinn-rs/quinn?rev=693c9b7cfbf89c541ba99523237594499984ffed#693c9b7cfbf89c541ba99523237594499984ffed"
-dependencies = [
- "bytes",
- "rand 0.8.5",
- "ring 0.17.8",
- "rustc-hash 2.0.0",
- "rustls 0.23.11",
+ "rustls-platform-verifier",
  "slab",
  "thiserror",
  "tinyvec",
@@ -16759,18 +16763,6 @@ name = "quinn-udp"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9096629c45860fc7fb143e125eb826b5e721e10be3263160c7d60ca832cf8c46"
-dependencies = [
- "libc",
- "once_cell",
- "socket2 0.5.7",
- "tracing",
- "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "quinn-udp"
-version = "0.5.2"
-source = "git+https://github.com/quinn-rs/quinn?rev=693c9b7cfbf89c541ba99523237594499984ffed#693c9b7cfbf89c541ba99523237594499984ffed"
 dependencies = [
  "libc",
  "once_cell",
@@ -17105,7 +17097,7 @@ checksum = "ad156d539c879b7a24a363a2016d77961786e71f48f2e2fc8302a92abd2429a6"
 dependencies = [
  "hashbrown 0.13.2",
  "log",
- "rustc-hash 1.1.0",
+ "rustc-hash",
  "slice-group-by",
  "smallvec",
 ]
@@ -17322,7 +17314,7 @@ dependencies = [
  "once_cell",
  "percent-encoding",
  "pin-project-lite",
- "quinn 0.11.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "quinn",
  "rustls 0.23.11",
  "rustls-native-certs 0.7.0",
  "rustls-pemfile 2.1.2",
@@ -17692,12 +17684,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
-name = "rustc-hash"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "583034fd73374156e66797ed8e5b0d5690409c9226b22d87cb7f19821c05d152"
-
-[[package]]
 name = "rustc-hex"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17851,6 +17837,33 @@ name = "rustls-pki-types"
 version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "976295e77ce332211c0d24d92c0e83e50f5c5f046d11082cea19f3df13a3562d"
+
+[[package]]
+name = "rustls-platform-verifier"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e3beb939bcd33c269f4bf946cc829fcd336370267c4a927ac0399c84a3151a1"
+dependencies = [
+ "core-foundation",
+ "core-foundation-sys",
+ "jni",
+ "log",
+ "once_cell",
+ "rustls 0.23.11",
+ "rustls-native-certs 0.7.0",
+ "rustls-platform-verifier-android",
+ "rustls-webpki 0.102.5",
+ "security-framework",
+ "security-framework-sys",
+ "webpki-roots 0.26.1",
+ "winapi 0.3.9",
+]
+
+[[package]]
+name = "rustls-platform-verifier-android"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84e217e7fdc8466b5b35d30f8c0a30febd29173df4a3a0c2115d306b9c4117ad"
 
 [[package]]
 name = "rustls-webpki"
@@ -18165,6 +18178,7 @@ dependencies = [
  "core-foundation",
  "core-foundation-sys",
  "libc",
+ "num-bigint 0.4.6",
  "security-framework-sys",
 ]
 
