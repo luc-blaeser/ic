@@ -563,39 +563,6 @@ pub(super) fn replacement_functions(
                                 function_index: InjectedImports::InternalTrap as u32,
                             },
                             End,
-                            // check if these i64 hold valid i32 heap addresses
-                            // check dst
-                            LocalGet { local_index: DST },
-                            I64Const {
-                                value: u32::MAX as i64,
-                            },
-                            I64GtU,
-                            If {
-                                blockty: BlockType::Empty,
-                            },
-                            I32Const {
-                                value: InternalErrorCode::HeapOutOfBounds as i32,
-                            },
-                            Call {
-                                function_index: InjectedImports::InternalTrap as u32,
-                            },
-                            End,
-                            // check len
-                            LocalGet { local_index: LEN },
-                            I64Const {
-                                value: u32::MAX as i64,
-                            },
-                            I64GtU,
-                            If {
-                                blockty: BlockType::Empty,
-                            },
-                            I32Const {
-                                value: InternalErrorCode::HeapOutOfBounds as i32,
-                            },
-                            Call {
-                                function_index: InjectedImports::InternalTrap as u32,
-                            },
-                            End,
                             // src
                             LocalGet { local_index: SRC },
                             I64Const {
@@ -1071,39 +1038,6 @@ pub(super) fn replacement_functions(
                             },
                             I32Const {
                                 value: InternalErrorCode::StableMemoryOutOfBounds as i32,
-                            },
-                            Call {
-                                function_index: InjectedImports::InternalTrap as u32,
-                            },
-                            End,
-                            // check if these i64 hold valid i32 heap addresses
-                            // check src
-                            LocalGet { local_index: SRC },
-                            I64Const {
-                                value: u32::MAX as i64,
-                            },
-                            I64GtU,
-                            If {
-                                blockty: BlockType::Empty,
-                            },
-                            I32Const {
-                                value: InternalErrorCode::HeapOutOfBounds as i32,
-                            },
-                            Call {
-                                function_index: InjectedImports::InternalTrap as u32,
-                            },
-                            End,
-                            // check len
-                            LocalGet { local_index: LEN },
-                            I64Const {
-                                value: u32::MAX as i64,
-                            },
-                            I64GtU,
-                            If {
-                                blockty: BlockType::Empty,
-                            },
-                            I32Const {
-                                value: InternalErrorCode::HeapOutOfBounds as i32,
                             },
                             Call {
                                 function_index: InjectedImports::InternalTrap as u32,
