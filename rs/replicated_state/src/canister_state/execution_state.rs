@@ -104,6 +104,8 @@ impl PartialEq<Global> for Global {
     }
 }
 
+impl Eq for Global {}
+
 impl From<&Global> for pb::Global {
     fn from(item: &Global) -> Self {
         match item {

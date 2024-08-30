@@ -1,7 +1,7 @@
 use crate::{
-    canister_state::execution_state::Memory,
-    canister_state::system_state::wasm_chunk_store::WasmChunkStore, CanisterState, NumWasmPages,
-    PageMap,
+    canister_state::execution_state::{Global, Memory},
+    canister_state::system_state::wasm_chunk_store::WasmChunkStore,
+    CanisterState, NumWasmPages, PageMap,
 };
 use ic_sys::PAGE_SIZE;
 use ic_types::{CanisterId, NumBytes, SnapshotId, Time};
@@ -279,6 +279,10 @@ impl From<&PageMemory> for Memory {
 pub struct ExecutionStateSnapshot {
     /// The raw canister module.
     pub wasm_binary: CanisterModule,
+    /// The Wasm global variables.
+    /// Note: The hypervisor instrumentations exports all global variables,
+    /// including originally internal global variables.
+    pub exported_globals: Vec<Global>,
     /// Snapshot of stable memory.
     pub stable_memory: PageMemory,
     /// Snapshot of wasm memory.
@@ -336,6 +340,7 @@ impl CanisterSnapshot {
             .ok_or(CanisterSnapshotError::EmptyExecutionState(canister_id))?;
         let execution_snapshot = ExecutionStateSnapshot {
             wasm_binary: execution_state.wasm_binary.binary.clone(),
+            exported_globals: execution_state.exported_globals.clone(),
             stable_memory: PageMemory::from(&execution_state.stable_memory),
             wasm_memory: PageMemory::from(&execution_state.wasm_memory),
         };
@@ -381,6 +386,10 @@ impl CanisterSnapshot {
 
     pub fn canister_module(&self) -> &CanisterModule {
         &self.execution_snapshot.wasm_binary
+    }
+
+    pub fn exported_globals(&self) -> &Vec<Global> {
+        &self.execution_snapshot.exported_globals
     }
 
     pub fn chunk_store(&self) -> &WasmChunkStore {
@@ -448,6 +457,7 @@ mod tests {
     ) -> (SnapshotId, CanisterSnapshot) {
         let execution_snapshot = ExecutionStateSnapshot {
             wasm_binary: CanisterModule::new(vec![1, 2, 3]),
+            exported_globals: vec![Global::I32(1), Global::I64(2), Global::F64(0.1)],
             stable_memory: PageMemory {
                 page_map: PageMap::new_for_testing(),
                 size: NumWasmPages::new(10),
